@@ -1,0 +1,8 @@
+# One pin, read by rustup, so a plain `cargo` loop is on the same compiler as
+# every check.
+#
+# No `targets`: nothing is cross-compiled. The deploy image builds on a linux
+# builder for that builder, so the only standard library it needs is the host's.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]

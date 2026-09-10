@@ -1,0 +1,33 @@
+[package]
+name = "enroute-lattice-store"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+name = "enroute_lattice_store"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+# The contract every catalog answers to, plus the fixtures that ask it. Off in
+# a production build; on for whoever runs them.
+[features]
+conformance = []
+
+[dependencies]
+enroute-lattice-core.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+object_store.workspace = true
+thiserror.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+# Itself, with the cases on, so `cargo test -p enroute-lattice-store` runs them
+# rather than silently compiling none of them.
+enroute-lattice-store = { path = ".", features = ["conformance"] }
+tokio.workspace = true

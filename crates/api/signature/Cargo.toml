@@ -1,0 +1,20 @@
+[package]
+name = "enroute-signature"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+name = "enroute_signature"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+base64.workspace = true
+ed25519-dalek.workspace = true
+http.workspace = true
+sha2.workspace = true
+thiserror.workspace = true

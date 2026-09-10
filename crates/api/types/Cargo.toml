@@ -1,0 +1,30 @@
+[package]
+name = "enroute-api"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+# Inherited like every other crate. What tonic's codegen trips is said once, as
+# an `#[expect]` on the module `include_proto!` expands into — eleven rules, not
+# the open-ended allow-list this used to assume. `expect` and not `allow`, so
+# that a rule the codegen stops tripping is reported rather than left standing.
+[lints]
+workspace = true
+
+# `include_proto!` expands the generated code into this crate, so `prost` and
+# `tonic-prost` are named by that expansion rather than by anything in `src/`,
+# and `protox`/`tonic-prost-build` are named by `build.rs`. A tool that reads
+# only `src/` sees all four as unused.
+[package.metadata.cargo-machete]
+ignored = ["prost", "prost-types", "tonic-prost", "protox", "tonic-prost-build"]
+
+[dependencies]
+prost.workspace = true
+prost-types.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+
+[build-dependencies]
+protox.workspace = true
+tonic-prost-build.workspace = true

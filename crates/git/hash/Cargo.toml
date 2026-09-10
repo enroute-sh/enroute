@@ -1,0 +1,30 @@
+[package]
+name = "enroute-git-hash"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+# Not the workspace's, because this crate is not all ours: `scalar.rs` and
+# `ubc_check.rs` are third-party MIT, carried with their notices. AND, not OR —
+# the crate contains work under both licences rather than offering a choice.
+license = "Apache-2.0 AND MIT"
+
+# What the line above is, declared so `xtask lint` reports a silent divergence
+# and lets this one through.
+[package.metadata.xtask]
+overrides = ["license"]
+
+[lib]
+name = "enroute_git_hash"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Only for its block buffer; the hashing is all in this crate.
+digest.workspace = true
+
+[dev-dependencies]
+# The oracle. Plain SHA-1 rather than sha1-checked, which shares this crate's
+# copied core; see src/tests.rs.
+sha1.workspace = true

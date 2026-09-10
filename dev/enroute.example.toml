@@ -1,0 +1,118 @@
+# What an Enroute deployment is, read once at startup:
+#
+#     enroute --config file:///etc/enroute/enroute.toml
+#     enroute --config s3://my-config/enroute.toml
+#
+# Any string may hold `${VAR}` from the environment. `$$` is a literal `$`, a
+# bare `$NAME` is refused, and a name the environment does not hold stops the
+# load. Numbers and booleans do not interpolate. Unknown keys are refused.
+#
+# Credentials are named here, not held: keep them `${VAR}` and this file stays
+# something to commit. See docs/operate/configuration.md for the rest.
+
+# Any store object_store reaches — s3://, gs://, az://, https://, file://,
+# memory:// — with the backend's own settings as the query, so `?endpoint=...`
+# belongs to the bucket that needs it.
+[bucket]
+uri = "s3://enroute-objects/prefix"
+
+# Only if the deployment has no role for the SDK to find. Prefer one that it
+# does — an instance role, IRSA — and leave this out. A credential never goes
+# in the query: a query value is form-decoded, so a `+` in a base64 key would
+# silently become a space, and one there is refused where it is written.
+#
+#     [bucket.credentials]
+#     access_key_id = "${AWS_ACCESS_KEY_ID}"
+#     secret_access_key = "${AWS_SECRET_ACCESS_KEY}"
+
+[database]
+# The tables land wherever this connection resolves unqualified names. For a
+# schema of its own, say so here: `?options=-csearch_path%3Denroute`.
+url = "${DATABASE_URL}"
+# A cap on concurrent pushes: one connection is held for a whole transaction.
+max_connections = 10
+# "auto" applies whatever schema steps are outstanding, then serves. Set "off"
+# where a DBA applies the DDL: a database that is behind is then refused.
+migrate = "auto"
+
+[hooks]
+# Enroute holds this half, an application holds the public one.
+signing_key = "${ENROUTE_HOOK_SIGNING_KEY}"
+# How long your application has to answer before the git request fails. Your
+# budget, not Enroute's: raise it for a heavy cold start, lower it to fail fast.
+timeout_secs = 10
+
+[tenants]
+# Re-read on a timer, so adding a tenant is an edit to that file and not a
+# restart of this one. It is the only thing here that changes while running.
+uri = "file:///etc/enroute/tenants.toml"
+
+# The revocation window: a tenant taken out of the list serves this long.
+refresh_secs = 30
+
+# Whatever can set this header is every tenant, so the `api` listener must not
+# be reachable except through whatever sets it — read docs/operate/security.md.
+header = "x-enroute-tenant"
+
+# Where a push's work runs: exactly one of these two tables, and the values a
+# choice needs are its own keys — a `region` under `local` is not a key.
+[ingest.local]
+# `file://` or `memory://` only: this process sweeps all of it at startup.
+scratch = "file:///data/scratch"
+
+# [ingest.lambda]
+# function = "enroute-ingest"                       # name or ARN
+# region = "eu-central-1"
+# handoff.uri = "s3://enroute-handoff?s3_express=true"   # directory bucket
+# max_pack_bytes = 1073741824
+# qualifier = "7"                                   # omit for the latest
+#
+# Both URIs go on every call to the function, which is configured with neither,
+# so the two ends cannot be pointed at different buckets. Their credentials do
+# not travel: an invoke payload is a thing CloudTrail keeps, and the function
+# reads its own from Secrets Manager. `handoff` takes a
+# `[ingest.lambda.handoff.credentials]` of its own, being routinely a different
+# provider from `bucket`.
+
+# Both default to every interface, which is what a container needs.
+[listen]
+api = "0.0.0.0:50051"
+git = "0.0.0.0:8080"
+
+# What a pass does, wherever it runs — the same windows for the in-process one
+# and for `enroute-maintenance`, so neither erases on a schedule the other
+# does not know about.
+[maintenance]
+# How old an unreferenced object must be before it counts as an orphan.
+# Under-waiting deletes a running push's bytes.
+grace_secs = 21600
+# How long a deleted repository can still be brought back, by clearing
+# `repositories.deleted_at`.
+deleted_grace_secs = 86400
+
+# Where it runs. `[maintenance.run.off]` instead, and something else invokes
+# `enroute-maintenance`. Both at once is safe: every step is idempotent.
+[maintenance.run.in-process]
+# A pass lists every repository's prefixes, trading that against how long an
+# orphan sits around.
+interval_secs = 900
+
+[sync]
+# Let PushToRemote dial http:// and addresses off the public internet, for a
+# development stack or a git server inside your own network.
+allow_private_remotes = false
+
+# Where spans go, over OTLP. Leave the table out and only the console gets
+# them. The endpoint is dialled as written — no `/v1/traces` is appended — and
+# the headers are how a collector knows the caller, so a vendor is a URL and
+# two headers rather than anything this repository names.
+#
+#     [telemetry]
+#     endpoint = "https://otlp.example.com/v1/traces"
+#     sample_ratio = 1.0                  # head-based, 0.0 to 1.0
+#
+#     [telemetry.headers]
+#     authorization = "Bearer ${OTEL_TOKEN}"
+#     "x-dataset" = "enroute"
+#
+# A header value is a secret like any other, so keep the token a `${VAR}`.

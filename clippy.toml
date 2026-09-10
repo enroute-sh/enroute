@@ -1,0 +1,17 @@
+excessive-nesting-threshold = 4
+allow-dbg-in-tests = true
+allow-expect-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-panic-in-tests = true
+allow-unwrap-in-tests = true
+
+# An unbounded fan-out over a push's commits exhausted a machine's file
+# descriptors in production; `enroute_git_ingest::concurrency::try_join_bounded`
+# is the gated replacement.
+[[disallowed-methods]]
+path = "futures::future::try_join_all"
+reason = "unbounded fan-out; use a concurrency-capped join"
+
+[[disallowed-methods]]
+path = "futures::future::join_all"
+reason = "unbounded fan-out; use a concurrency-capped join"

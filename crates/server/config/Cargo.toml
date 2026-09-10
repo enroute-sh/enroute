@@ -1,0 +1,39 @@
+[package]
+name = "enroute-config"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+name = "enroute_config"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[features]
+# The file, on by default because every reader of this crate but one wants it.
+# The exception is the ingest function, which is configured by the call it is
+# given and names only `StoreUri` — so it takes this with defaults off and
+# links neither a TOML parser nor the front door's schema. That crate makes
+# the same split internally between its two ends; this is the same reasoning
+# one level down.
+default = ["file"]
+file = ["dep:http", "dep:toml"]
+
+[dependencies]
+anyhow.workspace = true
+object_store.workspace = true
+serde = { workspace = true }
+url.workspace = true
+
+# For `HeaderName` alone: the header naming a call's tenant is refused where it
+# is configured rather than by the first call that carries it.
+http = { workspace = true, optional = true }
+toml = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The wire form a URI crosses the ingest call as, so the round trip is tested
+# against the encoding that actually carries it.
+serde_json.workspace = true

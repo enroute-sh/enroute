@@ -1,0 +1,37 @@
+# The local stack, mounted read-only at /etc/enroute/enroute.toml. Read once,
+# so an edit needs `docker compose restart enroute` — unlike `tenants.toml`
+# beside it. `dev/enroute.example.toml` is the whole format, commented.
+
+# A directory rather than a bucket, which is the only thing a local stack
+# changes about where objects go. No `[bucket.credentials]`: a directory needs
+# none, and a real deployment usually has a role instead.
+[bucket]
+uri = "file:///data/objects"
+
+[tenants]
+uri = "file:///etc/enroute/tenants.toml"
+# Two rather than the default thirty, so an edit shows up while you are still
+# looking at it.
+refresh_secs = 2
+
+[database]
+# Written out rather than `${DATABASE_URL}`: this password is `enroute`, in a
+# container, on a developer's own machine.
+url = "postgres://enroute:enroute@postgres:5432/enroute"
+
+[hooks]
+# RFC 9421's published test key — see docs/build/verify-the-signature.md. It guards nothing,
+# which is the only reason it can sit in a committed file. A real deployment
+# writes `signing_key = "${ENROUTE_HOOK_SIGNING_KEY}"`.
+signing_key = """
+-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEIJ+DYvh6SEqVTm50DFtMDoQikTmiCqirVv9mWG9qfSnF
+-----END PRIVATE KEY-----
+"""
+
+[ingest.local]
+# Swept whole at startup, so it is this process's alone.
+scratch = "file:///data/scratch"
+
+# `[listen]`, `[maintenance]` and `[sync]` are left out: their defaults are
+# what a container wants.

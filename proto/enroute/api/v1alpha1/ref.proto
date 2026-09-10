@@ -1,0 +1,135 @@
+syntax = "proto3";
+
+package enroute.api.v1alpha1;
+
+import "enroute/common/v1alpha1/common.proto";
+import "google/protobuf/timestamp.proto";
+
+// Refs, and moving them. What is left of a git exchange once Enroute
+// terminates the connection itself: a caller reads where the branches point
+// and moves them, and never handles a packfile.
+//
+// Introducing objects is git's job, over git. A ref here may only be pointed
+// at a commit this repository already stores, and a tip that is not one is
+// refused — so there is no pack to send and nothing to negotiate.
+service RefService {
+  // The repository's refs, and where `HEAD` points.
+  rpc ListRefs(ListRefsRequest) returns (ListRefsResponse);
+
+  // Move refs onto commits the repository already stores, atomically.
+  //
+  // No `pre-receive`: that hook is how an application decides what a *git
+  // client* may land, and the caller here is the application. What it cannot
+  // waive still holds — every tip must already be a commit this repository
+  // stores, so git remains the only way an object arrives.
+  rpc UpdateRefs(UpdateRefsRequest) returns (UpdateRefsResponse);
+
+  // Does `descendant_commit_id` have `ancestor_commit_id` in its history?
+  //
+  // The commit graph is here and an application is not, which is the same
+  // reason `pre-receive` is handed `RefCommand.force`. An application merging
+  // asks this before it moves a branch, and gets to decide what to do with the
+  // answer; Enroute holds no opinion about which refs may be rewritten.
+  //
+  // Safe to ask separately from the move it informs. Two commits are
+  // immutable, so their relationship is too — unlike where a ref points,
+  // which is why `UpdateRefs` compares `old_object_id` and this does not have
+  // to.
+  rpc IsAncestor(IsAncestorRequest) returns (IsAncestorResponse);
+}
+
+// ── refs ─────────────────────────────────────────────────────────────────
+
+message Ref {
+  // Fully qualified, e.g. `refs/heads/main`.
+  string name = 1;
+  common.v1alpha1.ObjectId object_id = 2;
+  // When this ref last moved. Unset for `HEAD`, which points at another ref
+  // rather than moving on its own, and so has no time of its own to report.
+  google.protobuf.Timestamp updated_at = 3;
+}
+
+message ListRefsRequest {
+  common.v1alpha1.RepoKey repo = 1;
+  // Return only refs under these prefixes. Empty returns every ref.
+  repeated string prefixes = 2;
+}
+
+message ListRefsResponse {
+  repeated Ref refs = 1;
+  // Where `HEAD` points, for a client that advertises a symref. Empty if the
+  // repository has no commits yet.
+  string default_branch = 2;
+}
+
+// Move `refname` from `old_object_id` to `new_object_id`.
+//
+// An unset `old_object_id` asks for a create, and is refused with
+// REASON_ALREADY_EXISTS if the ref is already there — it does not waive the
+// check, it changes what is checked. An unset `new_object_id` deletes.
+message RefUpdate {
+  string refname = 1;
+  common.v1alpha1.ObjectId old_object_id = 2;
+  common.v1alpha1.ObjectId new_object_id = 3;
+}
+
+message UpdateRefsRequest {
+  common.v1alpha1.RepoKey repo = 1;
+  // Applied atomically together. Outcomes come back in this order.
+  repeated RefUpdate updates = 2;
+}
+
+message IsAncestorRequest {
+  common.v1alpha1.RepoKey repo = 1;
+  // Both must be commits this repository stores.
+  common.v1alpha1.ObjectId ancestor_commit_id = 2;
+  common.v1alpha1.ObjectId descendant_commit_id = 3;
+}
+
+message IsAncestorResponse {
+  // False when either commit is unknown here, which is the same answer a
+  // caller can act on: it is not a history this repository can vouch for.
+  bool is_ancestor = 1;
+}
+
+message UpdateRefsResponse {
+  // One per update in `UpdateRefsRequest.updates`, in that order.
+  repeated RefUpdateOutcome outcomes = 1;
+}
+
+message RefUpdateOutcome {
+  string refname = 1;
+  // Unset when the update landed. A rejection is an outcome, not a call
+  // failure: a call can land some of its updates and reject others, so the
+  // RPC still succeeds.
+  Rejection rejection = 2;
+
+  message Rejection {
+    Reason reason = 1;
+    // Set only for REASON_POLICY, which is the one reason whose text is not
+    // derivable from the enum.
+    string message = 2;
+
+    enum Reason {
+      REASON_UNSPECIFIED = 0;
+      // The new tip is not a commit this repository stores. Push it over
+      // git first.
+      REASON_MISSING_OBJECTS = 1;
+      // The refname fails git's own funny-refname check.
+      REASON_FUNNY_REFNAME = 2;
+      // A branch was pointed at an object known not to be a commit.
+      REASON_NON_COMMIT_OBJECT = 3;
+      // A policy hook denied it. See `message`.
+      REASON_POLICY = 4;
+      // `old_object_id` did not match the ref's current value.
+      REASON_NON_FAST_FORWARD = 5;
+      // A create — an unset `old_object_id` — found the ref already present.
+      REASON_ALREADY_EXISTS = 6;
+      // Not a refname git itself would accept. Which namespaces a repository
+      // *admits* is an application's decision, made in `pre-receive` — Enroute
+      // stores any valid ref, including `refs/notes/*` and whatever an
+      // application invents for its own use.
+      REASON_INVALID_REFNAME = 7;
+    }
+  }
+}

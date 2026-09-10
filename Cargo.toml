@@ -1,0 +1,351 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/api/types",
+    "crates/api/signature",
+    "crates/lattice/core",
+    "crates/lattice/store",
+    "crates/server/app",
+    "crates/server/config",
+    "crates/server/postgres",
+    "crates/server/ingest-lambda",
+    "crates/git/store",
+    "crates/git/core",
+    "crates/git/cost",
+    "crates/git/graph",
+    "crates/git/graph-store",
+    "crates/git/ingest",
+    "crates/git/journal",
+    "crates/git/metadata",
+    "crates/git/objects",
+    "crates/git/packfile",
+    "crates/git/retrieve",
+    "crates/git/proto",
+    "crates/git/remote",
+    "crates/git/http",
+    "crates/git/hash",
+    "crates/git/test-support",
+    "dev/e2e",
+    "dev/load-test",
+    "dev/push-bench",
+    "dev/bench-support",
+    "dev/xtask",
+]
+default-members = ["crates/server/app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+# What ships. Fat LTO across the whole graph prunes the dependency code nothing
+# reaches, and one codegen unit lets it: the default sixteen give the optimizer
+# sixteen partial views. `strip` drops symbols the deployed binary never reads.
+#
+# No `panic = "abort"`. A panic in one git request must not take the other
+# connections down with it, and axum catches an unwinding handler; abort would
+# turn one malformed pack into an outage.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+
+# The fast loop: release codegen without the fat-LTO relink that dominates a
+# rebuild, plus incremental state. Never what ships — `cargo build --profile lab`
+# is for measuring something under optimization while still iterating on it.
+[profile.lab]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+incremental = true
+strip = false
+
+# Release codegen, but with full debug info (line tables + inlined-function
+# records) kept around. Sampling profilers can only attribute time spent in
+# inlined code back to its original function/line if that DWARF inline info
+# exists; a plain `--release` build (debug info off) collapses every inlined
+# callee into whichever caller it got folded into. Build with
+# `cargo build --profile profiling` and see `dev/profiling.md`.
+[profile.profiling]
+inherits = "release"
+debug = "full"
+# Explicit, because `release` strips and this profile inherits it. Without this
+# line the profile would carefully build the debug info and then throw it away.
+strip = false
+# macOS's linker leaves debug info in the intermediate object files rather
+# than the binary, referenced only by a debug map — fine for `lldb`, but it
+# means the profile stops symbolicating the moment `target/` gets cleaned or
+# the binary is copied elsewhere. `packed` runs `dsymutil` to collect
+# everything into a self-contained `.dSYM` next to the binary. Harmless on
+# Linux (where debug info is already embedded either way).
+split-debuginfo = "packed"
+
+[workspace.dependencies]
+enroute-api = { path = "crates/api/types" }
+enroute-signature = { path = "crates/api/signature" }
+
+enroute-lattice-core = { path = "crates/lattice/core" }
+enroute-lattice-store = { path = "crates/lattice/store" }
+
+enroute-git-store = { path = "crates/git/store" }
+enroute-git-core = { path = "crates/git/core" }
+enroute-git-cost = { path = "crates/git/cost" }
+enroute-git-graph = { path = "crates/git/graph" }
+enroute-git-graph-store = { path = "crates/git/graph-store" }
+enroute-git-ingest = { path = "crates/git/ingest" }
+enroute-git-journal = { path = "crates/git/journal" }
+enroute-git-metadata = { path = "crates/git/metadata" }
+enroute-git-objects = { path = "crates/git/objects" }
+enroute-git-packfile = { path = "crates/git/packfile" }
+enroute-git-retrieve = { path = "crates/git/retrieve" }
+enroute-postgres = { path = "crates/server/postgres" }
+enroute-git-proto = { path = "crates/git/proto" }
+enroute-git-remote = { path = "crates/git/remote" }
+enroute-git-http = { path = "crates/git/http" }
+enroute-git-hash = { path = "crates/git/hash" }
+enroute-git-test-support = { path = "crates/git/test-support" }
+
+# What a deployment configures, in the shapes both ends share. No clap: which
+# of these a command line names is the front door's, and this is not only its.
+# Defaults off for the reason `enroute-ingest-lambda` has them off: a consumer
+# takes the `file` half — the schema, and the TOML parser under it — only if it
+# reads one. The store grammar, `Bucket` and `Secret` are outside it, because
+# the ingest client names them to build a staging store and to hold a key.
+enroute-config = { path = "crates/server/config", default-features = false }
+
+# Both ends of the ingest worker protocol. A consumer takes exactly one of its
+# `client`/`server` features; there is no sensible default for a dependency.
+enroute-ingest-lambda = { path = "crates/server/ingest-lambda", default-features = false }
+
+# git protocol primitives
+gix-packetline = { version = "0.22", features = ["blocking-io"] }
+gix-hash = { version = "0.26", features = ["sha1"] }
+# HashMap/HashSet keyed by ObjectId, tuned for keys that are already
+# high-entropy hashes (skips re-hashing the full SHA-1 through SipHash)
+gix-hashtable = "0.16"
+# plain (hardware-accelerated) SHA-1 for hashing data we serve; object ids get
+# the collision-detecting one in `enroute-git-hash`
+sha1 = "0.11"
+digest = "0.11"
+gix-pack = "0.74"
+gix-actor = "0.42"
+gix-object = "0.64"
+gix-validate = "0.11"
+bstr = "1"
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+# One-shot zlib for objects already resident in memory — faster than streaming
+# because it sees the whole input. The wire path, which doesn't, stays on `flate2`.
+libdeflater = "1"
+
+# object storage. Every backend it can reach, because which one a deployment
+# uses is named by a URL at startup and is not a choice this repository makes.
+object_store = { version = "0.14", features = ["aws", "azure", "gcp", "http", "tokio"] }
+# The store URL type object_store itself parses, so both ends agree on what a
+# URL is.
+url = "2"
+
+tonic = "0.14"
+tonic-prost = "0.14"
+tonic-reflection = "0.14"
+prost = "0.14"
+# The well-known types, which the contract names for timestamps. Generated
+# code refers to them, so this is a dependency of the generated crate rather
+# than of anything hand-written.
+prost-types = "0.14"
+# Codegen, at build time only. `protox` compiles the `.proto` in-process, so a
+# `cargo build` needs no `protoc` and no `buf` — buf checks the contract (see
+# `buf.yaml`), it does not build it.
+tonic-prost-build = "0.14"
+protox = "0.9"
+futures = "0.3"
+async-stream = "0.3"
+roaring = "0.11"
+
+# http server
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tower = "0.5"
+tower-http = { version = "0.7", default-features = false, features = [
+    "trace",
+    "decompression-gzip",
+    "map-request-body",
+] }
+bytes = "1"
+# Decoding a git URL segment by segment. Not `url`, which parses a whole URL
+# and would resolve the `.` and `..` a repository path must instead refuse.
+percent-encoding = "2"
+
+# error handling
+anyhow = "1"
+thiserror = "2"
+
+# serde
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# syntax-only cross-crate analysis for `cargo xtask lint` (no name resolution:
+# see dev/xtask/src/lint/dead_code.rs)
+tree-sitter = "0.27"
+tree-sitter-rust = "0.24"
+# the skill's frontmatter, read the way an installer reads it rather than by a
+# parser of ours (see dev/xtask/src/lint/skill.rs). `encoding` off: the lint
+# hands it a `&str`, so there is nothing to detect an encoding of.
+yaml-rust2 = { version = "0.12", default-features = false }
+
+# misc
+lru = "0.18"
+rayon = "1"
+# segment S3 keys: opaque, with a timestamp the janitor's grace window reads
+ulid = "3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# distributed tracing export (OTLP over HTTP). The batch span processor runs
+# on its own dedicated thread regardless of the app's async runtime, so the
+# exporter needs the *blocking* reqwest client — a `reqwest-client` (async)
+# exporter panics there with "no reactor running", since that thread never
+# enters a Tokio context.
+opentelemetry = { version = "0.32", default-features = false, features = [
+    "trace",
+] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = [
+    "trace",
+] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+    "http-proto",
+    "reqwest-blocking-client",
+    "trace",
+] }
+tracing-opentelemetry = { version = "0.33", default-features = false }
+
+# The ingest worker's runtime, and the front door's client for invoking it.
+# `aws-config` is what resolves credentials: taking the SDK rather than signing
+# by hand is most of why the front door can use a role, and it refreshes
+# credentials instead of snapshotting them. `http` is the worker's own, for the
+# response prelude.
+lambda_runtime = "1"
+# `default-https-client` is what supplies the HTTP client, and a client-less SDK
+# fails only at the first call, at runtime. The default we drop, `rustls`, is the
+# deprecated hyper-0.14 connector, which duplicates the whole TLS stack.
+aws-sdk-lambda = { version = "1", default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+] }
+aws-config = "1"
+http = "1"
+
+# Configuration a deployment writes: a tenants file, and xtask's manifest
+# reading.
+toml = "1"
+
+# dev
+http-body-util = "0.1"
+walkdir = "2"
+tempfile = "3"
+insta = "1"
+proptest = "1"
+proptest-state-machine = "0.8"
+rand = "0.10"
+rand_distr = "0.6"
+rlt = "0.5.0"
+# Process CPU time across every thread, without this workspace taking on
+# `unsafe` to call `getrusage` itself.
+cpu-time = "1"
+# Hardware instruction counters, same reasoning for `perf_event_open`.
+perf-event = "0.4"
+reqwest = { version = "0.13", default-features = false }
+async-trait = "0.1"
+clap = { version = "4", features = ["derive", "env"] }
+
+# commit-graph metadata store (Postgres)
+sqlx = { version = "0.9", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "uuid",
+    # The schema's ledger, checksums and transactional apply. Not `macros`:
+    # the steps are embedded with `include_str!`, so nothing here needs a
+    # proc macro or the migrations directory at runtime.
+    "migrate",
+] }
+# Binary `COPY ... FROM STDIN` for the identity table, which takes a row per
+# object in a push and is the largest write there is.
+sqlx-pg-copy = "0.2"
+uuid = { version = "1", features = ["v4"] }
+
+# auth: Basic-auth header decoding, and the digests the hook signatures cover.
+base64 = "0.23"
+sha2 = "0.11"
+# The hook endpoint's RFC 9421 signatures. `pkcs8`/`pem` so a key is whatever
+# `openssl genpkey -algorithm ed25519` already wrote, rather than a shape only
+# this workspace knows how to read.
+ed25519-dalek = { version = "3", features = ["pkcs8", "pem"] }
+
+[workspace.lints.rust]
+# Only sees within a crate, and only for items that are not `pub` — rustc has
+# to assume a `pub` one has a caller it cannot see. `cargo xtask lint` covers
+# that half, across the workspace, where nothing is published and so the whole
+# set of callers is here.
+dead_code = "deny"
+missing_docs = "deny"
+unsafe_code = "deny"
+single_use_lifetimes = "deny"
+unused_lifetimes = "deny"
+redundant_lifetimes = "deny"
+variant_size_differences = "deny"
+non_ascii_idents = "deny"
+unit_bindings = "deny"
+let_underscore_drop = "deny"
+absolute_paths_not_starting_with_crate = "deny"
+unreachable_pub = "deny"
+unused_qualifications = "deny"
+trivial_casts = "deny"
+missing_debug_implementations = "deny"
+
+[workspace.lints.clippy]
+suspicious = { level = "deny", priority = -1 }
+style = { level = "deny", priority = -1 }
+complexity = { level = "deny", priority = -1 }
+perf = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+# internal workspace, not a published generic library — the standard
+# HashMap/HashSet hasher is fine everywhere, so generalizing over BuildHasher
+# would just be noise
+implicit_hasher = "allow"
+# restriction lints
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+as_conversions = "deny"
+assertions_on_result_states = "deny"
+cognitive_complexity = "deny"
+dbg_macro = "deny"
+debug_assert_with_mut_call = "deny"
+expect_used = "deny"
+float_cmp_const = "deny"
+format_push_string = "deny"
+get_unwrap = "deny"
+indexing_slicing = "deny"
+large_futures = "deny"
+let_underscore_future = "deny"
+let_underscore_must_use = "deny"
+lossy_float_literal = "deny"
+map_err_ignore = "deny"
+mem_forget = "deny"
+multiple_unsafe_ops_per_block = "deny"
+panic = "deny"
+panic_in_result_fn = "deny"
+path_buf_push_overwrite = "deny"
+print_stderr = "deny"
+print_stdout = "deny"
+rc_mutex = "deny"
+string_slice = "deny"
+todo = "deny"
+unchecked_time_subtraction = "deny"
+undocumented_unsafe_blocks = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+unused_result_ok = "deny"
+unwrap_in_result = "deny"
+unwrap_used = "deny"

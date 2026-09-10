@@ -1,0 +1,377 @@
+syntax = "proto3";
+
+package enroute.hook.v1alpha1;
+
+import "enroute/common/v1alpha1/common.proto";
+
+// The hook endpoint: what Enroute asks whoever owns the answers it cannot
+// have. Enroute terminates the git connection and stores the objects, but it
+// knows a repository only by an opaque id — not its name, not who owns it,
+// not who was allowed to ask. Those are the questions here.
+//
+// A package of its own because this is the contract pointing the other way.
+// `enroute.api.v1alpha1` is what an application calls; this is what calls an
+// application, over a different transport and answered by a different party.
+// The generic names here — `Header`, `Access`, `Granted` — are unambiguous
+// only because of that separation.
+//
+// This file declares no service on purpose. Every call is one POST to one URL
+// the application chooses, and `HookRequest.call` selects which. An
+// application mounts a single route and dispatches behind it, so adding a
+// call below does not ask an integrator to mount anything new or to learn a
+// path scheme. A service with a method per call would put the dispatch in the
+// URL, which is the part a serverless runtime makes awkward and the part
+// nobody wants to maintain by hand.
+//
+// Unary, and small. Nothing here streams: a decision is a question and an
+// answer, and every runtime that can serve an HTTP request can serve one.
+
+// ── the envelope ───────────────────────────────────────────────────────────
+
+message HookRequest {
+  oneof call {
+    AuthorizeRequest authorize = 1;
+    PreReceiveRequest pre_receive = 2;
+    PostReceiveRequest post_receive = 3;
+    VisibleRefsRequest visible_refs = 4;
+  }
+}
+
+message HookResponse {
+  // Answers the call that was made. An application that does not implement a
+  // call leaves this empty rather than guessing, and Enroute refuses the git
+  // request rather than proceeding on an answer nobody gave.
+  //
+  // `post_receive` is the exception, because it is the one call with nothing
+  // left to decide: the refs have moved, so silence there is noted and
+  // ignored rather than fatal.
+  oneof answer {
+    AuthorizeResponse authorize = 1;
+    PreReceiveResponse pre_receive = 2;
+    PostReceiveResponse post_receive = 3;
+    VisibleRefsResponse visible_refs = 4;
+  }
+}
+
+// ── authorize ──────────────────────────────────────────────────────────────
+
+// Which repository does this git request name, and who is asking?
+//
+// Asked once per git request, before anything is served. It carries the
+// request roughly as it arrived, because what a credential looks like and
+// what a path means are the application's business — Enroute cannot narrow
+// this to a parsed identity without deciding those first.
+message AuthorizeRequest {
+  // The repository exactly as the client spelled it, of any depth and with
+  // any `.git` still on it. What it is relative to — a namespace in the
+  // `Host`, a path prefix, nothing at all — is the application's business.
+  //
+  // `.git` is a convention of the URL a user typed and means nothing in the
+  // protocol, so stripping it here would decide what a path means. Serving
+  // both spellings as one repository is an application's to choose.
+  //
+  // A path and not a `RepoKey`: which repository the path means is the whole
+  // of what this call asks, so the two are never the same field.
+  string repo_path = 1;
+
+  // The request headers, carrying both the credential and whatever the
+  // application scopes it by.
+  repeated Header headers = 2;
+
+  // What the route about to run would do to the repository.
+  Access access = 3;
+}
+
+message AuthorizeResponse {
+  oneof outcome {
+    Granted granted = 1;
+    Denied denied = 2;
+  }
+}
+
+message Granted {
+  // The repository to serve, by the key this application gave it at
+  // CreateRepository — resolving a path to one is the whole of what it was
+  // asked. A key naming nothing this tenant has is a 404.
+  common.v1alpha1.RepoKey repo = 1;
+
+  // Whoever is asking, in the application's own namespace. Recorded on the
+  // request's spans and in what it cost, so it must be safe to keep: an id,
+  // never a credential and never an email.
+  //
+  // It comes from here rather than from the request because the git client is
+  // the one party that must not be trusted to say who it is. What it looks
+  // like inside is the application's business — Enroute stores it and never
+  // splits it.
+  string actor = 2;
+
+  // Whatever the application wants handed back on this request's hooks, byte
+  // for byte. Never parsed and never recorded: it may hold credential
+  // material, and Enroute holding a taxonomy of what an application puts here
+  // is the thing this field exists to avoid.
+  //
+  // Captured now and replayed when the hooks run, which on a large push is
+  // minutes later. An application that cares whether it is still true re-
+  // checks. At most 8 KiB; a longer one is refused as a fault, not a denial.
+  bytes context = 3;
+}
+
+message Denied {
+  Denial denial = 1;
+
+  // How to authenticate, sent with a 401. Read only for
+  // DENIAL_UNAUTHORIZED, and required there: git's own credential handling —
+  // netrc, credential helpers, a prompted retry — only engages off the header
+  // this carries, so a 401 without one is a dead end for the person behind
+  // the client.
+  Challenge challenge = 2;
+}
+
+enum Denial {
+  DENIAL_UNSPECIFIED = 0;
+  // No usable credential was presented.
+  DENIAL_UNAUTHORIZED = 1;
+  // A valid credential that does not grant this access.
+  DENIAL_FORBIDDEN = 2;
+  // No such repository — or one the caller may not be told about. Answering
+  // this ahead of DENIAL_UNAUTHORIZED tells an anonymous caller which
+  // repositories exist, so which of the two an application sends is its
+  // decision and not an ordering Enroute imposes.
+  DENIAL_NOT_FOUND = 3;
+}
+
+message Challenge {
+  // The `WWW-Authenticate` value.
+  string www_authenticate = 1;
+  // A plain-text body, which git prints as `remote:` lines. The one place to
+  // tell someone why the credential they hold will never work. Include the
+  // trailing newline; git renders it verbatim.
+  string help = 2;
+}
+
+// ── pre-receive ────────────────────────────────────────────────────────────
+
+// Git's `pre-receive` hook, for a repository whose hooks live in another
+// process. The push has arrived, its objects are stored, and no ref has
+// moved. Which of these commands may land?
+//
+// The ordering is `receive-pack`'s own, and both halves of it matter.
+// `RefCommand.force` is an ancestry question whose answer does not exist
+// until the new commits do, and an application that wants to read what was
+// pushed can do so over the contract before it answers.
+//
+// This is where protected branches, merge queues, and "this branch needs a
+// review" live. Enroute holds no policy of its own and asks on every push: an
+// application with nothing to say allows every command, which is what having
+// no hook installed has always meant.
+message PreReceiveRequest {
+  // The repository, as Enroute knows it. An application that keeps names
+  // looks this up; an application that does not already has everything it
+  // needs.
+  common.v1alpha1.RepoKey repo = 1;
+
+  // Who is pushing, as `Granted.actor` named them in the `Authorize` that
+  // admitted this request. Whoever reached here already has write access —
+  // this is for policy that cares *which* writer, not whether.
+  string actor = 2;
+
+  // Every command the push still asks for, less any Enroute already refused
+  // on its own (a non-fast-forward, an object that never arrived). A hook
+  // sees what is still live, so a judgement it returns is never for something
+  // already dead.
+  repeated RefCommand commands = 3;
+
+  // `Granted.context`, byte for byte, from the `Authorize` that admitted this
+  // push.
+  bytes context = 4;
+}
+
+// One ref update a push is asking for — git's own unit, the line a
+// `pre-receive` hook reads one of per command.
+message RefCommand {
+  // The full refname, e.g. `refs/heads/main`.
+  string refname = 1;
+
+  // `old_object_id` is unset when the command creates the ref,
+  // `new_object_id` when it deletes it — which is the thing a hook actually
+  // asks, where git's own forty zeroes is a trap.
+  common.v1alpha1.ObjectId old_object_id = 2;
+  common.v1alpha1.ObjectId new_object_id = 3;
+
+  // Whether `old_object_id` is *not* an ancestor of `new_object_id` — what a
+  // hook running next to the repository would work out with `merge-base
+  // --is-ancestor`. Answered here because the hook is somewhere else and the
+  // commit graph is not. Only ever true for a command with both ids: a create
+  // or a delete rewrites no history.
+  bool force = 4;
+}
+
+// What may land, said one command at a time.
+//
+// Every command in the request needs a judgement of its own, matched to it by
+// refname. A command nobody judged fails the whole push, the way a call
+// nobody answered does: Enroute cannot tell an application that meant to
+// allow a ref from one whose policy never reached it.
+//
+// Naming only what is refused would read better on the application with no
+// policy, but every mistake it can make then lands the push — a refname spelt
+// wrong, a rule written over one namespace and applied to all of them, a
+// judgement lost to an early return. None of those looks wrong from the
+// application's side, and all of them let a push through unexamined. An
+// answer that must name every command turns each of them into a push that
+// fails, which is the direction to fail in.
+message PreReceiveResponse {
+  repeated RefJudgement judgements = 1;
+}
+
+// One command, judged.
+message RefJudgement {
+  // Which command this judges, as `RefCommand.refname` spelled it. One that
+  // names no command in this push is ignored: it answers a question nobody
+  // asked, and reading it could only refuse a ref nobody was shown.
+  //
+  // A refname judged more than once is refused if any of those judgements
+  // refuses it.
+  string refname = 1;
+
+  Judgement judgement = 2;
+
+  // What to tell whoever pushed. Read only for JUDGEMENT_REFUSE, and all
+  // they get: name the ref and say what to do instead. Reaches the client as
+  // `REASON_POLICY`, whose message is exactly this — the way a hook's stderr
+  // reaches it.
+  string reason = 3;
+}
+
+enum Judgement {
+  // Not a decision. A command judged this way is a command nobody judged,
+  // and the push fails: proto3 gives an unset field the zero value, so the
+  // zero value here must not be the one that lets a ref through.
+  JUDGEMENT_UNSPECIFIED = 0;
+  // This command may land.
+  JUDGEMENT_ALLOW = 1;
+  // This command may not land, for `reason`.
+  JUDGEMENT_REFUSE = 2;
+}
+
+// ── post_receive ───────────────────────────────────────────────────────────
+
+// Git's `post-receive` hook: the refs have moved, and this says what landed.
+//
+// Nothing here can be refused, which is what makes it the call CI belongs on.
+// An application learns a branch has a new tip at the moment it does, rather
+// than by listing refs on a timer and comparing them with what it saw last.
+//
+// Delivery is best-effort and at most once. Enroute sends this after the push
+// has already succeeded, so it cannot retry without lying to a client that is
+// gone — an application that was unreachable is simply not told. Anything whose
+// correctness depends on being told needs its own record; this is latency, not
+// a guarantee.
+//
+// Enroute waits for the answer and ignores it, the way `receive-pack` waits
+// for `post-receive` and ignores its exit code. An application that fails
+// here has not undone anything, so the push is not failed for it.
+message PostReceiveRequest {
+  // The repository, as Enroute knows it.
+  common.v1alpha1.RepoKey repo = 1;
+
+  // Who pushed, as `Granted.actor` named them. Always a git client: an
+  // application moving a ref over the contract runs no hooks, so its own
+  // writes never arrive back here.
+  string actor = 2;
+
+  // Every command that landed, and only those. A push whose commands were all
+  // refused sends nothing at all rather than an empty list.
+  repeated RefCommand commands = 3;
+
+  // `Granted.context`, byte for byte, from the `Authorize` that admitted this
+  // push.
+  bytes context = 4;
+}
+
+// Nothing that changes what happened, and something to say about it.
+message PostReceiveResponse {
+  // Lines to print to whoever pushed, the way git prints a `post-receive`
+  // hook's stdout. This is where "open a merge request at ..." comes from on
+  // every other application, and there is nowhere else it could come from: an
+  // application is not on the connection, and by here nothing is left to
+  // refuse.
+  //
+  // Sent as sideband progress frames before the report-status body, so they
+  // reach the client above the `ok <ref>` lines. A client that negotiated no
+  // sideband has no channel to receive them on and is sent none, which is
+  // also what git does.
+  //
+  // Best-effort like the call itself. Nothing here is retried, and an
+  // application that must be sure a person saw something should not say it
+  // only here.
+  repeated string messages = 1;
+}
+
+// ── visible-refs ───────────────────────────────────────────────────────────
+
+// Which of these refs may this caller see?
+//
+// Asked before every ref advertisement, with the refs Enroute would otherwise
+// send. An application answers with the ones it will admit to, and Enroute
+// advertises those. This is where a private branch, a hidden `refs/pull/`
+// namespace, or a ref only its author may see comes from.
+//
+// The refs are sent rather than described, because visibility is the
+// application's own question: a pattern Enroute understood would only be the
+// subset of policies somebody thought to spell, where a list is every policy
+// at once.
+//
+// This hides refs; it does not make their objects unreachable. A client that
+// already knows a hidden tip's object id may still fetch it, which is what
+// git's own `uploadpack.hideRefs` does too. Anything whose secrecy must
+// survive a guessed object id needs a repository of its own.
+message VisibleRefsRequest {
+  // The repository, as Enroute knows it.
+  common.v1alpha1.RepoKey repo = 1;
+
+  // Who is asking, as `Granted.actor` named them in the `Authorize` that
+  // admitted this request.
+  string actor = 2;
+
+  // Whether the advertisement is a fetch's or a push's. The same refs, asked
+  // about twice, because what a caller may read and what it may be told is
+  // writable are not the same question.
+  Access access = 3;
+
+  // Every refname Enroute would advertise, `HEAD` excluded — it names no ref
+  // of its own, and it is hidden automatically when what it points at is.
+  repeated string refnames = 4;
+
+  // `Granted.context`, byte for byte, from the `Authorize` that admitted this
+  // request. An application deciding what a caller may see needs the same auth
+  // context it gets on the hooks, and for the same reason.
+  bytes context = 5;
+}
+
+// The refs to advertise. Anything Enroute sent and does not read back is
+// hidden; anything read back that was never sent is ignored, since this
+// answers which refs may be seen and not which exist.
+message VisibleRefsResponse {
+  repeated string refnames = 1;
+}
+
+// ── shared ─────────────────────────────────────────────────────────────────
+
+// What a request needs to do to a repository. The whole of what Enroute knows
+// about permission — the tiers an application grades it into are the
+// application's business.
+enum Access {
+  ACCESS_UNSPECIFIED = 0;
+  // Advertising refs for a fetch, and `upload-pack` itself.
+  ACCESS_READ = 1;
+  // `receive-pack`, and the ref advertisement that precedes it.
+  ACCESS_WRITE = 2;
+}
+
+// One header as it arrived. Repeated rather than a map, because a header may
+// appear more than once and the one carrying a credential is allowed to.
+message Header {
+  string name = 1;
+  string value = 2;
+}

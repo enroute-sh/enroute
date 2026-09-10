@@ -1,0 +1,12 @@
+# Anything not listed here is copied into the build context, and a context that
+# carries `target/` is most of a gigabyte of it.
+/target
+.git
+.cargo
+*.pending-snap
+.DS_Store
+.envrc
+/result
+/result-*
+/.direnv
+/.pgdata

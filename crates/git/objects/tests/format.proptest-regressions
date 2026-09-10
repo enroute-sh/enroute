@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 3b28804f192f00a66cbabbbe85d3848edeef3e43915605d3cec6c0121746d8a6 # shrinks to index = ObjectIndex { entries: [(3, Object { locations: [Location { pack_seq: 2, pack_oid: Sha1(0202020202020202020202020202020202020202), segment: SegmentLocation { id: Ulid(3), base_offset: 4, image_len: 5 }, offset: 6, entry_len: 7, base_seq: None }, Location { pack_seq: 2, pack_oid: Sha1(0202020202020202020202020202020202020202), segment: SegmentLocation { id: Ulid(3), base_offset: 4, image_len: 5 }, offset: 6, entry_len: 7, base_seq: Some(0) }], children: ObjectSeqs { trees: RoaringTreemap<[]>, blobs: RoaringTreemap<[]> } })] }
+cc 50212f312ef8801e347a7c3cfdc0afb9f92ef3f36648d8a616ab442e97e30df8 # shrinks to a = ObjectIndex { entries: [] }, b = ObjectIndex { entries: [(39, Object { locations: [Location { pack_seq: 1, pack_oid: Sha1(0101010101010101010101010101010101010101), segment: SegmentLocation { id: Ulid(2), base_offset: 3, image_len: 4 }, offset: 5, entry_len: 6, base_seq: None }, Location { pack_seq: 1, pack_oid: Sha1(0101010101010101010101010101010101010101), segment: SegmentLocation { id: Ulid(2), base_offset: 3, image_len: 4 }, offset: 5, entry_len: 6, base_seq: Some(0) }], children: ObjectSeqs { trees: RoaringTreemap<[]>, blobs: RoaringTreemap<[]> } })] }, c = ObjectIndex { entries: [] }

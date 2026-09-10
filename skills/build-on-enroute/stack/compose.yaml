@@ -1,0 +1,83 @@
+# Enroute, locally, from the published image. The application is yours.
+#
+#     $EDITOR config/tenants.toml       # hook_endpoint_url is yours
+#     docker compose up -d
+#     docker compose down -v            # and erase all of it
+#
+# Nothing here is built, and nothing is cloned. This directory is the whole
+# stack, installed beside the skill that describes it. The repository's own
+# `compose.yaml` declares the same two services, builds from `Dockerfile`
+# instead of naming a published image, and mounts `./dev/config`.
+#
+# The image names one release: the one this skill shipped beside. A skill
+# installed a year from now still starts the Enroute its recipes and its proto
+# were written against. `cargo xtask lint` holds the two in step. There is no
+# variable to point this elsewhere, because the recipes, the proto, and the
+# server are one release. Reinstall the skill to move all of them.
+#
+# `config/` is mounted read-only at /etc/enroute and holds both files.
+# `enroute.toml` is the deployment, read once, so an edit to it needs
+# `docker compose restart enroute`. `tenants.toml` is re-read every two
+# seconds, so pointing it at your application is an edit and not a restart.
+#
+# The contract authenticates nobody. A call names its tenant in a header,
+# `x-enroute-tenant: dev`, and this stack puts nothing in front of the
+# listener to set it. Anything that can reach 50051 is that tenant. That is a
+# laptop, not a deployment.
+#
+# There is no application in this stack. Enroute calls yours when a git
+# request arrives and not before, so until then only the contract works.
+#
+# Nothing is applied to Postgres first. Enroute brings its tables up to what
+# the image reads at every start, so an upgrade is a new image tag.
+#
+# `down -v` is the reset. It drops the volumes, so the tables and the objects
+# come back fresh. The configuration is a mount, not a volume, so it stays.
+#
+# Git is published on 8080 and the contract on 50051.
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: enroute
+      POSTGRES_PASSWORD: enroute
+      POSTGRES_DB: enroute
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # 5433, not 5432: a developer machine usually already has one on 5432.
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U enroute -d enroute"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  enroute:
+    image: ghcr.io/enroute-sh/enroute:0.1.0
+    command:
+      # The whole deployment, read from the mount below.
+      - --config=file:///etc/enroute/enroute.toml
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "8080:8080"
+      - "50051:50051"
+    volumes:
+      - enroute-objects:/data
+      # The directory, never the file. A bind mount of one file pins one
+      # inode, and a tenants file is replaced by a rename over it.
+      - ./config:/etc/enroute:ro
+    # Your application runs outside this stack. On Linux the host is not
+    # otherwise nameable from inside a container.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Postgres and nothing else: the schema is this service's own to apply.
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  enroute-objects:

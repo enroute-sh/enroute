@@ -1,0 +1,60 @@
+# The tenants an Enroute serves. Point `--tenants` at it as a URL:
+#
+#     --tenants=file:///etc/enroute/tenants.toml
+#     --tenants=s3://my-config/tenants.toml
+#
+# Re-read every `--tenants-refresh` seconds, and only when the store says it
+# changed. A list that does not load leaves whatever is already serving in
+# place, so a bad edit costs a log line at ERROR and nothing else.
+#
+# Replace it by writing beside it and renaming, never in place: a reader that
+# arrives mid-write sees half a file, and while that is only refused rather
+# than served, there is no reason to make it happen.
+#
+# Nothing here is a credential. Who may call as a tenant is decided in front of
+# Enroute rather than here — see the note at the end — so a list may be
+# committed and mounted like any other configuration.
+
+# The table name is the tenant's id: what the ownership table keys every one of
+# its repositories by, and the one thing that must never change. Renaming this
+# table hands them to nobody.
+#
+# 1 to 64 of a-z, 0-9, dash or underscore. No dots — a dot starts a sub-table,
+# so `[tenants.a.b]` is `a`'s `b` and never a tenant called `a.b`. An opaque id
+# is a better choice here than a name somebody may want to change.
+[tenants.acme]
+
+# Where this tenant's application answers. Enroute signs every call over this
+# exact authority and path, so it must match what the application verifies
+# against byte for byte.
+hook_endpoint_url = "https://acme.example.com/enroute/hooks"
+
+# Every hostname that reaches this tenant, and the only thing that decides it.
+# A name on its own is claimed exactly; `*.example.com` claims everything under
+# it, at any depth, but never `example.com` itself.
+#
+# Most specific wins: a name claimed outright beats any suffix that would also
+# match it, and a longer suffix beats a shorter one. A subdomain of whatever
+# domain the deployment serves is written out here like any other name — there
+# is no second mechanism for it.
+domains = ["acme.enroute.sh", "git.acme.com", "*.acme.com"]
+
+[tenants.dev]
+hook_endpoint_url = "http://host.docker.internal:3000/enroute/hooks"
+
+# `*` is simply the least specific suffix: whatever no other tenant claimed
+# reaches this one. At most one tenant may hold it, and it never takes traffic
+# from a name above.
+domains = ["*"]
+
+# A third tenant is another table:
+#
+#     [tenants.beta]
+#     hook_endpoint_url = "https://beta.example.com/enroute/hooks"
+#     domains = ["beta.enroute.sh"]
+#
+# Nothing here says who may *call* as a tenant. That is decided by whatever
+# sits in front of the contract listener — a proxy, a gateway, a mesh — which
+# authenticates the caller and names the tenant of each call in a header.
+# Whatever can set that header is every tenant, so read docs/operate/security.md before
+# putting this anywhere.

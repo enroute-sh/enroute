@@ -1,0 +1,40 @@
+[package]
+name = "push-bench"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "push-bench"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+enroute-postgres.workspace = true
+enroute-git-cost.workspace = true
+enroute-git-ingest.workspace = true
+enroute-git-retrieve.workspace = true
+enroute-git-store.workspace = true
+bench-support = { path = "../bench-support" }
+
+gix-hash.workspace = true
+object_store.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+sqlx.workspace = true
+
+anyhow.workspace = true
+clap.workspace = true
+cpu-time.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing-subscriber.workspace = true
+
+# Hardware performance counters, which only Linux has an interface for. Not
+# optional-on-a-feature: whether the counters exist is a property of where
+# this runs, not of how it was asked to build.
+[target.'cfg(target_os = "linux")'.dependencies]
+perf-event.workspace = true

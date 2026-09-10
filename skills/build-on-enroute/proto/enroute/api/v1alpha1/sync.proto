@@ -1,0 +1,114 @@
+syntax = "proto3";
+
+package enroute.api.v1alpha1;
+
+import "enroute/common/v1alpha1/common.proto";
+
+// Sending what this repository holds to a git server somewhere else.
+//
+// The mirror of the rest of the contract: everywhere else Enroute is the git
+// server and something else is the client, and here Enroute is the client. A
+// caller names a remote and the refs to send, and Enroute speaks git to that
+// remote — so an application that mirrors to GitHub holds no repository of
+// its own, runs no `git push`, and builds no packfile.
+//
+// Nothing about a remote is stored. A call carries the URL and the
+// credentials it needs, because a remote is a relationship between an
+// application's repository and somebody else's, and this layer holds no
+// repository names to hang one off.
+service SyncService {
+  // Push refs to a remote, and report what each one did.
+  //
+  // A ref that the remote refuses is an outcome, not a call failure, as in
+  // `RefService.UpdateRefs` — a push can land some refs and be refused
+  // others. The call itself fails only when the remote cannot be reached or
+  // will not talk git.
+  rpc PushToRemote(PushToRemoteRequest) returns (PushToRemoteResponse);
+}
+
+// A git server somewhere else, and what proves a push may land there.
+message Remote {
+  // The URL a git client would be given, e.g.
+  // `https://github.com/acme/widgets.git`. Smart HTTP only, and `https` only
+  // unless the deployment allows otherwise.
+  string url = 1;
+
+  // Credentials sent with every request, rather than after a challenge: a
+  // git host answers an unauthenticated push with a 401 and nothing else, so
+  // waiting to be asked only costs a round trip.
+  //
+  // GitHub reads a personal access token or an app installation token as the
+  // `basic` password, and ignores the username.
+  oneof credentials {
+    BasicAuth basic = 2;
+    // Sent as `Authorization: Bearer`, for a host that reads one.
+    string bearer_token = 3;
+  }
+}
+
+message BasicAuth {
+  string username = 1;
+  string password = 2;
+}
+
+// One ref to send: what it is called here, and what it is called there.
+message RefSpec {
+  // The ref to send, fully qualified, e.g. `refs/heads/main`. Empty deletes
+  // `destination` instead.
+  string source = 1;
+  // The ref to move on the remote, fully qualified. Empty is `source` under
+  // the same name.
+  string destination = 2;
+  // Send even when what the remote holds is not an ancestor of what is sent,
+  // which loses whatever is only on the remote.
+  //
+  // Checked here rather than there: git's own wire protocol carries no force
+  // bit, so a client is what refuses a push that would discard history, and
+  // Enroute is the client. A remote that holds a commit this repository does
+  // not is not a fast-forward this repository can prove, so it needs this
+  // too.
+  bool force = 3;
+}
+
+message PushToRemoteRequest {
+  common.v1alpha1.RepoKey repo = 1;
+  Remote remote = 2;
+  // What to send. Empty is refused rather than meaning every ref: which refs
+  // leave a repository is a decision, and a default would make it silently.
+  repeated RefSpec refs = 3;
+  // Land every ref or none, using git's `atomic` capability.
+  //
+  // Refused when the remote does not offer it, rather than falling back to
+  // one ref at a time: a caller that asked for all-or-nothing and got a
+  // partial push has no way to tell.
+  bool atomic = 4;
+}
+
+message PushToRemoteResponse {
+  // One per `PushToRemoteRequest.refs`, in that order.
+  repeated RefPushOutcome outcomes = 1;
+}
+
+message RefPushOutcome {
+  // The ref on the remote this is about.
+  string destination = 1;
+  // What the remote had before this call, and what it was asked to hold.
+  // Unset for a ref that did not exist or was deleted.
+  common.v1alpha1.ObjectId old_object_id = 2;
+  common.v1alpha1.ObjectId new_object_id = 3;
+  Status status = 4;
+  // Why, for `STATUS_REJECTED`. The remote's own words when the remote
+  // refused, and Enroute's when the fast-forward check did.
+  string message = 5;
+
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    // The remote moved the ref, or created it.
+    STATUS_UPDATED = 1;
+    STATUS_DELETED = 2;
+    // The remote already held what was sent, so nothing was sent for it.
+    STATUS_UP_TO_DATE = 3;
+    // See `message`.
+    STATUS_REJECTED = 4;
+  }
+}

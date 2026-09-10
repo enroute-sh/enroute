@@ -1,0 +1,26 @@
+[package]
+name = "enroute-git-graph"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+name = "enroute_git_graph"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+enroute-git-core.workspace = true
+gix-actor.workspace = true
+gix-object.workspace = true
+gix-hash.workspace = true
+anyhow.workspace = true
+roaring.workspace = true
+
+[dev-dependencies]
+# Itself, with the object-id fixture on, so a test names an object the same
+# way every other layer's do.
+enroute-git-core = { workspace = true, features = ["fixtures"] }

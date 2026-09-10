@@ -1,0 +1,16 @@
+Enroute
+Copyright 2026 OpenCanopy GmbH
+
+This product includes software developed at OpenCanopy GmbH, licensed under
+the Apache License, Version 2.0 (see LICENSE).
+
+It also includes third-party software under the MIT licence, carried with the
+notices its licence requires:
+
+  crates/git/hash/src/scalar.rs
+  crates/git/hash/src/ubc_check.rs
+    Collision-detecting SHA-1, from the `sha1-checked` crate, itself a
+    translation of Marc Stevens and Dan Shumow's `sha1collisiondetection`.
+    Copyright (c) 2017 Marc Stevens (CWI) and Dan Shumow (Microsoft Research)
+    Copyright (c) 2024 The RustCrypto Project Developers
+    The full permission notice is at the head of each file.

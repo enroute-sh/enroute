@@ -1,0 +1,327 @@
+# The deploy image, built from what is on a channel branch and pushed to the
+# GitHub Container Registry.
+#
+# It builds `Dockerfile` unchanged, so what is published is what a deployment
+# runs. The lints are a job here rather than a stage there: `build` waits on
+# them, so a release that fails them still publishes nothing, and a rustfmt
+# violation now costs half a minute rather than two full builds.
+#
+# One architecture per runner, and each runner is the architecture it builds.
+# Nothing is cross-compiled — see `rust-toolchain.toml` — and emulation is not
+# an option, because the build is the whole workspace under fat LTO. So the two
+# builds push an image each, by digest and without a tag, and a third job joins
+# them into one manifest list that the tags then name.
+#
+# Releases live on `main`, the only channel. It is not called `stable`:
+# nothing between two `0.x` releases is, and a channel that claimed otherwise
+# would say the opposite of `docs/reference/limitations.md`. A pre-release
+# channel says twice what a `0.x` number already says, so there is none; add
+# one when 1.0 gives it something to stage.
+#
+# The branch is squashed from the trunk, so a release is one commit and
+# re-releasing a version is a force-push. A version tag names one image for
+# good, so `version` refuses to build a version the registry already holds:
+# a re-cut carries a new number, and a bad release costs a patch. `sha-<commit>`
+# never moves either.
+#
+# `main` publishes `:latest` rather than `:main`, so the branch does not name
+# the tag. A bare `docker pull` asks for `:latest`, and a second moving tag
+# beside it would name the same image twice.
+#
+# That commit's message is the release notes. There is no changelog file, so
+# `git log main` is what each release changed. Keep `#` out of the body: git
+# drops a line starting with one when the message goes through an editor.
+#
+# Nothing is tagged in git yet. `main` is permanent, so a tag here would now
+# outlive nothing and a release could carry one. A release is pinned by its
+# image tag, and the skill ships pinned to the version it was built beside.
+name: release
+
+# By hand, and only by hand. Publishing is not something a push should do as a
+# side effect: the trunk is also called `main`, a re-cut is a force-push to the
+# channel, and either would otherwise start a release nobody asked for. It
+# also keeps a fork from publishing merely because someone pushed to it.
+#
+# So the branch is prepared first and released when it is ready, and a re-run
+# after a registry or a runner failure needs no empty commit. A dispatch can
+# name any branch, which is why `CHANNELS` allow-lists them below.
+on:
+  workflow_dispatch:
+
+# One build at a time per channel, so two runs cannot race for the channel tag
+# and leave it on the older of them. Two channels do not wait on each other: at
+# a rollover both publish, and neither names the other's tags.
+concurrency:
+  group: release-image-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  # Where this run pushes, which is whichever repository is running it. A
+  # dispatch on the internal repository therefore rehearses a release into its
+  # own package, and nothing a rehearsal pushes can land on the real one.
+  IMAGE: ghcr.io/${{ github.repository }}
+  # What a release is published as, wherever it was built. The skill pins this
+  # and not `IMAGE`: it ships pointing at the release, not at the run that
+  # happened to make it.
+  RELEASE_IMAGE: ghcr.io/enroute-sh/enroute
+  # Which branches publish. A dispatch can name any branch, and this is the
+  # only thing that stops one naming the trunk and publishing it under
+  # whatever version its manifest happens to hold.
+  CHANNELS: main
+
+jobs:
+  # Both jobs below need the version, and reading it in each of them is two
+  # places for it to be read differently.
+  version:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      # To read whether this version is published already.
+      packages: read
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # Before anything is read or built. A branch that is not a channel does
+      # not publish, however this workflow was started.
+      - name: Check the branch is a channel
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          for channel in ${CHANNELS}; do
+            if [ "${channel}" = "${BRANCH}" ]; then
+              exit 0
+            fi
+          done
+          echo "::error::${BRANCH} is not a release channel (${CHANNELS})."
+          exit 1
+
+      # The manifest is the one source of the version. The image is labelled
+      # with it and tagged with it, so what the image says it is and what it is
+      # called cannot disagree.
+      - name: Read the version
+        id: read
+        run: |
+          version="$(awk '
+            /^\[workspace\.package\]/ { in_table = 1; next }
+            /^\[/                     { in_table = 0 }
+            in_table && /^version[[:space:]]*=/ {
+              gsub(/^version[[:space:]]*=[[:space:]]*"|"[[:space:]]*$/, "")
+              print
+              exit
+            }
+          ' Cargo.toml)"
+          test -n "${version}"
+          echo "version=${version}" >>"${GITHUB_OUTPUT}"
+
+      # A release carries a release number. Without this, a branch squashed
+      # from a working `develop` ships whatever pre-release number that
+      # manifest happens to hold, and the number is what a deployment pins.
+      - name: Check the version is not a pre-release
+        env:
+          VERSION: ${{ steps.read.outputs.version }}
+        run: |
+          # Semver puts the pre-release after a `-`, so a release number holds
+          # none.
+          case "${VERSION}" in
+            *-*)
+              echo "::error::${VERSION} is a pre-release, which ${CHANNELS} does not publish."
+              exit 1
+              ;;
+          esac
+
+      # The package is not necessarily public, and an anonymous inspect of a
+      # private one fails the same way an absent tag does: as a miss, which is
+      # the answer that lets a build through.
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # What makes a version tag worth pinning: it is written once. The channel
+      # branch can still be force-pushed, so this is what makes a re-cut carry
+      # a new number, and it runs before the two-hour build rather than after
+      # it.
+      - name: Check the version is unpublished
+        env:
+          VERSION: ${{ steps.read.outputs.version }}
+        run: |
+          if docker buildx imagetools inspect "${IMAGE}:${VERSION}" >/dev/null 2>&1; then
+            echo "::error::${IMAGE}:${VERSION} is published. A release is never rebuilt: bump the version."
+            exit 1
+          fi
+
+      # The skill starts the release it shipped beside, so its stack names this
+      # version outright rather than a moving tag. `cargo xtask lint` says the
+      # same thing, and is not run here: it needs `buf` installed, and this is
+      # the moment the answer has to be right.
+      #
+      # Against `RELEASE_IMAGE`, because an installed skill starts the release
+      # wherever it was built. Reading `IMAGE` here would fail every rehearsal
+      # on the internal repository for naming the image the skill does not.
+      - name: Check the skill starts this release
+        env:
+          VERSION: ${{ steps.read.outputs.version }}
+          STACK: skills/build-on-enroute/stack/compose.yaml
+        run: |
+          if ! grep -q "image: ${RELEASE_IMAGE}:${VERSION}\$" "${STACK}"; then
+            echo "::error::${STACK} does not start ${VERSION}: an installed skill would start the wrong Enroute."
+            grep -n "image: ${RELEASE_IMAGE}" "${STACK}" || true
+            exit 1
+          fi
+
+  # Once, on one machine, and before anything is built. They were a stage in
+  # `Dockerfile` while there was no CI to hold them, which made a style
+  # violation stop an image and made `docker compose up --build` pay for clippy
+  # before the stack could start.
+  #
+  # Only the lints. Most of the suite needs no database at all; the half that
+  # does is behind `postgres-tests` — see docs/internals/quality-assurance.md
+  # for both.
+  lint:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      # `rust-toolchain.toml` names the compiler and both components, so cargo
+      # installs what this needs on the first call and no step here picks a
+      # version.
+      - run: cargo fmt --all --check
+
+      # The dev profile. A lint reads the same code either way, and the release
+      # profile would compile every test and bench target under fat LTO to say
+      # so.
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # Both tools below, before the rules that need them and after the two
+      # cheap checks above, so a rustfmt violation is not paid for by an
+      # install. `cargo xtask lint` counts a missing binary as a violation
+      # rather than a skip, on the grounds that a check which passes when its
+      # checker is absent is one nobody notices is dead.
+      - uses: bufbuild/buf-setup-action@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      # From source, rather than a third-party installer action. Everything
+      # else here comes from GitHub, Docker or Buf, and the workflow that
+      # publishes the image is not the place to widen that: a minute against a
+      # build measured in hours.
+      - run: cargo install cargo-machete --locked
+
+      # The rules the compiler cannot hold: crate layering, imports, dead code
+      # across crates, doc-comment shape, unused dependencies, the protobuf
+      # module, and whether the skill still ships this release.
+      # docs/internals/development.md describes each.
+      - run: cargo xtask lint
+
+  build:
+    needs: [version, lint]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # One architecture failing must not cancel the other, so that the log
+      # says whether the failure belongs to the build or to that machine.
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    # The full workspace, with fat LTO, from cold. Nothing carries over between
+    # runs: the Dockerfile keeps its compiler state in BuildKit cache mounts,
+    # and a mount is not part of a layer, so no layer cache can hold it.
+    timeout-minutes: 120
+    permissions:
+      # The registry accepts the job's own token, so no secret is stored here.
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # No tag is pushed here. A tag names one image, and naming this one would
+      # mean the second architecture to finish takes the tag off the first.
+      - id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          # BuildKit attests each build on its own, and only one of the two
+          # attestations survives the merge below. One that covers half of what
+          # a tag names is worse than none, so neither is made. Provenance for
+          # the manifest list is `actions/attest-build-provenance`, against the
+          # digest `merge` ends with.
+          provenance: false
+          # No labels are passed here. The Dockerfile sets them from these two
+          # arguments, and a label given at this point would overwrite that
+          # with a value read from a tag rather than from the manifest.
+          build-args: |
+            ENROUTE_COMMIT=${{ github.sha }}
+            ENROUTE_VERSION=${{ needs.version.outputs.version }}
+
+      # The digest is all the merge job needs, and an empty file named for it
+      # carries it without anything having to parse a log.
+      - name: Hand the digest on
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/digests"
+          touch "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ matrix.runner }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # What a `docker pull` resolves against: one manifest list holding both
+  # images, so the tags name the pair rather than whichever finished last.
+  merge:
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # `latest` is whatever `main` currently holds, the version is what a
+      # deployment pins to, and the commit is the tag that is never reused.
+      - name: Join the images and tag them
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          # shellcheck disable=SC2046  # each digest is one argument.
+          docker buildx imagetools create \
+            --tag "${IMAGE}:latest" \
+            --tag "${IMAGE}:${VERSION}" \
+            --tag "${IMAGE}:sha-${GITHUB_SHA}" \
+            $(printf "${IMAGE}@sha256:%s " *)
+
+      - name: Say what it holds
+        run: docker buildx imagetools inspect "${IMAGE}:sha-${GITHUB_SHA}"

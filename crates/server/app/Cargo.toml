@@ -1,0 +1,81 @@
+[package]
+name = "enroute"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+name = "enroute"
+path = "src/lib.rs"
+
+[[bin]]
+name = "enroute"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[features]
+# The umbrella: every test in the workspace that needs a database is behind
+# `enroute-postgres`'s gate, and this is the one flag that reaches it.
+postgres-tests = ["enroute-postgres/postgres-tests"]
+
+[dependencies]
+enroute-api.workspace = true
+enroute-config = { workspace = true, features = ["file"] }
+enroute-signature.workspace = true
+thiserror.workspace = true
+tonic.workspace = true
+tonic-reflection.workspace = true
+futures.workspace = true
+
+enroute-git-graph.workspace = true
+enroute-git-http.workspace = true
+enroute-git-ingest.workspace = true
+enroute-git-remote.workspace = true
+enroute-git-retrieve.workspace = true
+enroute-postgres.workspace = true
+enroute-git-store.workspace = true
+enroute-git-core.workspace = true
+# Client end only: the `server` feature would pull the Lambda runtime into the
+# front door's binary.
+enroute-ingest-lambda = { workspace = true, features = ["client"] }
+aws-config.workspace = true
+aws-sdk-lambda.workspace = true
+
+gix-hash.workspace = true
+gix-object.workspace = true
+
+object_store.workspace = true
+url.workspace = true
+sqlx.workspace = true
+http.workspace = true
+tower = { workspace = true, features = ["util"] }
+
+tokio.workspace = true
+bytes.workspace = true
+axum.workspace = true
+async-trait.workspace = true
+prost.workspace = true
+prost-types.workspace = true
+reqwest = { workspace = true, features = ["rustls"] }
+
+anyhow.workspace = true
+
+tracing.workspace = true
+tracing-subscriber.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
+tracing-opentelemetry.workspace = true
+
+clap.workspace = true
+# A tenants file, for a deployment whose customers are known before it starts.
+serde.workspace = true
+toml.workspace = true
+
+# The tenancy tests provision a throwaway schema, which needs the rows layer's
+# own test database url rather than the read path's re-export of it.
+[dev-dependencies]
+enroute-git-metadata.workspace = true

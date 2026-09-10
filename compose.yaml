@@ -1,0 +1,106 @@
+# Enroute, locally: Postgres and the service. The application is yours.
+#
+#     docker compose up --build          # objects on a volume
+#     docker compose down -v             # and forget all of it
+#
+# `bucket` takes any URL object_store reaches — `s3://`, `gs://`, `az://`,
+# `memory://` — so pointing this at a real bucket is a one-line change to
+# `dev/config/enroute.toml` and not a different build.
+#
+# `enroute` here is the image that deploys, configured by the same file a real
+# deployment writes — this one pointed at a directory instead of a bucket.
+# Nothing dev-only is compiled into it, which is the point: this stack
+# exercises what ships.
+#
+# `dev/config/` is mounted read-only at /etc/enroute, and holds both files.
+# `enroute.toml` is the deployment and is read once, so an edit to it needs
+# `docker compose restart enroute`.
+#
+# Nothing here applies a schema before Enroute starts, because Enroute does
+# it: the schema is brought up to what this build reads at startup, and again
+# on every start, applying only what is new.
+#
+# `down -v` is the reset worth knowing. It drops the objects `enroute` wrote,
+# the schema, and the ledger saying which steps had run. No configuration is
+# in the volume — that is the mount.
+#
+# The tenants are `dev/config/tenants.toml`. Enroute
+# re-reads it every couple of seconds, so pointing it at your application, or
+# adding a second tenant, is an edit to that file and not a restart:
+#
+#     $EDITOR dev/config/tenants.toml       # hook_endpoint_url is yours
+#
+# The contract authenticates nobody. A call names its tenant in a header, and
+# this stack puts nothing in front of the listener that would set it:
+#
+#     x-enroute-tenant: dev
+#
+# That is a laptop, not a deployment: anything that can reach 50051 is that
+# tenant. A real one puts a proxy in front which authenticates the caller and
+# sets the header — see docs/operate/security.md.
+#
+# There is no application in this stack, because an application is a customer's
+# own service. It does not have to answer yet: Enroute calls it when a git
+# request arrives and not before, so until then the contract is the whole of
+# what works.
+#
+# A tenants file that will not load is refused rather than served, and the
+# server logs that at ERROR and keeps serving what it already read.
+#
+# Git is published on 8080 and the contract on 50051, so both a git client and
+# an application on the host reach them the way anything else would.
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: enroute
+      POSTGRES_PASSWORD: enroute
+      POSTGRES_DB: enroute
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # 5433, not 5432: a developer machine usually already has one on 5432, and
+    # the suite is pointed here by DATABASE_URL rather than by luck.
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U enroute -d enroute"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  enroute:
+    image: enroute:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      # The whole of what this deployment is, read from the mount below.
+      # Everything else — where objects go, where a push stages, what each
+      # listener binds — is in that file rather than on this line.
+      - --config=file:///etc/enroute/enroute.toml
+    environment:
+      # The only one left. Everything this deployment is — the database it
+      # connects to, the key it signs hooks with — is in the file below.
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "8080:8080"
+      - "50051:50051"
+    volumes:
+      - enroute-objects:/data
+      # The directory, never the file. A bind mount of one file is a bind
+      # mount of one inode, and replacing a tenants file means renaming over
+      # it — which would leave the container reading the old one forever.
+      - ./dev/config:/etc/enroute:ro
+    # The application runs outside this stack, and on Linux the host is not
+    # otherwise nameable from inside a container.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Postgres and nothing else: the schema is this service's own to apply.
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  enroute-objects:

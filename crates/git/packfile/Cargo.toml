@@ -1,0 +1,30 @@
+[package]
+name = "enroute-git-packfile"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+name = "enroute_git_packfile"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+enroute-git-core.workspace = true
+gix-hash.workspace = true
+gix-object.workspace = true
+anyhow.workspace = true
+bytes.workspace = true
+flate2.workspace = true
+libdeflater.workspace = true
+sha1.workspace = true
+tokio.workspace = true
+
+gix-pack.workspace = true
+
+[dev-dependencies]
+futures.workspace = true
+proptest.workspace = true

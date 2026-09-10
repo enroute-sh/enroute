@@ -1,0 +1,31 @@
+# The tenant the local stack serves. `dev/tenants.example.toml` is the format,
+# commented; this is the smallest thing that works.
+#
+# Mounted read-only at /etc/enroute by compose.yaml, and re-read every couple of
+# seconds — so adding a tenant here is an edit and not a restart. The directory
+# is mounted rather than the file, because replacing a tenants file means
+# renaming over it and a single-file bind mount would pin the old inode.
+
+# `dev` is this tenant's id: what the ownership table keys its repositories by,
+# and the one thing that must never change. Renaming this table hands them to
+# nobody. It is also what a contract call names itself with:
+#
+#     x-enroute-tenant: dev
+#
+# Nothing authenticates that here. This stack puts nothing in front of the
+# contract listener, so anything that can reach 50051 is this tenant — which is
+# fine on a laptop and is not how to deploy. See docs/operate/security.md.
+[tenants.dev]
+
+# `*`: whatever hostname a git client sends reaches this tenant, since the
+# stack has no DNS name of its own.
+domains = ["*"]
+
+# Where your application answers. Edit this and the running stack picks it up
+# within a couple of seconds — no restart, and no `down -v`.
+#
+# The port is your framework's dev server. The path is yours, but keep it in
+# whatever namespace that framework reserves for machine traffic: a forge serves
+# repositories at paths named after repositories, so a hook mounted at
+# `/enroute/hooks` is a hook a repository named `enroute` takes away.
+hook_endpoint_url = "http://host.docker.internal:3000/api/enroute/hooks"

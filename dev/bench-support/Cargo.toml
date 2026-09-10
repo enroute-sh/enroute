@@ -1,0 +1,38 @@
+[package]
+name = "bench-support"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+enroute-postgres.workspace = true
+axum.workspace = true
+tokio.workspace = true
+sqlx.workspace = true
+uuid.workspace = true
+
+# `store`: the latency model, and the units its counting answers in.
+enroute-git-cost.workspace = true
+object_store.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+rand.workspace = true
+rand_distr.workspace = true
+
+# `collect`: the span aggregation, and the JSON a report is emitted as.
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+
+# `hooks`: the endpoint protocol, and the signature no stub may skip.
+enroute-api.workspace = true
+enroute-signature.workspace = true
+base64.workspace = true
+prost.workspace = true
+
+anyhow.workspace = true

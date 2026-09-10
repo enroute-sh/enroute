@@ -1,0 +1,32 @@
+[package]
+name = "enroute-git-metadata"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+name = "enroute_git_metadata"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+# What the engine asks of a metadata store, as cases any implementation can be
+# run against. Off in a production build; on for whoever runs them.
+[features]
+conformance = ["enroute-git-core/fixtures"]
+
+[dependencies]
+enroute-git-core.workspace = true
+gix-hash.workspace = true
+gix-object.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# Itself, with the cases on, so `cargo test -p enroute-git-metadata` runs them
+# rather than silently compiling none of them.
+enroute-git-metadata = { path = ".", features = ["conformance"] }
+tokio.workspace = true

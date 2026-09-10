@@ -1,0 +1,28 @@
+[package]
+name = "enroute-git-remote"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+name = "enroute_git_remote"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+enroute-git-proto.workspace = true
+enroute-git-retrieve.workspace = true
+
+anyhow.workspace = true
+base64.workspace = true
+bytes.workspace = true
+futures.workspace = true
+gix-hash.workspace = true
+reqwest = { workspace = true, features = ["rustls", "stream"] }
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
