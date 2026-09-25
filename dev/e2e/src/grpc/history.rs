@@ -3,9 +3,7 @@
 use enroute_git_test_support::linear_commit;
 
 use crate::contract::{Client, hex, hexes};
-use crate::support::{
-    E2E_TENANT, front_door_for, git, make_isolated_state, seed_pack, spawn_contract_without_hooks,
-};
+use crate::support::{front_door_for, git, make_isolated_state, seed_pack, spawn_enroute};
 
 use super::support::{absent_oid, hook_backed_repo, pushed_repo, pushed_repo_serving, status_of};
 
@@ -112,10 +110,8 @@ async fn diffing_a_tree_is_refused() {
 /// the order git made them.
 async fn pushed_history(count: usize) -> (Client, String, tempfile::TempDir, Vec<String>) {
     let state = make_isolated_state().await;
-    let enroute = spawn_contract_without_hooks(state.clone()).await;
-    let client = Client::connect(format!("http://{enroute}"), E2E_TENANT)
-        .await
-        .unwrap();
+    let enroute = spawn_enroute(state.clone()).await;
+    let client = Client::connect(format!("http://{enroute}")).await.unwrap();
     let repo = client.create_repository("").await.unwrap();
     let id = repo.repo.clone().unwrap().key;
 

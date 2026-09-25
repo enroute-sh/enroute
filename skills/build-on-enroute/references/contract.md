@@ -17,15 +17,14 @@ server, which is `0`, and a `0.y.z` API may change at any time. It becomes
 | ------- | -------------------------------------------------------------------------- |
 | Address | `127.0.0.1:50051`                                                          |
 | TLS     | None. Plain HTTP/2, so use the "insecure" credentials your library offers. |
-| Header  | `x-enroute-tenant: dev`                                                    |
 
-The contract authenticates nobody. The header names which tenant a call is
-for. A deployment has a proxy in front that authenticates the caller and sets
-the header. The local stack has no proxy, so send the header yourself.
+The contract authenticates nobody, and needs no header. Whatever can reach the
+listener can read, write and delete every repository in the deployment, so a
+deployment keeps the port reachable only by its own application. The local
+stack has no such boundary.
 
-Send the header on every call. A call with no header, more than one, or an
-unknown tenant is `UNAUTHENTICATED`. Enroute resolves every repository key
-within that tenant, so another tenant's key is `NOT_FOUND`.
+A key that names no repository is `NOT_FOUND`. Keys are unique across a
+deployment and mean nothing outside it.
 
 A deployment puts TLS in front of the same port. Nothing else changes.
 
@@ -39,7 +38,6 @@ below names the copied proto files instead, which works the same way:
 docker run --rm --network <compose-project>_default \
   -v "$PWD/proto:/proto:ro" fullstorydev/grpcurl:latest \
   -plaintext -import-path /proto -proto enroute/api/v1alpha1/repository.proto \
-  -H "x-enroute-tenant: dev" \
   -d '{"repo": {"key": "repo-4f2a1c"}}' \
   enroute:50051 enroute.api.v1alpha1.RepositoryService/CreateRepository
 ```
@@ -61,7 +59,7 @@ It answers:
 | ------------------- | ------------------ | -------------------------------------------------------------- |
 | `RepositoryService` | `CreateRepository` | The repository under the key you gave. Idempotent on the key.  |
 |                     | `GetRepository`    | The default branch, and the last push time.                    |
-|                     | `ListRepositories` | Every repository of the tenant, in key order, a page at a time. |
+|                     | `ListRepositories` | Every repository here, or one `prefix`, in key order, a page at a time. |
 |                     | `DeleteRepository` | Nothing. Idempotent, and the storage is reclaimed later.       |
 | `RefService`        | `ListRefs`         | Every ref, or the ones under given prefixes.                   |
 |                     | `UpdateRefs`       | One outcome per update, atomically applied.                    |
@@ -91,7 +89,8 @@ repository.
 **`ListRepositories` is the one read that starts from no key.** It exists for
 an application whose own table went missing, and for finding a repository
 nothing names. Send `next_page_token` back until it is empty. A short page is
-not the last page.
+not the last page. An optional `prefix` narrows it to the keys starting with
+that, byte for byte — send the separator, since `acme` also matches `acmex`.
 
 **Object ids are lowercase hex strings**, not raw bytes.
 

@@ -38,7 +38,7 @@ allocates no id. The key passed to `CreateRepository` is what every later call
 names, so no table maps an id of Enroute's onto the project's. Use the stable
 id the project already has for a repository: a row id, a UUID, a ULID. Never
 `owner/name`, which a rename or a transfer changes, and which would then name
-a different repository. A key is unique within the tenant, holds ASCII
+a different repository. A key is unique across the deployment, holds ASCII
 letters, digits, `-`, `_`, and `.`, and starts and ends with a letter or
 digit. The create is idempotent on the key, so a retry is safe.
 

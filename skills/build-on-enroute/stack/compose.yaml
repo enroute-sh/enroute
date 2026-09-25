@@ -1,6 +1,6 @@
 # Enroute, locally, from the published image. The application is yours.
 #
-#     $EDITOR config/tenants.toml       # hook_endpoint_url is yours
+#     $EDITOR config/enroute.toml       # hooks.endpoint_url is yours
 #     docker compose up -d
 #     docker compose down -v            # and erase all of it
 #
@@ -15,15 +15,13 @@
 # variable to point this elsewhere, because the recipes, the proto, and the
 # server are one release. Reinstall the skill to move all of them.
 #
-# `config/` is mounted read-only at /etc/enroute and holds both files.
-# `enroute.toml` is the deployment, read once, so an edit to it needs
-# `docker compose restart enroute`. `tenants.toml` is re-read every two
-# seconds, so pointing it at your application is an edit and not a restart.
+# `config/` is mounted read-only at /etc/enroute. `enroute.toml` is the whole
+# deployment, read once, so pointing it at your application is an edit and
+# `docker compose restart enroute`.
 #
-# The contract authenticates nobody. A call names its tenant in a header,
-# `x-enroute-tenant: dev`, and this stack puts nothing in front of the
-# listener to set it. Anything that can reach 50051 is that tenant. That is a
-# laptop, not a deployment.
+# The contract authenticates nobody, and this stack puts nothing in front of
+# the listener. Anything that can reach 50051 can read, write and delete every
+# repository. That is a laptop, not a deployment.
 #
 # There is no application in this stack. Enroute calls yours when a git
 # request arrives and not before, so until then only the contract works.
@@ -55,7 +53,7 @@ services:
       retries: 30
 
   enroute:
-    image: ghcr.io/enroute-sh/enroute:0.1.0
+    image: ghcr.io/enroute-sh/enroute:0.2.0
     command:
       # The whole deployment, read from the mount below.
       - --config=file:///etc/enroute/enroute.toml
@@ -67,7 +65,7 @@ services:
     volumes:
       - enroute-objects:/data
       # The directory, never the file. A bind mount of one file pins one
-      # inode, and a tenants file is replaced by a rename over it.
+      # inode, and an editor may write by renaming over it.
       - ./config:/etc/enroute:ro
     # Your application runs outside this stack. On Linux the host is not
     # otherwise nameable from inside a container.

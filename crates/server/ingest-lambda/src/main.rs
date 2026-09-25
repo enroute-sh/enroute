@@ -3,10 +3,10 @@
 //! Owns the Lambda-shaped parts — the event, the response stream, the
 //! lifecycle — not what a push means, which is
 //! [`enroute_ingest_lambda::server`]. Streamed frames arrive unbuffered
-//! every ~250ms, so progress needs no padding. The secrets extension
-//! answers during `INVOKE` only, so anything built from a secret is built
-//! on the first invocation. Spans need an explicit flush before the stream
-//! ends, or a queued batch is lost if Lambda reaps the environment first.
+//! every ~250ms, so progress needs no padding. Credentials arrive with the
+//! push, so anything built from them is built on the first invocation and
+//! kept against them. Spans need an explicit flush before the stream ends,
+//! or a queued batch is lost if Lambda reaps the environment first.
 
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,26 +17,14 @@ use bytes::Bytes;
 use futures::channel::mpsc;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use lambda_runtime::{Error, LambdaEvent, MetadataPrelude, StreamResponse, service_fn};
-use tokio::sync::OnceCell;
 use tracing::Instrument as _;
 
-use enroute_ingest_lambda::server::{self, FrameSink, Server};
+use enroute_ingest_lambda::server::{self, FrameSink};
 use enroute_ingest_lambda::{boot, telemetry, trace, wire};
 
 /// False only for the first invocation an environment serves, so a slow push
 /// can be told from one that waited on a cold start.
 static WARM: AtomicBool = AtomicBool::new(false);
-
-/// Built on the first invocation, for want of a secret during `INIT`.
-///
-/// Left uninitialized on failure, so the next invocation retries.
-static BOOT: OnceCell<boot::Boot> = OnceCell::const_new();
-
-/// The worker, kept against the bucket URI it was built for.
-///
-/// Not in [`BOOT`], because which bucket this writes to arrives in the call:
-/// a warm environment reuses it while the front door keeps naming the same one.
-static SERVER: boot::Kept<Server> = boot::Kept::new();
 
 async fn handler(
     event: LambdaEvent<wire::Call>,
@@ -52,10 +40,11 @@ async fn handler(
     // backpressure to protect.
     let (tx, rx) = mpsc::unbounded::<Result<Bytes, Infallible>>();
 
-    // Before the span: on a cold start this attaches the export layer, and a
-    // span created before that exists is never exported.
     let booting = Instant::now();
-    let ready = ready().await;
+    // Before anything that might want a span exported, and before the pool, so
+    // a worker that cannot connect still has a console to say so on.
+    telemetry::install(payload.telemetry.as_ref());
+    let ready = boot::ready(&payload).await;
 
     let span = tracing::info_span!(
         "ingest_lambda.invoke",
@@ -97,56 +86,19 @@ async fn handler(
 }
 
 async fn run(
-    ready: Result<&'static boot::Boot, anyhow::Error>,
+    ready: Result<boot::Derived, anyhow::Error>,
     call: wire::Call,
     frames: &FrameSink,
     invoked: Instant,
 ) {
-    let booted = match ready {
-        Ok(booted) => booted,
+    let derived = match ready {
+        Ok(derived) => derived,
         Err(e) => return refuse(frames, &e),
     };
-
-    // Both stores come from the call, so the front door and this cannot be
-    // pointed at different buckets.
-    let server = match server(booted, &call.objects) {
-        Ok(server) => server,
-        Err(e) => return refuse(frames, &e),
-    };
-    // Per invocation, unlike the worker: signed with the execution role's
-    // credentials, which the runtime refreshes between invocations.
-    let packs = match boot::packs(&call.staging) {
-        Ok(packs) => packs,
-        Err(e) => return refuse(frames, &e),
-    };
-
-    server.serve(packs, call, frames, invoked).await;
-}
-
-/// The worker for `objects`, reused while the front door keeps naming it.
-fn server(
-    booted: &boot::Boot,
-    objects: &enroute_config::StoreUri,
-) -> Result<Server, anyhow::Error> {
-    SERVER.get_or_build(objects.to_uri(), || boot::server(booted, objects))
-}
-
-/// Everything that has to hold before a push can be attempted.
-async fn ready() -> Result<&'static boot::Boot, anyhow::Error> {
-    // A warm invocation has everything the secret feeds, so re-fetching would
-    // cost a round trip per push. Rotation therefore doesn't reach a warm
-    // environment — documented behaviour of the Lambda runtime.
-    if let Some(booted) = BOOT.get() {
-        return Ok(booted);
-    }
-
-    // From the result rather than after `?`, so a worker that can't read its
-    // secret still has a console to say so on.
-    let secret = boot::secret().await;
-    telemetry::install(secret.as_ref().ok().and_then(boot::Secret::otlp_headers));
-    let secret = secret?;
-
-    BOOT.get_or_try_init(|| boot::boot(&secret)).await
+    derived
+        .server
+        .serve(derived.packs, call, frames, invoked)
+        .await;
 }
 
 /// Reported in the stream rather than as a status, and logged too so it lands
@@ -166,7 +118,7 @@ fn refuse(frames: &FrameSink, error: &anyhow::Error) {
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    // No subscriber here: it needs a secret only `INVOKE` can reach. See
+    // No subscriber here: the collector arrives with the call. See
     // `telemetry::install`.
     lambda_runtime::run(service_fn(handler)).await
 }

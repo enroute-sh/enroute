@@ -9,8 +9,8 @@ package enroute.common.v1alpha1;
 // A repository, by the name its application gave it.
 //
 // You choose this at CreateRepository and every later call spells it, so there
-// is no id of ours to store beside your own. Unique within your tenant, and
-// opaque to Enroute, which never reads anything out of one.
+// is no id of ours to store beside your own. Unique across the deployment,
+// and opaque to Enroute, which never reads anything out of one.
 message RepoKey {
   // ASCII letters, digits, `-`, `_` and `.`, at most 256 bytes, starting and
   // ending with a letter or digit. Compared byte for byte, so `Repo` and

@@ -20,9 +20,9 @@ docker compose down -v
 ```
 
 The root compose file builds the image and runs it with Postgres on host port
-`5433`. The server reads `dev/config/enroute.toml` and its tenant file. Point
-the configured hook URL at an application endpoint. Git requests require that
-endpoint; the API does not. `down -v` removes local database and object data.
+`5433`. The server reads `dev/config/enroute.toml`. Point `hooks.endpoint_url`
+at an application endpoint. Git requests require that endpoint; the API does
+not. `down -v` removes local database and object data.
 
 ## Database migrations
 

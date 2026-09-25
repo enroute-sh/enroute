@@ -15,8 +15,19 @@ Images are published at `ghcr.io/enroute-sh/enroute` for `linux/amd64` and
 
 The `latest` tag moves and may be rebuilt. A version tag names one image, so
 use `<version>` or `sha-<commit>` when you need an immutable image. The image
-contains the server, `enroute-schema`, and proto files in
-`/usr/share/enroute/proto`. Build `enroute-maintenance` from source.
+contains the server, `enroute-schema`, the `enroute-ingest-lambda` worker, and
+proto files in `/usr/share/enroute/proto`. Build `enroute-maintenance` from
+source.
+
+The entrypoint is the server. To run the worker, point a Lambda function at
+this image and set its image configuration to
+`/usr/local/bin/enroute-ingest-lambda`.
+
+A deployment has a function to itself by default. To serve several from one
+function, create it in tenant isolation mode and give each deployment an
+`ingest.lambda.tenant` of its own, so Lambda never serves two of them from one
+execution environment. Lambda charges for each isolated environment it creates,
+which trades a function per deployment for a cost that follows cold starts.
 
 ## Upgrades
 
@@ -47,7 +58,7 @@ deploying.
 ## Operator responsibilities
 
 - Terminate TLS for the Git listener.
-- Authenticate API callers and set the tenant header.
+- Keep the API listener reachable only by your application.
 - Protect and rotate the hook signing key.
 - Apply quotas, rate limits, and concurrency limits.
 

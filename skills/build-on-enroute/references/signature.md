@@ -77,7 +77,7 @@ A parameter string you format again is a different base.
 
 ### Take the authority and path from configuration
 
-`@authority` and `@path` come from the URL registered for the tenant, **not**
+`@authority` and `@path` come from the configured `hooks.endpoint_url`, **not**
 from the arriving `Host` header and request path. A proxy rewrites both, and
 Enroute signs over what it was configured with.
 
@@ -85,7 +85,7 @@ Enroute signs over what it was configured with.
 port 443 over https, `localhost:3000` for a local endpoint.
 
 Configure the endpoint with its own public URL, and check that it is the same
-string the tenant was registered with. One byte of difference makes every call
+string Enroute was configured with. One byte of difference makes every call
 a `401` with no reason given. That is the most common failure in this
 integration.
 

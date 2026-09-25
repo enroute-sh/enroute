@@ -2,9 +2,9 @@
 //! Message Signatures][rfc9421] over Ed25519.
 //!
 //! Asymmetric, so Enroute holds a private key and an application holds only the
-//! public half — an application can check a call and cannot make one, which
-//! matters most for a hosted Enroute, where one leaked tenant must not open a
-//! way into any other. A standard rather than something of ours, since the far
+//! public half — an application can check a call and cannot make one, so a
+//! leaked public key forges nothing. A standard rather than something of ours,
+//! since the far
 //! end is meant to be any language: RFC 9421 already has verifying libraries in
 //! most of them. Both ends live in this one crate, as with the ingest
 //! protocol's wire types, because a scheme that disagrees by one byte fails at

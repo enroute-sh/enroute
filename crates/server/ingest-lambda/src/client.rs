@@ -21,7 +21,7 @@ use object_store::ObjectStore;
 use object_store::path::Path as StorePath;
 use tokio::io::AsyncReadExt as _;
 
-use enroute_config::{Bucket, StoreUri};
+use enroute_config::Bucket;
 use enroute_git_core::Error;
 use enroute_git_cost::{CountingStore, Meter, StoreRole};
 use enroute_git_ingest::{
@@ -70,6 +70,11 @@ const PRELUDE_MAX: usize = 16 * 1024;
 /// Where and how to reach the worker.
 #[derive(Debug, Clone)]
 pub struct LambdaConfig {
+    /// What this deployment is called where it shares a function.
+    ///
+    /// `None` for a function of its own, which no other deployment is served
+    /// from; naming one Lambda has not isolated is refused at the invoke.
+    pub tenant: Option<String>,
     /// Function name or ARN.
     pub function: String,
     /// Version or alias to pin, or `None` for `$LATEST` — a direct invoke
@@ -82,13 +87,53 @@ pub struct LambdaConfig {
     ///
     /// This process's own, so the two ends cannot be pointed at different
     /// ones — which nothing but a deploy checklist used to prevent.
-    pub objects: StoreUri,
+    pub objects: Bucket,
+    /// Where the worker takes its credentials from.
+    pub objects_credentials: enroute_config::CredentialSource,
+    /// Where the worker takes the staging bucket's credentials from.
+    pub staging_credentials: enroute_config::CredentialSource,
     /// The bucket a staged push and a staged pack are left in, sent beside
     /// the key so a key alone never has to be enough.
-    ///
-    /// Its credentials stay here: only `staging.uri` goes on the call, since
-    /// an invoke payload is a thing `CloudTrail` keeps.
     pub staging: Bucket,
+    /// The database the worker records this deployment's push in.
+    ///
+    /// Sent rather than configured on the function, so a function holds no
+    /// deployment's credentials and can be shared by several.
+    pub database_url: enroute_config::Secret,
+    /// Most connections one push may hold against it at once.
+    pub database_max_connections: std::num::NonZeroU32,
+    /// Where the worker's spans go, if anywhere.
+    ///
+    /// Sent for the same reason, the headers holding the collector's token.
+    pub telemetry: Option<enroute_config::Telemetry>,
+}
+
+/// The credentials beside a bucket, in the form a call carries.
+fn given(bucket: &Bucket, source: enroute_config::CredentialSource) -> wire::Given {
+    match source {
+        enroute_config::CredentialSource::Environment => wire::Given::Environment,
+        enroute_config::CredentialSource::Sent => wire::Given::Credentials(
+            bucket
+                .credentials
+                .iter()
+                .map(|(name, value)| (name.clone(), wire::Credential::from(value)))
+                .collect(),
+        ),
+    }
+}
+
+impl LambdaConfig {
+    /// What every call this configuration makes will carry.
+    fn credentials(&self) -> wire::Credentials {
+        wire::Credentials {
+            database: wire::Database {
+                url: wire::Credential::from(&self.database_url),
+                max_connections: self.database_max_connections,
+            },
+            objects: given(&self.objects, self.objects_credentials),
+            staging: given(&self.staging, self.staging_credentials),
+        }
+    }
 }
 
 /// Ingests by invoking a Lambda directly.
@@ -97,6 +142,13 @@ pub struct LambdaIngestWorker {
     /// A plain backend, not a `StagingStore`: nothing sweeps it, since the
     /// worker still reading it outlives this process's request.
     staging: Arc<dyn ObjectStore>,
+    /// What every call carries, in the form it carries it.
+    ///
+    /// Built once: these come from a configuration read before this ran, so
+    /// rebuilding them per push would answer the same every time.
+    credentials: wire::Credentials,
+    /// Where the worker's spans go, likewise.
+    telemetry: Option<wire::Telemetry>,
     config: LambdaConfig,
     lambda: aws_sdk_lambda::Client,
 }
@@ -114,10 +166,12 @@ impl LambdaIngestWorker {
     pub fn new(lambda: aws_sdk_lambda::Client, config: LambdaConfig) -> Result<Self, Error> {
         let staging = config
             .staging
-            .build()
+            .build(enroute_config::CredentialSource::Environment)
             .map_err(|error| error.context("the staging bucket"))?;
         Ok(Self {
             staging,
+            credentials: config.credentials(),
+            telemetry: config.telemetry.as_ref().map(wire::Telemetry::from),
             config,
             lambda,
         })
@@ -214,15 +268,17 @@ impl LambdaIngestWorker {
         traceparent: Option<String>,
         push: wire::Request,
     ) -> Result<Vec<u8>, Error> {
-        // Pre-sized: `to_vec` starts from nothing and doubles, so a payload
-        // carrying a pack is copied through every size on the way up.
-        let mut body = Vec::with_capacity(body_capacity(&push));
         let mut call = wire::Call {
             traceparent,
-            objects: self.config.objects.clone(),
+            objects: self.config.objects.uri.clone(),
             staging: self.config.staging.uri.clone(),
+            credentials: self.credentials.clone(),
+            telemetry: self.telemetry.clone(),
             push: wire::Push::Inline(push),
         };
+        // Pre-sized: `to_vec` starts from nothing and doubles, so a payload
+        // carrying a pack is copied through every size on the way up.
+        let mut body = Vec::with_capacity(body_capacity(&call));
         serde_json::to_writer(&mut body, &call).context("encoding ingest call")?;
         if body.len() < PAYLOAD_MAX {
             return Ok(body);
@@ -285,6 +341,11 @@ impl LambdaIngestWorker {
         if let Some(qualifier) = &self.config.qualifier {
             call = call.qualifier(qualifier);
         }
+        // Only when there is one: Lambda refuses a tenant id for a function it
+        // has not isolated, as it refuses its absence for one it has.
+        if let Some(tenant) = &self.config.tenant {
+            call = call.tenant_id(tenant);
+        }
 
         // `DisplayErrorContext`, or the cause — throttling, access denied —
         // is lost behind the outermost type name.
@@ -327,8 +388,14 @@ impl LambdaIngestWorker {
     }
 }
 
-/// About what `push` encodes to — a hint only, too small costs one realloc.
-fn body_capacity(push: &wire::Request) -> usize {
+/// About what `call` encodes to — a hint only, too small costs one realloc.
+///
+/// The whole call and not just its push: everything below is written into the
+/// one buffer, and a credential has no length a constant could assume.
+fn body_capacity(call: &wire::Call) -> usize {
+    let wire::Push::Inline(push) = &call.push else {
+        return envelope(call);
+    };
     let pack = match &push.pack {
         // Exact: four characters per three bytes, and base64's alphabet has
         // nothing JSON would escape.
@@ -339,7 +406,46 @@ fn body_capacity(push: &wire::Request) -> usize {
     // assume, and undershooting costs the copy this exists to avoid.
     let updates: usize = push.updates.iter().map(|u| u.refname.len() + 128).sum();
     let existing: usize = push.existing.keys().map(|name| name.len() + 56).sum();
-    pack + updates + existing + 512
+    pack + updates + existing + envelope(call)
+}
+
+/// Counts what writing something would take, keeping none of it.
+///
+/// A credential is measured this way rather than added up by hand: nothing
+/// retains the bytes, and there is no second model of the encoding to keep.
+struct Counted(usize);
+
+impl std::io::Write for Counted {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// How many bytes `value` encodes to, or nothing if it will not encode.
+///
+/// Nothing rather than an error: a short hint costs the one copy this is
+/// avoiding, and the encode that follows reports what went wrong.
+fn measured<T: serde::Serialize>(value: &T) -> usize {
+    let mut counted = Counted(0);
+    match serde_json::to_writer(&mut counted, value) {
+        Ok(()) => counted.0,
+        Err(_unencodable) => 0,
+    }
+}
+
+/// What a call carries besides its push, counted for the same reason.
+fn envelope(call: &wire::Call) -> usize {
+    measured(&call.credentials)
+        + measured(&call.telemetry)
+        + call.traceparent.as_ref().map_or(0, String::len)
+        + call.objects.to_uri().len()
+        + call.staging.to_uri().len()
+        + 512
 }
 
 /// Read until `buf` holds a whole part, or the pack ends.
@@ -589,19 +695,85 @@ mod tests {
             .behavior_version(aws_sdk_lambda::config::BehaviorVersion::latest())
             .region(aws_sdk_lambda::config::Region::new("eu-central-1"))
             .build();
+        let config = LambdaConfig {
+            tenant: None,
+            function: "test".to_string(),
+            qualifier: None,
+            max_pack_bytes,
+            objects: Bucket {
+                uri: "memory:///objects".parse().expect("a store URI"),
+                credentials: BTreeMap::new(),
+            },
+            staging: Bucket {
+                uri: "memory:///staging".parse().expect("a store URI"),
+                credentials: BTreeMap::new(),
+            },
+            objects_credentials: enroute_config::CredentialSource::Sent,
+            staging_credentials: enroute_config::CredentialSource::Sent,
+            database_url: enroute_config::Secret::from("postgres:///test"),
+            database_max_connections: std::num::NonZeroU32::MIN,
+            telemetry: None,
+        };
         LambdaIngestWorker {
             staging,
+            credentials: config.credentials(),
+            telemetry: config.telemetry.as_ref().map(wire::Telemetry::from),
             lambda: aws_sdk_lambda::Client::from_conf(conf),
-            config: LambdaConfig {
-                function: "test".to_string(),
-                qualifier: None,
-                max_pack_bytes,
-                objects: "memory:///objects".parse().expect("a store URI"),
-                staging: Bucket {
-                    uri: "memory:///staging".parse().expect("a store URI"),
-                    credentials: BTreeMap::new(),
+            config,
+        }
+    }
+
+    /// `push` in a call, with an envelope no smaller than a real one's.
+    ///
+    /// Credentials a deployment plausibly sends, since what the estimate has
+    /// to cover is the whole call and not the push alone.
+    fn call_with(push: wire::Request) -> wire::Call {
+        let named = |value: &str| {
+            [
+                (
+                    "access_key_id".to_string(),
+                    wire::Credential::from("AKIA00000000000000EX"),
+                ),
+                (
+                    "secret_access_key".to_string(),
+                    wire::Credential::from(value),
+                ),
+                (
+                    "session_token".to_string(),
+                    wire::Credential::from(&*"t".repeat(2048)),
+                ),
+            ]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>()
+        };
+        wire::Call {
+            traceparent: Some(
+                "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string(),
+            ),
+            objects: "s3://objects/prefix?region=eu-central-1"
+                .parse()
+                .expect("a store URI"),
+            staging: "s3://handoff?s3_express=true".parse().expect("a store URI"),
+            credentials: wire::Credentials {
+                database: wire::Database {
+                    url: wire::Credential::from(
+                        "postgres://enroute:hunter2@db.example.internal:5432/enroute?sslmode=require",
+                    ),
+                    max_connections: std::num::NonZeroU32::MIN,
                 },
+                objects: wire::Given::Credentials(named("objects-secret")),
+                staging: wire::Given::Credentials(named("staging-secret")),
             },
+            telemetry: Some(wire::Telemetry {
+                endpoint: "https://otlp.example.com/v1/traces".to_string(),
+                headers: [(
+                    "authorization".to_string(),
+                    wire::Credential::from(&*format!("Bearer {}", "x".repeat(512))),
+                )]
+                .into_iter()
+                .collect(),
+            }),
+            push: wire::Push::Inline(push),
         }
     }
 
@@ -806,11 +978,12 @@ mod tests {
                     .map(|u| (u.refname.clone(), u.old_id.clone()))
                     .collect();
 
-                let encoded = serde_json::to_vec(&push).expect("encoding").len();
+                let call = call_with(push);
+                let encoded = serde_json::to_vec(&call).expect("encoding").len();
                 assert!(
-                    body_capacity(&push) >= encoded,
+                    body_capacity(&call) >= encoded,
                     "estimated {} for {encoded} bytes: pack {pack_bytes}, {refs} refs of {name_len}",
-                    body_capacity(&push),
+                    body_capacity(&call),
                 );
             }
         }

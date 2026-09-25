@@ -42,16 +42,14 @@ Enroute runs in a container, so it reaches your development server at
 
 ## Point Enroute at it
 
-Edit `config/tenants.toml` in the stack you started in the quickstart:
+Edit `config/enroute.toml` in the stack you started in the quickstart:
 
 ```toml
-[tenants.dev]
-hook_endpoint_url = "http://host.docker.internal:3000/api/enroute/hooks"
-domains = ["*"]
+[hooks]
+endpoint_url = "http://host.docker.internal:3000/api/enroute/hooks"
 ```
 
-The quickstart sets `tenants.refresh_secs` to two seconds, so Enroute re-reads
-the file. No restart is needed.
+Configuration is read once, so apply it with `docker compose restart enroute`.
 
 Write this URL down. Chapter 3 verifies signatures against it, and the two
 must match byte for byte. Enroute signs over the URL you configured here, not
@@ -128,7 +126,7 @@ npm run dev
 Enroute answers, independently of your app:
 
 ```sh
-grpcurl -plaintext -H 'x-enroute-tenant: dev' 127.0.0.1:50051 list
+grpcurl -plaintext 127.0.0.1:50051 list
 ```
 
 Four services are listed. Git does not serve anything yet, because no endpoint
@@ -137,7 +135,7 @@ answers Enroute's questions. That starts in chapter 4.
 ## Result
 
 - A Next.js project with the Enroute contract generated into `lib/gen`.
-- A tenant that names a hook URL your app does not serve yet.
+- An Enroute pointed at a hook URL your app does not serve yet.
 
 Next: [Create repositories](02-create-repositories.md), where your app creates its first
 repository over the API.

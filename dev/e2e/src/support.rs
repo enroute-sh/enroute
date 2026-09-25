@@ -28,8 +28,7 @@ use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
 use bench_support::collect::{Collector, KeyedBy};
-use enroute::tenancy::Tenants;
-use enroute_git_core::RepoId;
+use enroute_git_core::{ExternalKey, RepoId};
 use enroute_git_ingest::LocalIngestWorker;
 use enroute_git_retrieve::Storage;
 use enroute_git_store::Store;
@@ -94,104 +93,12 @@ pub(crate) async fn make_isolated_state_on_pool() -> (Storage, sqlx::PgPool) {
     )
 }
 
-/// A ledger on a throwaway schema, with real rows and real queries.
+/// The contract on a loopback port, with the handle that stops it.
 ///
-/// One per caller, and every one pins a Postgres connection: a `pg_temp`
-/// schema lives only as long as that connection — see [`Servers`].
-pub(crate) async fn ephemeral_ledger() -> sqlx::PgPool {
-    enroute::tenancy::ephemeral_pool(&test_database_url())
-        .await
-        .expect("provisioning an e2e ledger")
-}
-
-/// Tenancy from a named list, on a throwaway ledger schema.
-///
-/// How every deployment is configured: nothing is ever registered, and only
-/// which repository is whose is a row.
-pub(crate) async fn listed_tenancy(toml: &str) -> Arc<Tenants> {
-    let directory = enroute::tenancy::Directory::from_toml(toml).expect("a tenants list");
-    Arc::new(Tenants::new(directory, ephemeral_ledger().await))
-}
-
-/// Tenancy read from a file on disk, re-read on `every`.
-///
-/// A real `file://` store and a real timer, because what a refresh has to
-/// prove is that a running server picks the change up on its own.
-pub(crate) async fn refreshing_tenancy(path: &Path, every: Duration) -> Arc<Tenants> {
-    let uri: enroute::ObjectUri = format!("file://{}", path.display())
-        .parse()
-        .expect("a file URI");
-    let (tenants, refreshing) = Tenants::from_uri(&uri, ephemeral_ledger().await, every)
-        .await
-        .expect("the tenants written above");
-    drop(refreshing);
-    tenants
-}
-
-/// Replace a tenants file the way an operator should: written beside, then
-/// renamed, so no reader can see it half-written.
-pub(crate) fn rewrite(path: &Path, toml: &str) {
-    let beside = path.with_extension("next");
-    std::fs::write(&beside, toml).expect("writing the next tenants");
-    std::fs::rename(&beside, path).expect("renaming the next tenants into place");
-}
-
-/// The tenants a suite names, as the list `--tenants` would spell them, with
-/// every one of them claiming `domains`.
-pub(crate) fn tenants_file(tenants: &[(&str, &str)], domains: &str) -> String {
-    let mut toml = String::new();
-    for (id, endpoint) in tenants {
-        // Pushed rather than formatted: `format_push_string` is denied, and
-        // writing into a String would leave a `Result` nothing can do with.
-        toml.push_str("[tenants.");
-        toml.push_str(id);
-        toml.push_str("]\nhook_endpoint_url = \"");
-        toml.push_str(endpoint);
-        toml.push_str("\"\n");
-        toml.push_str(domains);
-        toml.push('\n');
-    }
-    toml
-}
-
-/// The header a contract call names its tenant in, as `--tenant-header`
-/// defaults to.
-pub(crate) const TENANT_HEADER: &str = "x-enroute-tenant";
-
-/// The same, as the server takes it.
-pub(crate) fn tenant_header() -> axum::http::HeaderName {
-    axum::http::HeaderName::from_static(TENANT_HEADER)
-}
-
-/// The tenant the single-tenant helpers serve.
-pub(crate) const E2E_TENANT: &str = "e2e";
-
-/// One tenant, reachable at whatever `Host` a git client sends.
-///
-/// The servers here listen on loopback with no DNS name, so a `*` claim is
-/// what makes any hostname resolve.
-pub(crate) async fn one_tenant(hook_endpoint_url: &str) -> Arc<Tenants> {
-    let toml = tenants_file(&[(E2E_TENANT, hook_endpoint_url)], "domains = [\"*\"]\n");
-    listed_tenancy(&toml).await
-}
-
-/// The contract, with a stub application registered behind it.
-///
-/// The application is there for the tenant to name, not to be asked: the
-/// contract door runs no hooks. Tests use this to prove exactly that.
-pub(crate) async fn spawn_contract_with_hooks(
-    state: Storage,
-) -> (std::net::SocketAddr, String, Servers) {
-    let (hooks, _token, _landed, hook_servers) = spawn_hooks(&[]).await;
-    let tenants = one_tenant(&bench_support::hooks::endpoint_url(&format!(
-        "http://{hooks}"
-    )))
-    .await;
-
-    // No `Hooks` here. The contract door asks an application nothing — the
-    // application is the caller — so the stub above exists only to give the
-    // tenant an endpoint URL to be named with.
-    let services = enroute::grpc::services(state, tenants, local_remotes(), tenant_header());
+/// No `Hooks`: the contract door asks an application nothing, the application
+/// being the caller there.
+pub(crate) async fn spawn_contract(state: Storage) -> (std::net::SocketAddr, Servers) {
+    let services = enroute::grpc::services(state, local_remotes());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -209,11 +116,7 @@ pub(crate) async fn spawn_contract_with_hooks(
             .unwrap();
     });
 
-    (
-        addr,
-        E2E_TENANT.to_string(),
-        Servers(vec![stop]).and(hook_servers),
-    )
+    (addr, Servers(vec![stop]))
 }
 
 /// A sync client allowed to dial the loopback remotes these tests spin up.
@@ -223,12 +126,12 @@ pub(crate) fn local_remotes() -> enroute_git_remote::Client {
 }
 
 /// Serve the `enroute.api.v1alpha1` contract over gRPC on a loopback port.
-pub(crate) async fn spawn_enroute(state: Storage, tenants: Arc<Tenants>) -> std::net::SocketAddr {
+pub(crate) async fn spawn_enroute(state: Storage) -> std::net::SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     // No hooks: these tests are about the contract's own primitives, and the
     // `pre-receive` path has its own coverage over git.
-    let services = enroute::grpc::services(state, tenants, local_remotes(), tenant_header());
+    let services = enroute::grpc::services(state, local_remotes());
     tokio::spawn(async move {
         enroute::grpc::router(services)
             .unwrap()
@@ -394,8 +297,8 @@ pub(crate) async fn spawn_git(
 ///
 /// Deliberately not `path`: which repository a path means is the whole of what
 /// `authorize` is asked, and one string for both would never exercise it.
-pub(crate) fn key_for(path: &str) -> String {
-    format!("key-{path}")
+pub(crate) fn key_for(path: &str) -> ExternalKey {
+    ExternalKey::new(format!("key-{path}"))
 }
 
 /// A stub application of its own, naming every repository in `repos`.
@@ -403,12 +306,12 @@ pub(crate) fn key_for(path: &str) -> String {
 /// A stub because a real application now lives in TypeScript, which a Rust test
 /// cannot spawn — this implements the same endpoint protocol instead.
 pub(crate) async fn spawn_hooks(
-    repos: &[(&str, RepoId)],
+    repos: &[&str],
 ) -> (std::net::SocketAddr, String, crate::hooks::Landed, Servers) {
     let named = repos
         .iter()
-        .fold(crate::hooks::Repos::default(), |named, (name, _)| {
-            named.with(name, key_for(name))
+        .fold(crate::hooks::Repos::default(), |named, name| {
+            named.with(name, key_for(name).to_string())
         });
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -434,27 +337,9 @@ pub(crate) async fn spawn_hooks(
 /// it, and the git port asking it. Returns the git port and [`ALICE`]'s token.
 pub(crate) async fn spawn_server(
     state: Storage,
-    repos: &[(&str, RepoId)],
+    repos: &[&str],
 ) -> (std::net::SocketAddr, String, crate::hooks::Landed, Servers) {
     let (hooks, token, landed, hook_servers) = spawn_hooks(repos).await;
-
-    // Named once the application has a port, since a tenant is what says where
-    // its application answers.
-    let tenants = one_tenant(&bench_support::hooks::endpoint_url(&format!(
-        "http://{hooks}"
-    )))
-    .await;
-    let tenant = tenants.by_id(E2E_TENANT).expect("the tenant just named");
-    // The engine minted these repositories directly, so nothing claimed them
-    // on the way through. A real create goes over the contract, which claims
-    // as it creates.
-    for (name, id) in repos {
-        let key = key_for(name).parse().expect("an e2e repository key");
-        tenants
-            .claim(&tenant, *id, &key)
-            .await
-            .expect("claiming an e2e repository");
-    }
 
     // One `Hooks` answers every one of a git client's questions — who may reach
     // a repository, which refs it sees, and which may land — as the real binary
@@ -462,8 +347,15 @@ pub(crate) async fn spawn_server(
     let hooks = Arc::new(
         // The suite's stub answers at once, so the budget only has to be
         // longer than nothing.
-        enroute::hooks::Hooks::new(tenants, endpoint_signing_key(), Duration::from_secs(10))
-            .expect("building the hooks endpoint client"),
+        enroute::hooks::Hooks::new(
+            state.clone(),
+            bench_support::hooks::endpoint_url(&format!("http://{hooks}"))
+                .parse()
+                .expect("a hook endpoint URL"),
+            endpoint_signing_key(),
+            Duration::from_secs(10),
+        )
+        .expect("building the hooks endpoint client"),
     );
     let (addr, git_servers) = spawn_git(state, hooks.clone(), hooks.clone(), hooks).await;
     (addr, token, landed, git_servers.and(hook_servers))
@@ -573,8 +465,8 @@ pub(crate) async fn spawn_smoke_repo() -> (tempfile::TempDir, PathBuf, crate::ho
 {
     let state = make_isolated_state().await;
     let name = format!("repo-{}", uuid::Uuid::new_v4());
-    let repo = state.rows.create(None).await.unwrap();
-    let (addr, token, landed, servers) = spawn_server(state, &[(&name, repo.id)]).await;
+    state.rows.create(None, &key_for(&name)).await.unwrap();
+    let (addr, token, landed, servers) = spawn_server(state, &[&name]).await;
     let repo = name;
     let url = format!("http://{ALICE}:{token}@{addr}/{repo}.git");
 
@@ -757,18 +649,6 @@ pub(crate) fn init_tracing() -> TimingReport {
     TimingReport(collector)
 }
 
-/// Serves the `enroute.api.v1alpha1` services on a loopback port, as the one tenant
-/// `test-contract-token` authenticates as.
-///
-/// Every repository these tests create goes over that contract, which
-/// claims as it creates — so ownership checks are exercised, not stepped around.
-pub(crate) async fn spawn_contract_without_hooks(state: Storage) -> std::net::SocketAddr {
-    // No git is served here, so this tenant's application is never called and
-    // an address nothing listens on is the honest thing to name.
-    let tenants = one_tenant("http://127.0.0.1:1/never-called").await;
-    spawn_enroute(state, tenants).await
-}
-
 /// Enroute's git front door over `state`, serving `id` under whatever
 /// name the test asks for.
 ///
@@ -782,7 +662,7 @@ pub(crate) async fn front_door_for(state: Storage) -> (std::net::SocketAddr, Ser
 /// The repository an isolated store holds, for a test that made exactly one.
 ///
 /// A store here is per-test and holds one repository, which spares a caller a
-/// tenant handle just to turn a key back into a row.
+/// registry handle just to turn a key back into a row.
 pub(crate) async fn only_repo(state: &Storage) -> enroute_git_retrieve::RepoMetadata {
     // `all` skips deleted repositories, so nought here is as likely to mean
     // "this test deleted it" as "this test made none".

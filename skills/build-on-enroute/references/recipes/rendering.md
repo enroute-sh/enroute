@@ -22,8 +22,8 @@ right, which is why it survives review.
 The other is where the bytes come from. An object id addresses a blob, so the
 obvious economy is to let the page fetch them itself. That means the contract
 listener answering the open internet, which is not a thing to put in front of
-a browser: reaching it is what says which tenant a call is for, so anything
-that can reach it is every tenant.
+a browser: whatever can reach it is your application, with every repository
+in the deployment behind it.
 
 ## The solution
 

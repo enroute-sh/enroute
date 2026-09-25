@@ -1,6 +1,6 @@
 # Hook reference
 
-Enroute sends a signed HTTP `POST` to `hook_endpoint_url` whenever a Git
+Enroute sends a signed HTTP `POST` to `hooks.endpoint_url` whenever a Git
 request needs an application decision.
 
 This reference lists each hook message and field. To implement an endpoint,
@@ -11,7 +11,7 @@ follow [Build a code hosting application](../build/README.md).
 | Part | Value |
 | --- | --- |
 | Method | `POST` |
-| URL | `hook_endpoint_url` from the tenant file |
+| URL | `hooks.endpoint_url` from the configuration file |
 | `Content-Type` | `application/x-protobuf` |
 | Request body | A binary `HookRequest` |
 | Success response | `200` with a binary `HookResponse` |
@@ -194,7 +194,7 @@ Set exactly one of `granted` or `denied`.
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `repo` | `RepoKey` | The repository to serve. Enroute resolves it within the tenant the request arrived for. A key the tenant does not hold is a `404` to the client. |
+| `repo` | `RepoKey` | The repository to serve. A key no repository holds is a `404` to the client. |
 | `actor` | `string` | Who is asking, as an ID in your own namespace. |
 | `context` | `bytes` | Up to 8 KiB replayed on the later hooks of this request. Optional. |
 
@@ -629,13 +629,13 @@ check.
 
 | Condition | Result | Check |
 | --- | --- | --- |
-| Endpoint unreachable | Git request fails | Your endpoint is running, and `hook_endpoint_url` points at it |
+| Endpoint unreachable | Git request fails | Your endpoint is running, and `hooks.endpoint_url` points at it |
 | No answer within the timeout | Git request fails | `hooks.timeout_secs`, and slow lookups in your handler |
 | Status other than `200` | Git request fails | Deny inside the body with a `200`, not with a status code |
 | Body is not a `HookResponse` | Git request fails | You set a member of `answer`, and you write binary protobuf |
 | `answer` is empty | Git request fails, except on `post_receive` | The `answer` member matches the `call` member |
 | Signature rejected by your endpoint | Git request fails | You verify against the configured URL's authority and path, not the arriving `Host` |
-| `Granted.repo` names no repository | `404` to the client | The key exists in this tenant |
+| `Granted.repo` names no repository | `404` to the client | The key names a repository |
 | `Granted.context` over 8 KiB | Git request fails | Store the data and send a reference to it |
 | A command with no judgement | The whole push fails | You judge every command in `commands` |
 

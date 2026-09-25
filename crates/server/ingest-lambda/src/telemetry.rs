@@ -1,5 +1,5 @@
 //! Tracing for the worker: one subscriber, built on the first invocation
-//! because the export's headers hold a token only `INVOKE` can reach.
+//! because the collector it exports to arrives with the call.
 //!
 //! Do not put the export layer behind a `reload::Layer` slot to recover a
 //! console for the init window: `reload` refuses `downcast_raw`, which is how
@@ -9,7 +9,6 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use anyhow::Context as _;
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::{Protocol, SpanExporter, WithExportConfig as _, WithHttpConfig as _};
@@ -29,11 +28,11 @@ static PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
 /// Whether [`install`] has run, so later invocations skip it.
 static INSTALLED: OnceLock<()> = OnceLock::new();
 
-/// Console logging, and span export too when `headers` is `Some`.
+/// Console logging, and span export too when the call named a collector.
 ///
 /// Call on the first invocation, before any span meant to be exported — a
 /// subscriber installs once, so later calls do nothing.
-pub fn install(headers: Option<&str>) {
+pub fn install(telemetry: Option<&crate::wire::Telemetry>) {
     if INSTALLED.set(()).is_err() {
         return;
     }
@@ -47,7 +46,7 @@ pub fn install(headers: Option<&str>) {
     );
     let registry = Registry::default().with(fmt);
 
-    let Some(export) = headers.and_then(|headers| match build_provider(headers) {
+    let Some(export) = telemetry.and_then(|telemetry| match build_provider(telemetry) {
         Ok(provider) => Some(provider),
         Err(e) => {
             // Reaches nobody yet, no subscriber being installed — kept against
@@ -86,18 +85,21 @@ pub async fn flush() {
     }
 }
 
-/// The exporter `headers` and the environment describe.
+/// The exporter the call describes.
 ///
-/// The front door is configured by a file and this is not, so it reads OTLP's
-/// own variables — the one vocabulary both ends share with every collector.
-fn build_provider(headers: &str) -> Result<SdkTracerProvider, anyhow::Error> {
-    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
-        .context("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")?;
+/// Built from the call rather than the environment: a function serves whoever
+/// invokes it, and the collector is that caller's.
+fn build_provider(telemetry: &crate::wire::Telemetry) -> Result<SdkTracerProvider, anyhow::Error> {
+    let headers: HashMap<String, String> = telemetry
+        .headers
+        .iter()
+        .map(|(name, value)| (name.clone(), value.secret().expose().to_owned()))
+        .collect();
     let exporter = SpanExporter::builder()
         .with_http()
         .with_protocol(Protocol::HttpBinary)
-        .with_endpoint(endpoint)
-        .with_headers(parse_headers(headers))
+        .with_endpoint(&telemetry.endpoint)
+        .with_headers(headers)
         .build()?;
 
     Ok(SdkTracerProvider::builder()
@@ -122,18 +124,6 @@ fn env_or_empty(key: &str) -> String {
     std::env::var(key).unwrap_or_default()
 }
 
-/// `key=value,key=value`, as `OTEL_EXPORTER_OTLP_HEADERS` is specified.
-///
-/// A pair without an `=` is dropped rather than refused: this runs before the
-/// subscriber exists, and a push should not fail over a telemetry header.
-fn parse_headers(raw: &str) -> HashMap<String, String> {
-    raw.split(',')
-        .filter_map(|pair| pair.split_once('='))
-        .map(|(name, value)| (name.trim().to_string(), value.trim().to_string()))
-        .filter(|(name, _)| !name.is_empty())
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use opentelemetry::propagation::TextMapPropagator as _;
@@ -142,25 +132,6 @@ mod tests {
     use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
     use super::*;
-
-    #[test]
-    fn headers_are_read_the_way_otlp_specifies_them() {
-        let parsed = parse_headers("authorization=Bearer abc,x-dataset=enroute");
-
-        assert_eq!(parsed["authorization"], "Bearer abc");
-        assert_eq!(parsed["x-dataset"], "enroute");
-    }
-
-    /// Whitespace around a pair is a deployment writing it readably, and a
-    /// pair with no `=` is dropped rather than failing a push over telemetry.
-    #[test]
-    fn a_malformed_pair_costs_only_itself() {
-        let parsed = parse_headers(" a = 1 ,nonsense, =2,b=3");
-
-        assert_eq!(parsed["a"], "1");
-        assert_eq!(parsed["b"], "3");
-        assert_eq!(parsed.len(), 2);
-    }
 
     /// `reload::Layer` refuses `downcast_raw`, which `set_parent` needs, so
     /// wrapping the layer in one would silently root a new trace instead.

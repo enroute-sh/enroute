@@ -50,16 +50,10 @@ somebody reinstalled. Run `docker compose down -v`, then `up` again.
 
 ## The contract refuses
 
-**`UNAUTHENTICATED: no tenant was named`.** The header is missing, doubled, or
-misspelled, or the tenant is not in the list. Every one of these reads alike
-on purpose. Against the local stack the header is `x-enroute-tenant: dev`.
-The reason is in the server log at `debug`:
-`RUST_LOG=debug docker compose up -d enroute`. Enroute refuses a repeated
-header rather than guess at it.
-
-**`NOT_FOUND` for a repository that exists.** The key belongs to another
-tenant, or was never created in this one. One deployment serves many tenants,
-and a key resolves only within its own.
+**`NOT_FOUND` for a repository that exists.** The key was never created in
+this deployment, or it was created in another one. Keys are unique across a
+deployment and mean nothing outside it. `ListRepositories` shows what is
+actually here.
 
 **`INVALID_ARGUMENT` on a key.** A key is 1 to 256 bytes of ASCII letters,
 digits, `-`, `_`, and `.`, starting and ending with a letter or digit. A `/`
@@ -79,10 +73,10 @@ import path is the directory that *contains* `enroute/`.
 for the endpoint. Until it answers, git cannot serve. This is expected before
 phase 4.
 
-**`repository not found`, or a 404.** Enroute found no tenant for the
-hostname, or the endpoint answered `DENIAL_NOT_FOUND`, or the key it granted
-is not one this tenant holds. The local tenant claims every hostname, so
-suspect the endpoint. Log what `authorize` was asked and what it answered.
+**`repository not found`, or a 404.** The endpoint answered
+`DENIAL_NOT_FOUND`, or the key it granted names no repository here. Enroute
+reads nothing from the hostname, so suspect the endpoint. Log what `authorize`
+was asked and what it answered.
 
 **A 404 the endpoint never sees.** Count the `authorize` calls, not only their
 answers. Zero calls for one path and one call for another means Enroute
@@ -130,20 +124,20 @@ repository was just created and nothing has been pushed.
 One cause almost every time: **the URL Enroute signs over is not the URL the
 endpoint verifies against.**
 
-Enroute signs `@authority` and `@path` from the URL the tenant was registered
-with. The endpoint must verify against the same string, from its own
-configuration and not from the arriving request.
+Enroute signs `@authority` and `@path` from its configured
+`hooks.endpoint_url`. The endpoint must verify against the same string, from
+its own configuration and not from the arriving request.
 
-Check both sides. Enroute's half is `hook_endpoint_url` in
-`config/tenants.toml` in the stack directory. Then check the configured public
+Check both sides. Enroute's half is `hooks.endpoint_url` in
+`config/enroute.toml` in the stack directory. Then check the configured public
 URL of the endpoint. Look for a trailing slash, `localhost` against
 `127.0.0.1`, a missing or present port, `http` against `https`, and a path that
 differs by one segment. Any one of them fails every call.
 
-**Enroute still calls the old URL after an edit to the tenants file.** Enroute
-reads the file on a timer, so wait two seconds. Then check
-`docker compose logs enroute` for an `ERROR` that says the edit would not
-load, which leaves the previous tenants serving.
+**Enroute still calls the old URL after an edit.** Configuration is read once,
+at startup, so an edit needs `docker compose restart enroute`. If it still
+calls the old URL, check `docker compose logs enroute` for the value it started
+with.
 
 **The digest does not match.** A middleware parsed or re-encoded the body
 before the handler saw it. Read the raw bytes, once, and use those bytes for
@@ -193,5 +187,5 @@ docker compose up -d
 ```
 
 This drops the volumes, so the schema and every object come back fresh. It
-costs a pull at most. The tenants survive it, because they are a file beside
-the compose file, and a change to them never needed a reset.
+costs a pull at most. The configuration survives it, because it is a file
+beside the compose file rather than state in a volume.

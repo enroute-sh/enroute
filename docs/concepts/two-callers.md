@@ -18,9 +18,9 @@ Enroute terminates Git connections. Your application does not process
 pkt-lines or serve clone and push connections. It uses the gRPC API to read
 objects and metadata, then exposes them in its own UI or services.
 
-The Git listener is normally public. Keep the API listener private: the tenant
-header identifies the caller's tenant, so any client that can set it can act as
-that tenant. See [Security](../operate/security.md).
+The Git listener is normally public. Keep the API listener private: it
+authenticates nobody, so any client that can reach it can act as your
+application. See [Security](../operate/security.md).
 
 Enroute stores durable metadata in Postgres and Git objects and indexes in an
 object store. Its compute processes hold no repository state. See

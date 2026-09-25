@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use gix_hash::ObjectId;
 use gix_object::Kind;
 
-use enroute_git_core::{ObjectHashMap, RepoId, Ulid};
+use enroute_git_core::{ExternalKey, ObjectHashMap, RepoId, Ulid};
 
 use crate::store::Identity;
 use crate::{RefEntry, RefUpdate, RefUpdateResult, RefsMap, RepoMetadata, RepoSummary};
@@ -32,11 +32,16 @@ pub type MetadataRef = Arc<dyn Metadata>;
 /// stores belongs to the ledger, which is the only thing that can hold both.
 #[async_trait]
 pub trait Metadata: std::fmt::Debug + Send + Sync {
-    /// Create a repository, with a counter per kind so it can take a push.
+    /// Create the repository called `key`, with a counter per kind so it can
+    /// take a push, or answer with the one already called that.
+    ///
+    /// Idempotent on `key`: a repeat keeps the first `default_branch`. A key
+    /// is compared, never parsed, and unique among the ones not deleted.
     ///
     /// # Errors
     /// Whatever the store said.
-    async fn create(&self, default_branch: Option<&str>) -> Result<RepoMetadata>;
+    async fn create(&self, default_branch: Option<&str>, key: &ExternalKey)
+    -> Result<RepoMetadata>;
 
     /// Every repository not deleted.
     ///
@@ -101,6 +106,36 @@ pub trait Metadata: std::fmt::Debug + Send + Sync {
     /// # Errors
     /// Whatever the store said.
     async fn summarize(&self, repos: &[RepoId]) -> Result<Vec<RepoSummary>>;
+
+    /// The live repository called `key`, if there is one.
+    ///
+    /// The whole of it rather than its id, the key being a column on the row
+    /// it names: whoever resolves a key wants the repository.
+    ///
+    /// # Errors
+    /// Whatever the store said.
+    async fn by_key(&self, key: &ExternalKey) -> Result<Option<RepoMetadata>>;
+
+    /// What `repo` is called, if it is there and not deleted.
+    ///
+    /// # Errors
+    /// Whatever the store said.
+    async fn key_of(&self, repo: RepoId) -> Result<Option<ExternalKey>>;
+
+    /// Up to `limit` repositories in key order after `after`, each with its
+    /// key and its last push, narrowed to the keys starting with `prefix`.
+    ///
+    /// Keyset, so nothing slides past mid-walk. An empty prefix narrows
+    /// nothing, and a prefix holds only what a key holds.
+    ///
+    /// # Errors
+    /// Whatever the store said.
+    async fn page_by_key(
+        &self,
+        prefix: &str,
+        after: &str,
+        limit: u32,
+    ) -> Result<Vec<(RepoSummary, ExternalKey)>>;
 
     /// Mark it deleted, reporting whether this call is what did it.
     ///

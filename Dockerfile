@@ -40,14 +40,24 @@ COPY . .
 #
 # Each binary is asked for with the package that holds it. The workspace has
 # `default-members`, so a bare `--bin` looks in the server crate alone.
+#
+# The worker is a second call, not two more arguments to the first. Cargo
+# unifies a package's features across one build graph, so asking for the
+# worker's `server` end beside the front door would link the Lambda runtime
+# into `enroute`. Both calls share the target cache, so the second pays only
+# for what the first did not already compile.
 RUN --mount=type=cache,id=enroute-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=enroute-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=enroute-target-${TARGETARCH},target=/src/target,sharing=locked \
     cargo build --profile "${ENROUTE_PROFILE}" --locked \
         -p enroute --bin enroute \
         -p enroute-postgres --bin enroute-schema \
+    && cargo build --profile "${ENROUTE_PROFILE}" --locked \
+        -p enroute-ingest-lambda --bin enroute-ingest-lambda \
+        --no-default-features --features server \
     && install -m 755 "target/${ENROUTE_PROFILE}/enroute" /enroute \
-    && install -m 755 "target/${ENROUTE_PROFILE}/enroute-schema" /enroute-schema
+    && install -m 755 "target/${ENROUTE_PROFILE}/enroute-schema" /enroute-schema \
+    && install -m 755 "target/${ENROUTE_PROFILE}/enroute-ingest-lambda" /enroute-ingest-lambda
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
@@ -65,6 +75,10 @@ COPY --from=build /enroute /usr/local/bin/enroute
 # Every table, applied by the code that reads it. `compose.yaml` gates Enroute
 # on it, so leaving it out of the image stops the stack rather than a query.
 COPY --from=build /enroute-schema /usr/local/bin/enroute-schema
+# The ingest worker, for a deployment that configures `[ingest.lambda]`. The
+# entrypoint below is the front door, so a Lambda function built on this image
+# names this binary in its own image configuration.
+COPY --from=build /enroute-ingest-lambda /usr/local/bin/enroute-ingest-lambda
 # The contract's own definition, so an integrator generates a client from the
 # image that serves it rather than from a checkout they have to keep in step
 # with it. `docker cp` is the whole of what reads this; the binary never does.

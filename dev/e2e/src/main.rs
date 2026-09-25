@@ -48,7 +48,8 @@ use model::{
     WorkTree, copy_destination,
 };
 use support::{
-    ALICE, git, init_tracing, make_state, read_graph, read_missing_objects, read_tags, spawn_server,
+    ALICE, git, init_tracing, key_for, make_state, read_graph, read_missing_objects, read_tags,
+    spawn_server,
 };
 
 /// Apply a `ModifyOp` to the file at `path`, reading and rewriting whatever
@@ -737,9 +738,8 @@ impl StateMachineTest for OracleStateMachine {
         let repo_name = format!("repo-{}", uuid::Uuid::new_v4());
         let (enroute_addr, alice_token, _landed, servers, storage, repo) = rt.block_on(async {
             let state = make_state().await;
-            let repo = state.rows.create(None).await.unwrap();
-            let (addr, token, landed, servers) =
-                spawn_server(state.clone(), &[(&repo_name, repo.id)]).await;
+            let repo = state.rows.create(None, &key_for(&repo_name)).await.unwrap();
+            let (addr, token, landed, servers) = spawn_server(state.clone(), &[&repo_name]).await;
             (addr, token, landed, servers, state, repo)
         });
         // Credentials embedded in the URL: git and reqwest both read a

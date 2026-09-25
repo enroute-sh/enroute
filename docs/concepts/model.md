@@ -27,15 +27,14 @@ rejects them. Use `IsAncestor` to evaluate ancestry.
 Enroute supports SHA-1 repositories. Object IDs are 40 lowercase hexadecimal
 characters.
 
-## Tenants
+## Namespaces
 
-A tenant represents one application on a deployment. Operators define tenants
-in a configuration file. Each has a permanent ID, hook endpoint URL, and one
-or more claimed hostnames.
+A deployment serves one application, named in `hooks.endpoint_url`. Repository
+keys are flat and unique across the deployment; Enroute has no concept of an
+owner, a group, or a path.
 
-An exact hostname claim wins over a wildcard claim. Among wildcards, the
-longest matching suffix wins. A repository belongs to the tenant that created
-it, identified by tenant ID. See [tenant configuration](../operate/configuration.md#tenants).
+Grouping repositories is therefore your application's own table, not a field
+here. See [Namespacing repositories](../patterns/namespacing.md).
 
 ## Exclusions
 

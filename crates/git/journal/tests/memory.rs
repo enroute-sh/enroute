@@ -15,7 +15,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use object_store::path::Path;
 
-use enroute_git_core::{RepoId, Ulid};
+use enroute_git_core::{ExternalKey, RepoId, Ulid};
 use enroute_git_journal::{Index, Journal, Ledger as _, MemoryLedger};
 use enroute_git_metadata::{Memory, RepoMetadata, Rows};
 use enroute_lattice_core::{Key, KeyRange, Tier};
@@ -43,7 +43,10 @@ impl Stack {
     }
 
     async fn repo(&self) -> RepoMetadata {
-        self.rows.create(None).await.expect("a repository")
+        self.rows
+            .create(None, &ExternalKey::new("journal"))
+            .await
+            .expect("a repository")
     }
 }
 

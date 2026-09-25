@@ -1,6 +1,6 @@
 # The local stack, mounted read-only at /etc/enroute/enroute.toml. Read once,
-# so an edit needs `docker compose restart enroute` — unlike `tenants.toml`
-# beside it. `dev/enroute.example.toml` is the whole format, commented.
+# so an edit needs `docker compose restart enroute`.
+# `dev/enroute.example.toml` is the whole format, commented.
 
 # A directory rather than a bucket, which is the only thing a local stack
 # changes about where objects go. No `[bucket.credentials]`: a directory needs
@@ -8,18 +8,19 @@
 [bucket]
 uri = "file:///data/objects"
 
-[tenants]
-uri = "file:///etc/enroute/tenants.toml"
-# Two rather than the default thirty, so an edit shows up while you are still
-# looking at it.
-refresh_secs = 2
-
 [database]
 # Written out rather than `${DATABASE_URL}`: this password is `enroute`, in a
 # container, on a developer's own machine.
 url = "postgres://enroute:enroute@postgres:5432/enroute"
 
 [hooks]
+# Where your application answers. The port is your framework's dev server. The
+# path is yours, but keep it in whatever namespace that framework reserves for
+# machine traffic: a forge serves repositories at paths named after
+# repositories, so a hook at `/enroute/hooks` is a hook a repository named
+# `enroute` takes away.
+endpoint_url = "http://host.docker.internal:3000/api/enroute/hooks"
+
 # RFC 9421's published test key — see docs/build/verify-the-signature.md. It guards nothing,
 # which is the only reason it can sit in a committed file. A real deployment
 # writes `signing_key = "${ENROUTE_HOOK_SIGNING_KEY}"`.

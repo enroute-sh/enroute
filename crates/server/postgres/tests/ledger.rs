@@ -5,7 +5,7 @@ use bytes::Bytes;
 use object_store::path::Path;
 use sqlx::{AssertSqlSafe, PgPool, Row as _};
 
-use enroute_git_core::{RepoId, Ulid};
+use enroute_git_core::{ExternalKey, RepoId, Ulid};
 use enroute_git_journal::{Index, Journal, Ledger as _};
 use enroute_git_metadata::Rows;
 use enroute_lattice_core::{Key, KeyRange, Tier};
@@ -31,7 +31,7 @@ macro_rules! fixture {
         let repo = Rows::new(std::sync::Arc::new(enroute_postgres::Postgres::new(
             pool.clone(),
         )))
-        .create(None)
+        .create(None, &ExternalKey::new("ledger"))
         .await
         .expect("a repository")
         .id;

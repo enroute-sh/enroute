@@ -5,6 +5,7 @@
 //! `enroute-git-metadata` never need to depend on each other.
 
 mod commit_meta;
+mod external_key;
 mod object_hashtable;
 mod object_meta;
 mod refname;
@@ -12,6 +13,7 @@ mod repo_id;
 mod storage_key;
 
 pub use commit_meta::{COMMIT_PACK_HEADER_SIZE, NewCommit, topo_order};
+pub use external_key::ExternalKey;
 pub use object_hashtable::{ObjectHashMap, ObjectHashSet, object_hash_map_with_capacity};
 pub use object_meta::{
     CommitPackLocation, NewObject, ObjectMeta, ObjectSeq, ObjectSeqs, PackImageLocation,
@@ -82,20 +84,12 @@ pub fn decode_loose(compressed: &[u8]) -> Result<(Kind, Bytes), Error> {
 /// Computes the git object id for `(kind, raw_content)` without compressing
 /// it, for when only the OID is needed.
 ///
-/// `gix_object::compute_hash` spelled out so the hash goes through
-/// [`enroute_git_hash`] instead, to use the CPU's SHA-1 instructions.
-///
 /// # Errors
 ///
 /// Returns an error if the content is a SHA-1 collision attempt.
 pub fn hash_loose(kind: Kind, content: &[u8]) -> Result<gix_hash::ObjectId, Error> {
-    let len =
-        u64::try_from(content.len()).map_err(|e| anyhow::anyhow!("content too large: {e}"))?;
-    let mut hasher = enroute_git_hash::Hasher::new();
-    hasher.update(&gix_object::encode::loose_header(kind, len));
-    hasher.update(content);
-    let digest = hasher.try_finalize().map_err(|e| anyhow::anyhow!(e))?;
-    Ok(gix_hash::ObjectId::Sha1(digest))
+    gix_object::compute_hash(gix_hash::Kind::Sha1, kind, content)
+        .map_err(|e| anyhow::anyhow!("{e}").into())
 }
 
 /// Given `(kind, raw_content)`, produce `(ObjectId, zlib_bytes)` suitable for loose object storage.

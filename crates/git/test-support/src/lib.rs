@@ -41,8 +41,8 @@ use object_store::{
 };
 
 use enroute_git_core::{
-    NewCommit, NewObject, ObjectHashMap, PackImageLocation, SegmentLocation, decode_loose,
-    encode_loose, hash_loose,
+    ExternalKey, NewCommit, NewObject, ObjectHashMap, PackImageLocation, SegmentLocation,
+    decode_loose, encode_loose, hash_loose,
 };
 use enroute_git_retrieve::{RepoMetadata, Storage};
 use enroute_git_store::{
@@ -235,7 +235,15 @@ pub fn make_faulty_state() -> (Storage, Arc<FaultyObjectStore>) {
 /// It has no name and no owner: a test that wants a repository called
 /// something is testing an application, not this.
 pub async fn create_repo(state: &Storage) -> RepoMetadata {
-    state.rows.create(None).await.unwrap()
+    // A key of its own per call: a store shared by two callers would answer
+    // the second with the first's repository.
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let next = NEXT.fetch_add(1, Ordering::Relaxed);
+    state
+        .rows
+        .create(None, &ExternalKey::new(format!("support-{next}")))
+        .await
+        .unwrap()
 }
 
 /// Parse raw pkt-line bytes and return the payload of the sideband-3 (error)

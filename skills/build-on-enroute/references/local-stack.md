@@ -11,7 +11,7 @@ Every release is pushed to the GitHub Container Registry as
 | Tag            | What it names                                  |
 | -------------- | ---------------------------------------------- |
 | `latest`       | The current release. Moves with each one.      |
-| `<version>`    | One release, for example `0.1.0`. Not rebuilt. |
+| `<version>`    | One release, for example `0.2.0`. Not rebuilt. |
 | `sha-<commit>` | One commit. The tag that is never reused.      |
 
 The `latest` tag moves with each release. A version tag does not, so name one
@@ -58,12 +58,12 @@ source can pull the image.
 ## Start it
 
 Everything the stack needs is in the `stack/` directory beside this skill: a
-compose file and the two configuration files it mounts.
+compose file and the configuration file it mounts.
 
 ```sh
 cp -R <this skill>/stack enroute-stack
 cd enroute-stack
-$EDITOR config/tenants.toml    # hook_endpoint_url is the user's
+$EDITOR config/enroute.toml    # hooks.endpoint_url is the user's
 docker compose up -d
 ```
 
@@ -71,10 +71,10 @@ Copy it rather than run it in place. `docker compose` names the project after
 the directory, the volumes belong to that project, and an upgrade replaces the
 skill directory, which would strand them.
 
-`hook_endpoint_url` in `config/tenants.toml` is the route the user's endpoint
+`hooks.endpoint_url` in `config/enroute.toml` is the route the user's endpoint
 will serve. It does not have to exist yet. Enroute calls it when a git request
-arrives, and not before. Enroute reads the file again every two seconds, so a
-wrong value costs an edit and not a restart.
+arrives, and not before. The file is read once, so a wrong value costs an edit
+and `docker compose restart enroute`.
 
 Git does not serve until that endpoint answers. Until then the contract is all
 that works, and that is the checkpoint for this phase.
@@ -107,16 +107,13 @@ reads the file once, so an edit needs `docker compose restart enroute`.
 [`dev/enroute.example.toml`] in the repository gives the full format with
 comments.
 
-There is no tenant to register and no command that registers one. The tenants
-are in `config/tenants.toml`, which Enroute reads again every two seconds. To
-add one is an edit and no restart. [`dev/tenants.example.toml`] gives that
-format with comments.
+There is nothing to register and no command that registers anything. One
+deployment serves one application, named by `hooks.endpoint_url`.
 
-Enroute refuses a file that does not load rather than serve it. For the
-tenants, the server logs at `ERROR` and keeps serving what it read last. For
-the configuration, the first read must succeed or the server does not start.
-Mount the *directory*, never the file: a bind mount of one file pins one
-inode, and a tenants file is replaced by a rename.
+Enroute refuses a file that does not load rather than serve it: the read must
+succeed or the server does not start. Mount the *directory*, never the file — a
+bind mount of one file pins one inode, and an editor that writes by renaming
+would leave the container reading the old one.
 
 ## Fixed values
 
@@ -128,14 +125,12 @@ container's logs to find them.
 | Git base URL     | `http://127.0.0.1:8080`                         |
 | Repository URL   | `http://127.0.0.1:8080/<path>.git`              |
 | Contract address | `127.0.0.1:50051`, plaintext HTTP/2, no TLS     |
-| Contract tenant  | `x-enroute-tenant: dev`                         |
-| Tenant id        | `dev`, claiming `*`, so any hostname reaches it |
 | Signing key      | RFC 9421's published `test-key-ed25519`         |
 | Key id           | `poqkLGiymh_W0uP6PZFw-dvez3QJT5SolqXBCW38r0U`   |
 
-The contract authenticates nobody. A call names its tenant in a header, and
-this stack puts nothing in front of the listener to set it. That is fine on a
-laptop and is not how to deploy.
+The contract authenticates nobody and needs no header. This stack puts nothing
+in front of the listener, so anything that can reach 50051 can read, write and
+delete every repository. That is fine on a laptop and is not how to deploy.
 
 The user's endpoint decides what a git client presents as its credential. It
 is whatever `authorize` accepts, so pick something in phase 4 and use it.
@@ -174,11 +169,12 @@ endpoint the public half.
 
 ## Change the endpoint URL
 
-The URL is `hook_endpoint_url` in `config/tenants.toml`. The stack reads that
-file again every two seconds:
+The URL is `hooks.endpoint_url` in `config/enroute.toml`. The stack reads that
+file once, at startup:
 
 ```sh
-$EDITOR config/tenants.toml
+$EDITOR config/enroute.toml
+docker compose restart enroute
 ```
 
 Enroute signs over that exact authority and path, and the endpoint verifies
@@ -192,9 +188,9 @@ docker compose down -v
 ```
 
 `down -v` drops the volumes, so the tables and the objects come back fresh.
-Enroute creates the tables again on the next start. Without `-v` they are
-kept. There is no tenant to put back: the tenants are a file beside the
-compose file, not state in a volume.
+Enroute creates the tables again on the next start. Without `-v` they are kept.
+There is no configuration to put back: it is a file beside the compose file,
+not state in a volume.
 
 ## Logs
 
@@ -206,4 +202,3 @@ docker compose logs -f enroute   # the service, every call it makes, and the
 `RUST_LOG=debug docker compose up -d` raises the level on Enroute.
 
 [`dev/enroute.example.toml`]: https://github.com/enroute-sh/enroute/blob/HEAD/dev/enroute.example.toml
-[`dev/tenants.example.toml`]: https://github.com/enroute-sh/enroute/blob/HEAD/dev/tenants.example.toml

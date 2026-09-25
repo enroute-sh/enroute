@@ -114,7 +114,7 @@ Enroute is **early**. We use it ourselves, but read
 storage format can change in any release, requiring a clean slate and re-push.
 
 Releases are `0.x` and published as `ghcr.io/enroute-sh/enroute:latest`. A
-version tag names one image and is not rebuilt, so `:0.1.0` is enough to pin.
+version tag names one image and is not rebuilt, so `:0.2.0` is enough to pin.
 What a release changed is the message of its commit on the channel branch, so
 `git log main` is the changelog.
 

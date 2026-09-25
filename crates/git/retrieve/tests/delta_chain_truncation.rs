@@ -16,7 +16,7 @@ use gix_hash::ObjectId;
 use gix_object::Kind;
 use object_store::memory::InMemory;
 
-use enroute_git_core::RepoId;
+use enroute_git_core::{ExternalKey, RepoId};
 use enroute_git_ingest::{IncomingPack, IngestRequest, IngestWorker as _, LocalIngestWorker};
 use enroute_git_journal::Index;
 use enroute_git_retrieve::{RefUpdate, RefsMap, RepoMetadata, Storage};
@@ -29,7 +29,10 @@ async fn state_and_repo() -> Result<(Storage, RepoMetadata)> {
         Arc::new(InMemory::new()),
         Arc::new(Store::new(Arc::new(InMemory::new()))),
     );
-    let repo = state.rows.create(None).await?;
+    let repo = state
+        .rows
+        .create(None, &ExternalKey::new("delta-chain"))
+        .await?;
     Ok((state, repo))
 }
 

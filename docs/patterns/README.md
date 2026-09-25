@@ -18,6 +18,7 @@ it. Read the one you want; they do not need to be read in order.
 | [Deploy keys](deploy-keys.md) | A credential scoped to one repository, and bot actors | `authorize` |
 | [CI on push](ci-on-push.md) | Build what landed, and read what changed | `post_receive`, `DiffCommit`, `ListRefs` |
 | [Mirroring](mirroring.md) | Sync refs to another host as they land | `post_receive`, `ListRefs`, `PushToRemote` |
+| [Namespacing repositories](namespacing.md) | Give two groups a `backend` each | `authorize`, your own tables |
 
 Browsing a repository and rendering diffs are not here. They are
 [chapter 6](../build/06-browse-repositories.md) and

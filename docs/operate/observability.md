@@ -20,13 +20,13 @@ authorization = "Bearer ${OTEL_TOKEN}"
 | `telemetry.sample_ratio` | `1.0` | Head-sampling ratio from `0.0` to `1.0` |
 
 Invalid ratios or header names stop startup. `RUST_LOG` controls console logs;
-exported spans retain an `INFO` minimum level. Lambda ingestion uses
-`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` and `OTEL_EXPORTER_OTLP_HEADERS`.
+exported spans retain an `INFO` minimum level. Lambda ingestion receives
+`telemetry.endpoint` and `telemetry.headers` on each invocation, so a collector
+is configured once and the worker needs no telemetry settings of its own.
 
 Git operation spans record object-store request counts and bytes by storage
 role. The `actor` from `authorize` is attached to the span, so use an internal
 identifier rather than a credential or email address. Scratch storage is not
 metered.
 
-Maintenance has no metric, and tenant-refresh failures only produce `ERROR`
-logs. Alert on those logs.
+Maintenance has no metric and only produces `ERROR` logs. Alert on those logs.

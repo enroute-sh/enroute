@@ -5,8 +5,8 @@
 
 use crate::contract::Client;
 use crate::support::{
-    E2E_TENANT, front_door_for, git, git_allowing_failure, make_isolated_state,
-    make_isolated_state_on_pool, spawn_contract_without_hooks,
+    front_door_for, git, git_allowing_failure, make_isolated_state, make_isolated_state_on_pool,
+    spawn_enroute,
 };
 
 use super::support::{contract_only, contract_with_repo, status_of};
@@ -16,10 +16,8 @@ use super::support::{contract_only, contract_with_repo, status_of};
 #[tokio::test]
 async fn a_created_repository_takes_a_push() {
     let state = make_isolated_state().await;
-    let enroute = spawn_contract_without_hooks(state.clone()).await;
-    let client = Client::connect(format!("http://{enroute}"), E2E_TENANT)
-        .await
-        .unwrap();
+    let enroute = spawn_enroute(state.clone()).await;
+    let client = Client::connect(format!("http://{enroute}")).await.unwrap();
 
     let repo = client.create_repository("").await.unwrap();
     assert_eq!(repo.default_branch, "refs/heads/main");
@@ -49,10 +47,8 @@ async fn a_created_repository_takes_a_push() {
 #[tokio::test]
 async fn a_created_repository_keeps_its_default_branch() {
     let state = make_isolated_state().await;
-    let enroute = spawn_contract_without_hooks(state.clone()).await;
-    let client = Client::connect(format!("http://{enroute}"), E2E_TENANT)
-        .await
-        .unwrap();
+    let enroute = spawn_enroute(state.clone()).await;
+    let client = Client::connect(format!("http://{enroute}")).await.unwrap();
 
     let repo = client.create_repository("refs/heads/trunk").await.unwrap();
     assert_eq!(repo.default_branch, "refs/heads/trunk");
@@ -90,10 +86,8 @@ async fn a_created_repository_keeps_its_default_branch() {
 #[tokio::test]
 async fn a_default_branch_outside_refs_heads_is_refused() {
     let state = make_isolated_state().await;
-    let enroute = spawn_contract_without_hooks(state.clone()).await;
-    let client = Client::connect(format!("http://{enroute}"), E2E_TENANT)
-        .await
-        .unwrap();
+    let enroute = spawn_enroute(state.clone()).await;
+    let client = Client::connect(format!("http://{enroute}")).await.unwrap();
 
     client
         .create_repository("trunk")
@@ -106,10 +100,8 @@ async fn a_default_branch_outside_refs_heads_is_refused() {
 #[tokio::test]
 async fn a_deleted_repository_stops_answering() {
     let state = make_isolated_state().await;
-    let enroute = spawn_contract_without_hooks(state.clone()).await;
-    let client = Client::connect(format!("http://{enroute}"), E2E_TENANT)
-        .await
-        .unwrap();
+    let enroute = spawn_enroute(state.clone()).await;
+    let client = Client::connect(format!("http://{enroute}")).await.unwrap();
 
     let repo = client.create_repository("").await.unwrap();
     let id = repo.repo.clone().unwrap().key;
@@ -133,10 +125,8 @@ async fn a_deleted_repository_stops_answering() {
 #[tokio::test]
 async fn a_deleted_repository_refuses_a_client() {
     let state = make_isolated_state().await;
-    let enroute = spawn_contract_without_hooks(state.clone()).await;
-    let client = Client::connect(format!("http://{enroute}"), E2E_TENANT)
-        .await
-        .unwrap();
+    let enroute = spawn_enroute(state.clone()).await;
+    let client = Client::connect(format!("http://{enroute}")).await.unwrap();
     let repo = client.create_repository("").await.unwrap();
     let id = repo.repo.clone().unwrap().key;
     let (front_door, _servers) = front_door_for(state).await;
@@ -154,10 +144,8 @@ async fn a_deleted_repository_refuses_a_client() {
 #[tokio::test]
 async fn the_janitor_reclaims_a_deleted_repository() {
     let (state, pool) = make_isolated_state_on_pool().await;
-    let enroute = spawn_contract_without_hooks(state.clone()).await;
-    let client = Client::connect(format!("http://{enroute}"), E2E_TENANT)
-        .await
-        .unwrap();
+    let enroute = spawn_enroute(state.clone()).await;
+    let client = Client::connect(format!("http://{enroute}")).await.unwrap();
     let repo = client.create_repository("").await.unwrap();
     let id = repo.repo.clone().unwrap().key;
 
@@ -236,10 +224,8 @@ async fn the_janitor_reclaims_a_deleted_repository() {
 #[tokio::test]
 async fn a_repository_reports_its_last_push() {
     let state = make_isolated_state().await;
-    let enroute = spawn_contract_without_hooks(state.clone()).await;
-    let client = Client::connect(format!("http://{enroute}"), E2E_TENANT)
-        .await
-        .unwrap();
+    let enroute = spawn_enroute(state.clone()).await;
+    let client = Client::connect(format!("http://{enroute}")).await.unwrap();
     let created = client.create_repository("").await.unwrap();
     let id = created.repo.clone().unwrap().key;
     assert_eq!(

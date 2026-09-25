@@ -2,12 +2,11 @@
 //!
 //! Enroute allocates no id of its own, so these are the facts an integration
 //! rests on: the key you gave is the key you get back, creating twice with one
-//! key is one repository, and a key means nothing outside the tenant that
-//! chose it.
+//! key is one repository, and a key released by a delete is free again.
 
 use crate::contract::Client;
 use crate::grpc::support::{contract_only, status_of};
-use crate::support::{E2E_TENANT, make_isolated_state, spawn_contract_without_hooks};
+use crate::support::{make_isolated_state, spawn_enroute};
 
 /// The key comes back exactly as it was given.
 ///
@@ -39,10 +38,8 @@ async fn a_key_is_returned_as_it_was_given() {
 #[tokio::test]
 async fn creating_twice_with_one_key_is_idempotent() {
     let state = make_isolated_state().await;
-    let enroute = spawn_contract_without_hooks(state.clone()).await;
-    let client = Client::connect(format!("http://{enroute}"), E2E_TENANT)
-        .await
-        .unwrap();
+    let enroute = spawn_enroute(state.clone()).await;
+    let client = Client::connect(format!("http://{enroute}")).await.unwrap();
 
     let first = client.create_repository_as("once", "").await.unwrap();
     let again = client.create_repository_as("once", "").await.unwrap();
@@ -80,33 +77,6 @@ async fn a_repeat_does_not_change_the_default_branch() {
     );
 }
 
-/// Two tenants may each call a repository the same thing.
-///
-/// Why a key needs no unguessability: scoped to whoever chose it, one tenant's
-/// keys neither collide with another's nor reach them.
-#[tokio::test]
-async fn one_key_names_a_different_repository_for_each_tenant() {
-    let (acme, other) = crate::grpc::tenancy::two_tenants().await;
-
-    let mine = acme.create_repository_as("shared-name", "").await.unwrap();
-    let theirs = other
-        .create_repository_as("shared-name", "")
-        .await
-        .expect("another tenant's key blocked this one");
-
-    // The same string, and two repositories: neither tenant can tell the
-    // other's exists, let alone reach it.
-    assert_eq!(mine.repo.expect("a key").key, "shared-name");
-    assert_eq!(theirs.repo.expect("a key").key, "shared-name");
-
-    acme.delete_repository("shared-name").await.unwrap();
-    // Deleting one leaves the other alone, which a shared row would not.
-    other
-        .get_repository("shared-name")
-        .await
-        .expect("deleting one tenant's repository took another's");
-}
-
 /// A deleted key is free, and creating with it again is a new repository.
 #[tokio::test]
 async fn a_deleted_key_can_be_used_again() {
@@ -125,6 +95,99 @@ async fn a_deleted_key_can_be_used_again() {
         .create_repository_as("recycled", "")
         .await
         .expect("a released key was not free again");
+}
+
+/// A listing narrowed to one grouping, over the contract.
+///
+/// The one thing an application cannot do for itself with a flat key space:
+/// walk a group without reading every repository in the deployment.
+#[tokio::test]
+async fn a_listing_can_be_narrowed_to_a_prefix() {
+    let client = contract_only().await;
+
+    for key in ["acme.backend", "acme.web", "acmex", "globex.api"] {
+        client.create_repository_as(key, "").await.unwrap();
+    }
+
+    let keys = |page: Vec<enroute_api::api::v1alpha1::Repository>| {
+        let mut held: Vec<String> = page
+            .into_iter()
+            .map(|one| one.repo.expect("a key").key)
+            .collect();
+        held.sort();
+        held
+    };
+
+    let (page, next) = client
+        .list_repositories_under("acme.", 50, "")
+        .await
+        .unwrap();
+    assert_eq!(keys(page), ["acme.backend", "acme.web"]);
+    assert!(next.is_empty());
+
+    // The separator is the caller's: without it, the neighbour is in.
+    let (page, _) = client
+        .list_repositories_under("acme", 50, "")
+        .await
+        .unwrap();
+    assert_eq!(keys(page), ["acme.backend", "acme.web", "acmex"]);
+
+    let (page, _) = client
+        .list_repositories_under("nobody.", 50, "")
+        .await
+        .unwrap();
+    assert!(page.is_empty());
+}
+
+/// Paging inside a prefix stays inside it, and a token from another walk is
+/// refused rather than quietly resumed somewhere else.
+#[tokio::test]
+async fn a_page_token_belongs_to_the_prefix_that_minted_it() {
+    let client = contract_only().await;
+
+    for key in ["acme.backend", "acme.web", "globex.api"] {
+        client.create_repository_as(key, "").await.unwrap();
+    }
+
+    let (first, next) = client
+        .list_repositories_under("acme.", 1, "")
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    assert!(!next.is_empty(), "a page of one of two reports a next");
+
+    let (second, last) = client
+        .list_repositories_under("acme.", 50, &next)
+        .await
+        .unwrap();
+    assert_eq!(second.len(), 1, "the rest of the group");
+    assert!(last.is_empty());
+
+    // The same token against another prefix is two walks confused for one.
+    let error = client
+        .list_repositories_under("globex.", 50, &next)
+        .await
+        .expect_err("a token from another prefix");
+    assert_eq!(status_of(&error).code(), tonic::Code::InvalidArgument);
+}
+
+/// A prefix holding what no key holds is the caller's to fix, and saying so
+/// beats reporting an empty deployment.
+#[tokio::test]
+async fn a_prefix_that_could_start_no_key_is_refused() {
+    let client = contract_only().await;
+
+    for bad in ["acme/backend", "a b", "acme%2F"] {
+        let error = client
+            .list_repositories_under(bad, 50, "")
+            .await
+            .expect_err(bad);
+        assert_eq!(
+            status_of(&error).code(),
+            tonic::Code::InvalidArgument,
+            "{bad}"
+        );
+    }
 }
 
 /// A key the rules refuse is an `InvalidArgument`, and says which rule.

@@ -1,16 +1,14 @@
-//! Asking the application the questions Enroute cannot answer — and working out
-//! which application to ask.
+//! Asking the application the questions Enroute cannot answer.
 //!
-//! Enroute knows a repository only by an opaque id; which one a URL names,
-//! and whether the request's credential may have it, are the application's to
-//! say. *Which* application is answered by the hostname (see [`crate::tenancy`]),
-//! so one Enroute serves many customers over one port. One POST per call,
-//! nothing streamed and nothing held open, so the application on the far side can
-//! be a serverless function.
+//! Enroute knows a repository only by an opaque id; which one a URL names, and
+//! whether the request's credential may have it, are the application's to say.
+//! One application answers for the whole deployment, at `hooks.endpoint_url`.
+//! One POST per call, nothing streamed and nothing held open, so the
+//! application on the far side can be a serverless function.
 
-use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context as _;
 use async_trait::async_trait;
 use prost::Message as _;
 
@@ -22,7 +20,7 @@ use enroute_git_http::{
 use enroute_git_ingest::{Actor, ReceiveHooks, RefCommand, RefJudgement, Verdict};
 use enroute_signature::{Covered, SigningKey};
 
-use crate::tenancy::{RepoKey, Tenant, Tenants};
+use crate::repo_key::RepoKey;
 use crate::wire::{wire_oid_from_hex, wire_repo};
 
 /// The most `Granted.context` an application may hand back.
@@ -31,30 +29,33 @@ use crate::wire::{wire_oid_from_hex, wire_repo};
 /// bounded here rather than left to an application's own restraint.
 const MAX_CONTEXT: usize = 8 * 1024;
 
-/// Every tenant's application, reached over HTTP.
+/// The application, reached over HTTP.
 ///
-/// One client, not one per tenant: a `reqwest::Client` is a connection
-/// pool, and what varies per tenant is only the URL, which is looked up.
+/// One client and not one per call: a `reqwest::Client` is a connection pool.
 #[derive(Debug)]
 pub struct Hooks {
     http: reqwest::Client,
-    tenants: Arc<Tenants>,
+    state: enroute_git_retrieve::Storage,
+    endpoint: url::Url,
     key: SigningKey,
 }
 
 impl Hooks {
-    /// A client for every tenant's application, signing with `key`.
-    ///
-    /// One key for the whole deployment: the signature covers the authority
-    /// and path, so a call meant for one tenant does not verify at another's.
+    /// A client for the application at `endpoint`, signing with `key`.
     ///
     /// # Errors
     ///
     /// Returns an error if an HTTP client cannot be built.
-    pub fn new(tenants: Arc<Tenants>, key: SigningKey, timeout: Duration) -> anyhow::Result<Self> {
+    pub fn new(
+        state: enroute_git_retrieve::Storage,
+        endpoint: url::Url,
+        key: SigningKey,
+        timeout: Duration,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
             http: reqwest::Client::builder().timeout(timeout).build()?,
-            tenants,
+            state,
+            endpoint,
             key,
         })
     }
@@ -65,13 +66,9 @@ impl Hooks {
         self.key.verifying_key()
     }
 
-    /// Make one call to `tenant`'s application and read the answer back.
-    async fn call(
-        &self,
-        tenant: &Tenant,
-        request: &pb::HookRequest,
-    ) -> anyhow::Result<pb::HookResponse> {
-        let url = &tenant.hook_endpoint_url;
+    /// Make one call to the application and read the answer back.
+    async fn call(&self, request: &pb::HookRequest) -> anyhow::Result<pb::HookResponse> {
+        let url = &self.endpoint;
         let authority = url
             .host_str()
             .ok_or_else(|| anyhow::anyhow!("the hooks endpoint URL names no host"))?;
@@ -104,19 +101,6 @@ impl Hooks {
         let response = post.body(body).send().await?.error_for_status()?;
         Ok(pb::HookResponse::decode(response.bytes().await?)?)
     }
-
-    /// The tenant a git request is for, from the host it arrived on.
-    ///
-    /// An unregistered hostname is a 404, not a 401 — no credential would
-    /// make it exist.
-    fn tenant(&self, request: &GitRequest<'_>) -> Result<Tenant, AuthError> {
-        let host = request
-            .headers
-            .get(http::header::HOST)
-            .and_then(|value| value.to_str().ok())
-            .ok_or(AuthError::NotFound)?;
-        self.tenants.by_host(host).ok_or(AuthError::NotFound)
-    }
 }
 
 #[async_trait]
@@ -124,16 +108,9 @@ impl Authorizer for Hooks {
     #[tracing::instrument(
         name = "enroute::hooks::authorize",
         skip(self, request),
-        fields(tenant = tracing::field::Empty, actor = tracing::field::Empty)
+        fields(actor = tracing::field::Empty)
     )]
     async fn authorize(&self, request: &GitRequest<'_>) -> Result<Authorized, AuthError> {
-        let tenant = self.tenant(request)?;
-        // What every unit this request goes on to spend is attributable to,
-        // and a span with no tenant could not be attributed later even in
-        // principle. The id, since it is the one field configuration may not
-        // edit and a record of what was spent may not stop meaning what it did.
-        tracing::Span::current().record("tenant", tenant.id.as_str());
-
         let call = pb::HookRequest {
             call: Some(pb::hook_request::Call::Authorize(pb::AuthorizeRequest {
                 repo_path: request.repo.to_string(),
@@ -147,10 +124,7 @@ impl Authorizer for Hooks {
 
         // An unreachable or misbehaving application is a fault, not a refusal —
         // a 500, so a push fails closed rather than being quietly allowed.
-        let response = self
-            .call(&tenant, &call)
-            .await
-            .map_err(AuthError::Internal)?;
+        let response = self.call(&call).await.map_err(AuthError::Internal)?;
         let Some(pb::hook_response::Answer::Authorize(answer)) = response.answer else {
             return Err(AuthError::Internal(anyhow::anyhow!(
                 "the hooks did not answer the authorize call"
@@ -171,35 +145,35 @@ impl Authorizer for Hooks {
         // fetch is attributable to nobody if it is not recorded here.
         tracing::Span::current().record("actor", actor.id.as_str());
 
-        // An application is a customer's own code, so a buggy or compromised
-        // one must not reach another customer's storage by answering with a key
-        // it read somewhere. It cannot: a key is resolved against the tenant
-        // this request arrived for, so another tenant's is simply not there.
+        // A key no repository holds is a 404: the application named something
+        // that is not here, which no credential would change.
         let repo = self
-            .tenants
-            .resolve(&tenant, &key)
+            .state
+            .rows
+            .by_key(key.external())
             .await
             .map_err(AuthError::Internal)?
-            .ok_or(AuthError::NotFound)?;
+            .ok_or(AuthError::NotFound)?
+            .id;
 
         Ok(Authorized { repo, actor })
     }
 }
 
 impl Hooks {
-    /// Whose application answers for `repo` and what they call it, recorded on
-    /// the current span.
+    /// What the application calls `repo`, which is what every hook call spells.
     ///
-    /// Started from a repository rather than a hostname, since git is being
-    /// served by now. An unclaimed one has no application, and no push may land.
-    async fn tenant_for(&self, repo: RepoId) -> Result<(Tenant, RepoKey), Error> {
-        let (tenant, key) = self
-            .tenants
-            .by_repo(repo)
+    /// Started from a repository rather than from a URL, since git is being
+    /// served by now. An unregistered one has no name to spell.
+    async fn key_of(&self, repo: RepoId) -> Result<RepoKey, Error> {
+        let key = self
+            .state
+            .rows
+            .repo(repo)
+            .key_of()
             .await?
-            .ok_or_else(|| anyhow::anyhow!("repository {repo} belongs to no live tenant"))?;
-        tracing::Span::current().record("tenant", tenant.id.as_str());
-        Ok((tenant, key))
+            .ok_or_else(|| anyhow::anyhow!("repository {repo} has no key"))?;
+        Ok(key.as_str().parse().context("a stored repository key")?)
     }
 }
 
@@ -213,7 +187,6 @@ impl ReceiveHooks for Hooks {
         err,
         skip(self, actor, commands),
         fields(
-            tenant = tracing::field::Empty,
             actor = %actor.id,
             commands = commands.len()
         )
@@ -224,7 +197,7 @@ impl ReceiveHooks for Hooks {
         actor: &Actor,
         commands: &[RefCommand],
     ) -> Result<Vec<RefJudgement>, Error> {
-        let (tenant, key) = self.tenant_for(repo).await?;
+        let key = self.key_of(repo).await?;
 
         let call = pb::HookRequest {
             call: Some(pb::hook_request::Call::PreReceive(pb::PreReceiveRequest {
@@ -235,7 +208,7 @@ impl ReceiveHooks for Hooks {
             })),
         };
 
-        let response = self.call(&tenant, &call).await?;
+        let response = self.call(&call).await?;
         // Same rule as `authorize`: an application that did not answer has not
         // decided, and `receive-pack` fails a hook it could not run rather
         // than guessing which way it would have gone.
@@ -253,7 +226,6 @@ impl ReceiveHooks for Hooks {
         name = "enroute::hooks::post_receive",
         skip(self, actor, commands),
         fields(
-            tenant = tracing::field::Empty,
             actor = %actor.id,
             commands = commands.len()
         )
@@ -264,7 +236,7 @@ impl ReceiveHooks for Hooks {
         actor: &Actor,
         commands: &[RefCommand],
     ) -> Result<Vec<String>, Error> {
-        let (tenant, key) = self.tenant_for(repo).await?;
+        let key = self.key_of(repo).await?;
 
         let call = pb::HookRequest {
             call: Some(pb::hook_request::Call::PostReceive(
@@ -281,7 +253,7 @@ impl ReceiveHooks for Hooks {
         // decided and the push fails; here the refs have already moved, so a
         // application too old to know this call is one that will not hear about
         // pushes rather than one that breaks them.
-        let response = self.call(&tenant, &call).await?;
+        let response = self.call(&call).await?;
         let Some(pb::hook_response::Answer::PostReceive(answer)) = response.answer else {
             tracing::debug!("the hooks does not answer post-receive");
             return Ok(Vec::new());
@@ -295,7 +267,7 @@ impl RefVisibility for Hooks {
     #[tracing::instrument(
         name = "enroute::hooks::visible_refs",
         skip(self, refs),
-        fields(tenant = tracing::field::Empty, refs = refs.len())
+        fields(refs = refs.len())
     )]
     async fn visible_refs(
         &self,
@@ -304,7 +276,7 @@ impl RefVisibility for Hooks {
         access: Access,
         refs: &[&str],
     ) -> Result<Vec<String>, Error> {
-        let (tenant, key) = self.tenant_for(repo).await?;
+        let key = self.key_of(repo).await?;
 
         let call = pb::HookRequest {
             call: Some(pb::hook_request::Call::VisibleRefs(
@@ -324,7 +296,7 @@ impl RefVisibility for Hooks {
         // `pre_receive`'s rule, for the same reason: an application that did not
         // answer has not decided, and advertising every ref would publish the
         // very ones it may have meant to hide.
-        let response = self.call(&tenant, &call).await?;
+        let response = self.call(&call).await?;
         let Some(pb::hook_response::Answer::VisibleRefs(answer)) = response.answer else {
             return Err(anyhow::anyhow!("the hooks did not answer the visible-refs call").into());
         };
@@ -385,9 +357,8 @@ fn granted_by(granted: pb::Granted) -> Result<(RepoKey, Actor), AuthError> {
         .ok_or_else(|| AuthError::Internal(anyhow::anyhow!("the hooks granted no repository")))?
         .key;
 
-    // A key no repository could have is one this tenant does not have. To
-    // whoever is pushing that is the same as a repository that is not there,
-    // and saying more would only report an application's own bug to them.
+    // A key no repository could have is a repository that is not there. Saying
+    // more would only report an application's own bug to whoever is pushing.
     let key: RepoKey = key.parse().map_err(|_bad| AuthError::NotFound)?;
 
     if granted.context.len() > MAX_CONTEXT {

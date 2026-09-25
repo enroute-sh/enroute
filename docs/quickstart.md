@@ -58,6 +58,8 @@ uri = "file:///data/objects"
 url = "postgres://enroute:enroute@postgres:5432/enroute"
 
 [hooks]
+# Where your application answers hooks.
+endpoint_url = "http://host.docker.internal:3000/api/enroute/hooks"
 # The public test key from RFC 9421. Generate your own key for any other use.
 signing_key = """
 -----BEGIN PRIVATE KEY-----
@@ -65,22 +67,12 @@ MC4CAQAwBQYDK2VwBCIEIJ+DYvh6SEqVTm50DFtMDoQikTmiCqirVv9mWG9qfSnF
 -----END PRIVATE KEY-----
 """
 
-[tenants]
-uri = "file:///etc/enroute/tenants.toml"
-refresh_secs = 2
-
 [ingest.local]
 scratch = "file:///data/scratch"
 ```
 
-Create `config/tenants.toml`. The endpoint URL identifies the HTTP route that
-will answer hooks:
-
-```toml
-[tenants.dev]
-hook_endpoint_url = "http://host.docker.internal:3000/api/enroute/hooks"
-domains = ["*"]
-```
+`endpoint_url` is the HTTP route that will answer hooks. Nothing has to be
+listening there yet.
 
 ## Start Enroute
 
@@ -93,16 +85,15 @@ The API listens on port `50051`.
 
 ## Create a repository
 
-Every API call names its tenant in a header. This stack has one tenant, `dev`,
-and nothing in front of the API to set the header, so you set it yourself.
-For local use, set the header directly. In a deployment, an authenticated
-proxy must set it; see [Security](operate/security.md).
+The API authenticates nobody, and this stack puts nothing in front of it. That
+is fine on a laptop; in a deployment, keep the port reachable only by your
+application. See [Security](operate/security.md).
 
 You choose the repository key. Use an id your application already allocated
 and will never change, not a name a user can rename:
 
 ```sh
-grpcurl -plaintext -H 'x-enroute-tenant: dev' \
+grpcurl -plaintext \
   -d '{"repo": {"key": "repo-4f2a1c"}}' \
   127.0.0.1:50051 enroute.api.v1alpha1.RepositoryService/CreateRepository
 ```
@@ -112,14 +103,14 @@ retry needs no bookkeeping. See
 [Repository keys](reference/the-contract.md#repository-keys) for the rules a key
 must follow.
 
-Read the repository back, and list every repository the tenant has:
+Read the repository back, and list every repository this Enroute holds:
 
 ```sh
-grpcurl -plaintext -H 'x-enroute-tenant: dev' \
+grpcurl -plaintext \
   -d '{"repo": {"key": "repo-4f2a1c"}}' \
   127.0.0.1:50051 enroute.api.v1alpha1.RepositoryService/GetRepository
 
-grpcurl -plaintext -H 'x-enroute-tenant: dev' \
+grpcurl -plaintext \
   127.0.0.1:50051 enroute.api.v1alpha1.RepositoryService/ListRepositories
 ```
 
@@ -132,7 +123,7 @@ Enroute does not know which URL names which repository, and it does not know
 who may push. It asks your application through the `authorize` hook on every
 Git request. Until an endpoint answers that hook, every Git request fails.
 
-Your endpoint receives one `POST` per hook at the URL in `config/tenants.toml`.
+Your endpoint receives one `POST` per hook at `hooks.endpoint_url`.
 For a push of `http://127.0.0.1:8080/acme/widgets.git`, the `authorize` call
 carries the path `acme/widgets.git`. Your application looks that path up in its
 own tables and answers with the repository key, `repo-4f2a1c`. The URL and the
@@ -143,8 +134,8 @@ Two ways to get an endpoint:
 - Follow [Build a code hosting platform](build/README.md) to create a client
   and hook endpoint.
 
-Edit `hook_endpoint_url` to match where your endpoint listens. Enroute re-reads
-the tenant file every two seconds in this stack, so no restart is needed.
+Edit `hooks.endpoint_url` to match where your endpoint listens, then run
+`docker compose restart enroute`: configuration is read once, at startup.
 
 With an endpoint that grants access, this push lands:
 

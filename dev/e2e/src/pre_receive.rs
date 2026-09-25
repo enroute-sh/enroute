@@ -139,7 +139,7 @@ mod contract_tests {
     use enroute_git_test_support::linear_commit;
 
     use crate::contract::{Client, oid};
-    use crate::support::{make_isolated_state, seed_pack, spawn_contract_with_hooks};
+    use crate::support::{make_isolated_state, seed_pack, spawn_contract};
 
     /// The contract does not run the hook, and the same refname proves it.
     ///
@@ -148,10 +148,8 @@ mod contract_tests {
     #[tokio::test]
     async fn the_contract_is_not_held_to_the_git_door_s_hook() {
         let state = make_isolated_state().await;
-        let (addr, token, _servers) = spawn_contract_with_hooks(state.clone()).await;
-        let client = Client::connect(format!("http://{addr}"), &token)
-            .await
-            .unwrap();
+        let (addr, _servers) = spawn_contract(state.clone()).await;
+        let client = Client::connect(format!("http://{addr}")).await.unwrap();
 
         let created = client.create_repository("refs/heads/main").await.unwrap();
         let repo = created.repo.expect("a created repository has a key").key;
@@ -188,10 +186,8 @@ mod contract_tests {
     #[tokio::test]
     async fn the_contract_cannot_name_an_object_that_never_arrived() {
         let state = make_isolated_state().await;
-        let (addr, token, _servers) = spawn_contract_with_hooks(state.clone()).await;
-        let client = Client::connect(format!("http://{addr}"), &token)
-            .await
-            .unwrap();
+        let (addr, _servers) = spawn_contract(state.clone()).await;
+        let client = Client::connect(format!("http://{addr}")).await.unwrap();
 
         let created = client.create_repository("refs/heads/main").await.unwrap();
         let repo = created.repo.expect("a created repository has a key").key;

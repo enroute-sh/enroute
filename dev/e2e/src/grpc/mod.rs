@@ -13,16 +13,12 @@ mod refs;
 mod repo_keys;
 mod repository;
 mod sync;
-mod tenancy;
 
 mod support {
     use enroute_git_retrieve::Storage;
 
     use crate::contract::Client;
-    use crate::support::{
-        E2E_TENANT, front_door_for, git, make_isolated_state, spawn_contract_with_hooks,
-        spawn_contract_without_hooks,
-    };
+    use crate::support::{front_door_for, git, make_isolated_state, spawn_contract, spawn_enroute};
 
     /// A repository with one commit, pushed through the contract.
     ///
@@ -49,10 +45,8 @@ mod support {
         crate::support::Servers,
     ) {
         let state = make_isolated_state().await;
-        let enroute = spawn_contract_without_hooks(state.clone()).await;
-        let client = Client::connect(format!("http://{enroute}"), E2E_TENANT)
-            .await
-            .unwrap();
+        let enroute = spawn_enroute(state.clone()).await;
+        let client = Client::connect(format!("http://{enroute}")).await.unwrap();
         let repo = client.create_repository("").await.unwrap();
         let id = repo.repo.clone().unwrap().key;
 
@@ -92,10 +86,8 @@ mod support {
         default_branch: &str,
     ) -> (Storage, Client, String, crate::support::Servers) {
         let state = make_isolated_state().await;
-        let (addr, token, servers) = spawn_contract_with_hooks(state.clone()).await;
-        let client = Client::connect(format!("http://{addr}"), &token)
-            .await
-            .unwrap();
+        let (addr, servers) = spawn_contract(state.clone()).await;
+        let client = Client::connect(format!("http://{addr}")).await.unwrap();
         let created = client.create_repository(default_branch).await.unwrap();
         let repo = created.repo.expect("a created repository has a key").key;
         (state, client, repo, servers)
@@ -106,10 +98,8 @@ mod support {
     /// What a test wants when nothing in it has to push.
     pub(super) async fn contract_only() -> Client {
         let state = make_isolated_state().await;
-        let enroute = spawn_contract_without_hooks(state).await;
-        Client::connect(format!("http://{enroute}"), E2E_TENANT)
-            .await
-            .unwrap()
+        let enroute = spawn_enroute(state).await;
+        Client::connect(format!("http://{enroute}")).await.unwrap()
     }
 
     /// [`contract_only`], with a repository already created on it.

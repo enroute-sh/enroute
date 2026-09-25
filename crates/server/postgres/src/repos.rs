@@ -11,7 +11,7 @@ use gix_hash::ObjectId;
 use sqlx::{AssertSqlSafe, PgConnection, PgPool, Row};
 use uuid::Uuid;
 
-use enroute_git_core::{RepoId, StorageKey, Ulid};
+use enroute_git_core::{ExternalKey, RepoId, StorageKey, Ulid};
 
 use enroute_git_metadata::{RefEntry, RepoMetadata, RepoSummary};
 
@@ -37,6 +37,24 @@ fn into_repo_metadata((id, storage_key, default_branch): (i64, Uuid, String)) ->
     }
 }
 
+/// The columns and join a summary reads, with `$columns` any the caller adds
+/// and `$tail` its own predicate.
+///
+/// A macro rather than a value, so every query stays one literal and the two
+/// that read a summary cannot drift on what a last push is.
+macro_rules! summary_query {
+    ($columns:literal, $tail:literal) => {
+        concat!(
+            "SELECT r.id, r.storage_key, r.default_branch, \
+             EXTRACT(EPOCH FROM b.updated_at)::bigint",
+            $columns,
+            " FROM repositories r \
+              LEFT JOIN branches b ON b.repo_id = r.id AND b.refname = r.default_branch ",
+            $tail
+        )
+    };
+}
+
 /// Insert a repository row.
 ///
 /// # Errors
@@ -44,17 +62,131 @@ fn into_repo_metadata((id, storage_key, default_branch): (i64, Uuid, String)) ->
 pub(crate) async fn insert(
     tx: &mut PgConnection,
     default_branch: Option<&str>,
+    key: &ExternalKey,
 ) -> Result<RepoMetadata> {
+    // Only the index can say which of two racing creates won, and `DO UPDATE`
+    // is what makes the loser's `RETURNING` name the winner: `DO NOTHING`
+    // returns no row, and a read after it cannot see an uncommitted insert.
+    // The update is a no-op, the key being set to what it already holds.
     let row: (i64, Uuid, String) = sqlx::query_as(
-        "INSERT INTO repositories (default_branch) \
-         VALUES (COALESCE($1::text, 'refs/heads/main')) \
+        "INSERT INTO repositories (default_branch, external_key) \
+         VALUES (COALESCE($1::text, 'refs/heads/main'), $2) \
+         ON CONFLICT (external_key) WHERE deleted_at IS NULL \
+         DO UPDATE SET external_key = EXCLUDED.external_key \
          RETURNING id, storage_key, default_branch",
     )
     .bind(default_branch)
+    .bind(key.as_str())
     .fetch_one(&mut *tx)
     .await
     .context("inserting repository row")?;
     Ok(into_repo_metadata(row))
+}
+
+/// The live repository called `key`, if there is one.
+///
+/// The same columns [`by_id`] reads, the key being a column on the row it
+/// names: whoever resolves a key wants the repository, not its id alone.
+///
+/// # Errors
+/// Whatever the database said.
+pub(crate) async fn by_key(pool: &PgPool, key: &ExternalKey) -> Result<Option<RepoMetadata>> {
+    let row: Option<(i64, Uuid, String)> = sqlx::query_as(
+        "SELECT id, storage_key, default_branch FROM repositories \
+         WHERE external_key = $1 AND deleted_at IS NULL",
+    )
+    .bind(key.as_str())
+    .fetch_optional(pool)
+    .await
+    .context("resolving a repository key")?;
+    Ok(row.map(into_repo_metadata))
+}
+
+/// What `id` is called, if it is there and not deleted.
+///
+/// # Errors
+/// Whatever the database said.
+pub(crate) async fn key_of(pool: &PgPool, id: RepoId) -> Result<Option<ExternalKey>> {
+    let key: Option<String> = sqlx::query_scalar(
+        "SELECT external_key FROM repositories WHERE id = $1 AND deleted_at IS NULL",
+    )
+    .bind(id.as_i64())
+    .fetch_optional(pool)
+    .await
+    .context("reading what a repository is called")?;
+    Ok(key.map(ExternalKey::new))
+}
+
+/// Where a listing narrowed by `prefix` stops: the first string ordered after
+/// every key that starts with it, or `None` when the prefix narrows nothing.
+///
+/// A key holds only ASCII, so the last byte cannot carry out of itself.
+fn prefix_upper_bound(prefix: &str) -> Option<String> {
+    let (last, rest) = prefix.as_bytes().split_last()?;
+    let mut bound = rest.to_vec();
+    bound.push(last.saturating_add(1));
+    String::from_utf8(bound).ok()
+}
+
+/// Up to `limit` repositories in key order after `after`, each with its key
+/// and its last push, narrowed to the keys starting with `prefix`.
+///
+/// Keyset, not `OFFSET`: a create or delete mid-walk cannot slide one past.
+/// One query, so a repository deleted mid-page cannot leave a hole in it.
+///
+/// # Errors
+/// Whatever the database said.
+pub(crate) async fn page_by_key(
+    pool: &PgPool,
+    prefix: &str,
+    after: &str,
+    limit: u32,
+) -> Result<Vec<(RepoSummary, ExternalKey)>> {
+    // A half-open range on the leading column, which `repositories_by_external_key`
+    // walks in order. Each shape is a statement of its own because a generic
+    // plan reads a bound that may be null as a filter instead, and would walk
+    // every key past the prefix rather than stopping at its end.
+    let upper = prefix_upper_bound(prefix);
+    let sql = if upper.is_some() {
+        summary_query!(
+            ", r.external_key",
+            "WHERE r.deleted_at IS NULL AND r.external_key > $1 AND r.external_key >= $2 \
+             AND r.external_key < $4 ORDER BY r.external_key LIMIT $3"
+        )
+    } else {
+        summary_query!(
+            ", r.external_key",
+            "WHERE r.deleted_at IS NULL AND r.external_key > $1 AND r.external_key >= $2 \
+             ORDER BY r.external_key LIMIT $3"
+        )
+    };
+
+    let mut query = sqlx::query_as::<_, (i64, Uuid, String, Option<i64>, String)>(sql)
+        .bind(after)
+        .bind(prefix)
+        .bind(i64::from(limit));
+    if let Some(upper) = upper.as_deref() {
+        query = query.bind(upper);
+    }
+    let rows = query
+        .fetch_all(pool)
+        .await
+        .context("listing repositories")?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(id, storage_key, default_branch, last_push_unix_seconds, key)| {
+                (
+                    RepoSummary {
+                        repo: into_repo_metadata((id, storage_key, default_branch)),
+                        last_push_unix_seconds,
+                    },
+                    ExternalKey::new(key),
+                )
+            },
+        )
+        .collect())
 }
 
 /// Mark a repository deleted, reporting whether this call is what did it.
@@ -116,14 +248,10 @@ pub(crate) async fn summarize(pool: &PgPool, ids: &[RepoId]) -> Result<Vec<RepoS
         return Ok(Vec::new());
     }
     let wanted: Vec<i64> = ids.iter().copied().map(RepoId::as_i64).collect();
-    let rows: Vec<(i64, Uuid, String, Option<i64>)> = sqlx::query_as(
-        "SELECT r.id, r.storage_key, r.default_branch, \
-                EXTRACT(EPOCH FROM b.updated_at)::bigint \
-         FROM repositories r \
-         LEFT JOIN branches b ON b.repo_id = r.id AND b.refname = r.default_branch \
-         WHERE r.id = ANY($1) AND r.deleted_at IS NULL \
-         ORDER BY r.id",
-    )
+    let rows: Vec<(i64, Uuid, String, Option<i64>)> = sqlx::query_as(summary_query!(
+        "",
+        "WHERE r.id = ANY($1) AND r.deleted_at IS NULL ORDER BY r.id"
+    ))
     .bind(&wanted)
     .fetch_all(pool)
     .await
@@ -411,4 +539,27 @@ fn segment_id(row: &sqlx::postgres::PgRow) -> Result<Ulid> {
         .try_into()
         .context("a segment id that is not sixteen bytes")?;
     Ok(Ulid::from_bytes(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prefix_upper_bound;
+
+    #[test]
+    fn a_prefix_bounds_the_keys_that_start_with_it() {
+        let upper = prefix_upper_bound("acme.").expect("a bound");
+
+        // Every key under `acme.` sorts inside `["acme.", upper)`, and the
+        // first thing that is not under it sorts at or after `upper`.
+        assert!("acme.backend" >= "acme." && *"acme.backend" < *upper);
+        assert!(*"acme." < *upper);
+        assert!(*"acme/" >= *upper, "{upper}");
+        assert!(*"acmf" >= *upper);
+    }
+
+    /// The whole of a listing, which is what a caller naming no prefix means.
+    #[test]
+    fn an_empty_prefix_bounds_nothing() {
+        assert_eq!(prefix_upper_bound(""), None);
+    }
 }

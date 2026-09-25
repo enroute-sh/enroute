@@ -15,6 +15,7 @@ use gix_hash::ObjectId;
 use object_store::memory::InMemory;
 use sqlx::PgPool;
 
+use enroute_git_core::ExternalKey;
 use enroute_git_ingest::{IncomingPack, IngestRequest, IngestWorker as _, LocalIngestWorker};
 use enroute_git_retrieve::{RefUpdate, RefsMap, RepoMetadata, Storage};
 use enroute_git_test_support::{PackEntry, TestCommit, linear_commit, make_pack_of};
@@ -88,7 +89,11 @@ async fn a_parent_side_object_missing_from_the_index() {
     let (state, pool) = enroute_postgres::ephemeral(&enroute_postgres::test_database_url())
         .await
         .expect("these tests need Postgres: set DATABASE_URL, or see docs/internals/quality-assurance.md");
-    let repo = state.rows.create(None).await.unwrap();
+    let repo = state
+        .rows
+        .create(None, &ExternalKey::new("ingest"))
+        .await
+        .unwrap();
 
     let first = linear_commit(b"one\n", None, 0, "c");
     push(&state, &repo, &first).await;

@@ -15,7 +15,7 @@ use anyhow::Result;
 use gix_hash::ObjectId;
 use gix_object::Kind;
 
-use enroute_git_core::{ObjectHashMap, RepoId, Ulid};
+use enroute_git_core::{ExternalKey, ObjectHashMap, RepoId, Ulid};
 
 use crate::memory::Memory;
 use crate::metadata::MetadataRef;
@@ -77,12 +77,47 @@ impl Rows {
         RepoRows { rows: self, repo }
     }
 
-    /// Create a repository, with a counter per kind so it can take a push.
+    /// Create the repository called `key`, or answer with the one already
+    /// called that.
+    ///
+    /// See [`Metadata::create`], whose contract this is.
+    ///
+    /// [`Metadata::create`]: crate::metadata::Metadata::create
     ///
     /// # Errors
     /// Whatever the store said.
-    pub async fn create(&self, default_branch: Option<&str>) -> Result<crate::RepoMetadata> {
-        self.store.create(default_branch).await
+    pub async fn create(
+        &self,
+        default_branch: Option<&str>,
+        key: &ExternalKey,
+    ) -> Result<crate::RepoMetadata> {
+        self.store.create(default_branch, key).await
+    }
+
+    /// The live repository called `key`, if there is one.
+    ///
+    /// # Errors
+    /// Whatever the store said.
+    pub async fn by_key(&self, key: &ExternalKey) -> Result<Option<crate::RepoMetadata>> {
+        self.store.by_key(key).await
+    }
+
+    /// Up to `limit` repositories in key order after `after`, each with its
+    /// key and its last push, narrowed to the keys starting with `prefix`.
+    ///
+    /// See [`Metadata::page_by_key`], whose contract this is.
+    ///
+    /// [`Metadata::page_by_key`]: crate::metadata::Metadata::page_by_key
+    ///
+    /// # Errors
+    /// Whatever the store said.
+    pub async fn page_by_key(
+        &self,
+        prefix: &str,
+        after: &str,
+        limit: u32,
+    ) -> Result<Vec<(crate::RepoSummary, ExternalKey)>> {
+        self.store.page_by_key(prefix, after, limit).await
     }
 
     /// Every repository not deleted.
@@ -118,6 +153,14 @@ pub struct RepoRows<'a> {
 }
 
 impl RepoRows<'_> {
+    /// What it is called, if it is there and not deleted.
+    ///
+    /// # Errors
+    /// Whatever the store said.
+    pub async fn key_of(&self) -> Result<Option<ExternalKey>> {
+        self.rows.store.key_of(self.repo).await
+    }
+
     /// Makes sure the repository has a counter per kind.
     ///
     /// # Errors

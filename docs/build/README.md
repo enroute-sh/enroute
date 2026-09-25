@@ -32,7 +32,7 @@ Neither component implements the Git protocol.
 
 Complete the [Quickstart](../quickstart.md). It starts Enroute and Postgres
 locally. This guide assumes Git listens on `127.0.0.1:8080`, gRPC listens on
-`127.0.0.1:50051`, and you can edit `config/tenants.toml`.
+`127.0.0.1:50051`, and you can edit `config/enroute.toml`.
 
 To follow the examples, install Node.js 20 or later, Git, and `protoc`.
 Generated field names can differ in other protobuf toolchains.

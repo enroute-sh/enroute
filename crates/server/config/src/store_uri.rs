@@ -3,7 +3,7 @@
 //! Three stores are named this way — a repository's objects, a local ingest's
 //! scratch, and the Lambda handoff — though only two of them take a bucket. One
 //! thing more is named the same way and is not a store: [`ObjectUri`] is a
-//! single object inside one, which is how the tenants are read.
+//! single object inside one, which is how the deployment file is read.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -21,7 +21,7 @@ use crate::Secret;
 ///
 /// Whatever [`object_store`] can reach, since the backend is a deployment's
 /// choice and not one this repository should be making for it.
-#[derive(Clone)]
+#[derive(Clone, Hash)]
 pub struct StoreUri {
     /// The location, with the query stripped: those are ours, not the URL's.
     url: Url,
@@ -42,13 +42,17 @@ impl std::fmt::Debug for StoreUri {
     }
 }
 
-/// Fold the URI's options into a builder that reads its own environment.
+/// Fold the URI's options into a builder, over its environment or nothing.
 ///
-/// `from_env` first so credentials keep arriving the way each SDK expects,
-/// and an unparseable key is an error rather than something quietly dropped.
+/// `from_env` first where it applies, so credentials keep arriving the way
+/// each SDK expects, and an unparseable key is an error, not a quiet drop.
 macro_rules! configured {
-    ($builder:ty, $uri:expr, $options:expr) => {{
-        let mut builder = <$builder>::from_env().with_url($uri.url.as_str());
+    ($builder:ty, $uri:expr, $options:expr, $from:expr) => {{
+        let mut builder = match $from {
+            CredentialSource::Environment => <$builder>::from_env(),
+            CredentialSource::Sent => <$builder>::new(),
+        }
+        .with_url($uri.url.as_str());
         for (key, value) in $options {
             builder = builder.with_config($uri.key(key)?, value);
         }
@@ -62,6 +66,18 @@ macro_rules! configured {
     }};
 }
 
+/// A store at the path inside it, which is where a caller wants it.
+///
+/// Applied here rather than left to the caller, because only two of the three
+/// stores go through `Store`, which is what would otherwise do it.
+fn rooted((store, path): (Arc<dyn ObjectStore>, Path)) -> Arc<dyn ObjectStore> {
+    if path.as_ref().is_empty() {
+        store
+    } else {
+        Arc::new(PrefixStore::new(store, path))
+    }
+}
+
 impl StoreUri {
     /// The object store this names, rooted at the path inside it.
     ///
@@ -70,27 +86,24 @@ impl StoreUri {
     /// Returns an error if the scheme is one this build cannot reach, if an
     /// option is not one that backend takes, or if the store cannot be built.
     pub fn build(&self) -> Result<Arc<dyn ObjectStore>> {
-        self.build_with(&[])
+        self.build_with(&[], CredentialSource::Environment)
     }
 
     /// The store this names, with `extra` folded in after the URI's own.
     ///
-    /// For a credential that arrives at runtime rather than in the URI: a
-    /// secret store's answer belongs in neither a file nor a wire payload.
+    /// `from` says what else it may reach: credentials sent to a process are
+    /// the whole of what it reaches a bucket with, never a first try.
     ///
     /// # Errors
     ///
     /// Returns an error if the scheme is one this build cannot reach, if an
     /// option is not one that backend takes, or if the store cannot be built.
-    pub fn build_with(&self, extra: &[(String, String)]) -> Result<Arc<dyn ObjectStore>> {
-        let (store, path) = self.store(extra)?;
-        // Applied here rather than left to the caller, because only two of the
-        // three stores go through `Store`, which is what would otherwise do it.
-        if path.as_ref().is_empty() {
-            Ok(store)
-        } else {
-            Ok(Arc::new(PrefixStore::new(store, path)))
-        }
+    pub(crate) fn build_with(
+        &self,
+        extra: &[(String, String)],
+        from: CredentialSource,
+    ) -> Result<Arc<dyn ObjectStore>> {
+        Ok(rooted(self.store(extra, from)?))
     }
 
     /// This URI as it was written, options included.
@@ -115,7 +128,11 @@ impl StoreUri {
     /// [`build`] roots the store at and [`ObjectUri`] reads as an object.
     ///
     /// [`build`]: Self::build
-    fn store(&self, extra: &[(String, String)]) -> Result<(Arc<dyn ObjectStore>, Path)> {
+    fn store(
+        &self,
+        extra: &[(String, String)],
+        from: CredentialSource,
+    ) -> Result<(Arc<dyn ObjectStore>, Path)> {
         let (scheme, path) = ObjectStoreScheme::parse(&self.url)
             .with_context(|| format!("{} is not a store URL", self.url))?;
         // `extra` last, so a credential supplied at runtime beats whatever the
@@ -124,17 +141,23 @@ impl StoreUri {
 
         let store: Arc<dyn ObjectStore> = match scheme {
             ObjectStoreScheme::AmazonS3 => {
-                configured!(object_store::aws::AmazonS3Builder, self, options())
+                configured!(object_store::aws::AmazonS3Builder, self, options(), from)
             }
             ObjectStoreScheme::GoogleCloudStorage => {
                 configured!(
                     object_store::gcp::GoogleCloudStorageBuilder,
                     self,
-                    options()
+                    options(),
+                    from
                 )
             }
             ObjectStoreScheme::MicrosoftAzure => {
-                configured!(object_store::azure::MicrosoftAzureBuilder, self, options())
+                configured!(
+                    object_store::azure::MicrosoftAzureBuilder,
+                    self,
+                    options(),
+                    from
+                )
             }
             // No `from_env`: this one has no environment of its own.
             ObjectStoreScheme::Http => {
@@ -203,26 +226,45 @@ pub struct Bucket {
     pub credentials: BTreeMap<String, Secret>,
 }
 
+/// Where a process takes a bucket's credentials from.
+///
+/// Explicit because the two are not interchangeable: a process reaching a
+/// bucket as itself is one that bucket has to trust on its own account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialSource {
+    /// The credentials it was handed, and nothing else.
+    Sent,
+    /// Its own environment, for a process whose identity the bucket knows.
+    Environment,
+}
+
 impl Bucket {
     /// The store this names, reached with the credentials beside it.
+    ///
+    /// `from` is named at every call because it is a posture, and the one
+    /// this repository got wrong was the one an omission chose.
     ///
     /// # Errors
     ///
     /// Returns an error if the store cannot be built.
-    pub fn build(&self) -> Result<Arc<dyn ObjectStore>> {
-        let credentials: Vec<(String, String)> = self
-            .credentials
+    pub fn build(&self, from: CredentialSource) -> Result<Arc<dyn ObjectStore>> {
+        self.uri.build_with(&self.pairs(), from)
+    }
+
+    /// The option pairs a builder folds in.
+    fn pairs(&self) -> Vec<(String, String)> {
+        self.credentials
             .iter()
             .map(|(name, value)| (name.clone(), value.expose().to_string()))
-            .collect();
-        self.uri.build_with(&credentials)
+            .collect()
     }
 }
 
 /// One object inside a store, named the way a store is: the backend's URL
 /// with the object's own path on the end.
 ///
-/// `s3://config/tenants.toml` and `file:///etc/enroute/tenants.toml` are the
+/// `s3://config/enroute.toml` and `file:///etc/enroute/enroute.toml` are the
 /// same string shape, so which backend holds them is not a build.
 #[derive(Clone, Debug)]
 pub struct ObjectUri(StoreUri);
@@ -234,7 +276,9 @@ impl ObjectUri {
     ///
     /// Returns an error if the store cannot be built.
     pub fn build(&self) -> Result<(Arc<dyn ObjectStore>, Path)> {
-        self.0.store(&[])
+        // This is a process reading its own configuration, which is the one
+        // thing it can only reach as itself.
+        self.0.store(&[], CredentialSource::Environment)
     }
 
     /// The URL this was read from, for saying where something was read.
@@ -522,13 +566,13 @@ mod tests {
     #[test]
     fn an_object_uri_keeps_the_path_as_the_object() {
         for (s, key) in [
-            ("s3://config/tenants.toml", "tenants.toml"),
-            ("s3://config/a/b/tenants.toml", "a/b/tenants.toml"),
+            ("s3://config/enroute.toml", "enroute.toml"),
+            ("s3://config/a/b/enroute.toml", "a/b/enroute.toml"),
             (
-                "file:///etc/enroute/tenants.toml",
-                "etc/enroute/tenants.toml",
+                "file:///etc/enroute/enroute.toml",
+                "etc/enroute/enroute.toml",
             ),
-            ("memory:///tenants.toml", "tenants.toml"),
+            ("memory:///enroute.toml", "enroute.toml"),
         ] {
             let (_store, path) = s
                 .parse::<ObjectUri>()

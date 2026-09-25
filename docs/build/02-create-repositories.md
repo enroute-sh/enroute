@@ -156,19 +156,10 @@ export function repoById(id: string) {
 Create `lib/enroute.ts`:
 
 ```ts
-import { credentials, Metadata } from "@grpc/grpc-js";
+import { credentials } from "@grpc/grpc-js";
 import { RepositoryServiceClient } from "./gen/enroute/api/v1alpha1/repository";
 
 const ADDRESS = process.env.ENROUTE_API ?? "127.0.0.1:50051";
-
-// Every API call names its tenant. On a laptop you set the header yourself.
-// A deployment puts a proxy in front that authenticates the caller and sets
-// it, because a caller that can set this header is every tenant.
-function tenant() {
-  const metadata = new Metadata();
-  metadata.set("x-enroute-tenant", process.env.ENROUTE_TENANT ?? "dev");
-  return metadata;
-}
 
 const repositories = new RepositoryServiceClient(
   ADDRESS,
@@ -179,7 +170,6 @@ export function createRepository(key: string) {
   return new Promise<void>((resolve, reject) => {
     repositories.createRepository(
       { repo: { key }, defaultBranch: "" },
-      tenant(),
       (err) => (err ? reject(err) : resolve()),
     );
   });
@@ -187,9 +177,9 @@ export function createRepository(key: string) {
 ```
 
 The API is plain HTTP/2 with no TLS and no authentication of its own. That is
-correct on a laptop and wrong in a deployment, where the listener must be
-private: anything that can reach it and set the header is every tenant. See
-[Protect the API listener](../operate/security.md#protect-the-api-listener).
+correct on a laptop and wrong in a deployment, where anything that can reach
+the listener can act as your application. See
+[API access](../operate/security.md#api-access).
 
 ## Create a repository
 
@@ -278,7 +268,7 @@ docker compose exec -T postgres psql -U enroute -d codehost \
 Then ask Enroute for the same repository, by the ID that row carries:
 
 ```sh
-grpcurl -plaintext -H 'x-enroute-tenant: dev' \
+grpcurl -plaintext \
   -d '{"repo": {"key": "repo-4f2a1c"}}' \
   127.0.0.1:50051 enroute.api.v1alpha1.RefService/ListRefs
 ```

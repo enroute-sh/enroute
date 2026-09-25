@@ -40,10 +40,7 @@ const IMAGE: &str = "ghcr.io/enroute-sh/enroute";
 const TREES: &[(&str, &str)] = &[("proto/enroute", "proto/enroute")];
 
 /// Single files the skill mirrors, as `(here, inside the skill)`.
-const FILES: &[(&str, &str)] = &[
-    ("dev/config/enroute.toml", "stack/config/enroute.toml"),
-    ("dev/config/tenants.toml", "stack/config/tenants.toml"),
-];
+const FILES: &[(&str, &str)] = &[("dev/config/enroute.toml", "stack/config/enroute.toml")];
 
 /// The two stack definitions, compared by what they declare rather than byte
 /// for byte.

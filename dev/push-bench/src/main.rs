@@ -41,6 +41,7 @@ use tracing_subscriber::{EnvFilter, Layer as _};
 use bench_support::{drop_scratch_schema, scratch_metadata_pool};
 use enroute_git_cost::{CountingStore, Meter, StoreRole, StoreUnits};
 use enroute_git_ingest::{IngestRequest, IngestWorker, LocalIngestWorker, noop_progress};
+use enroute_git_metadata::ExternalKey;
 use enroute_git_retrieve::{RefUpdate, RefsMap, RepoMetadata};
 use enroute_git_store::Store;
 use gix_hash::ObjectId;
@@ -278,7 +279,10 @@ async fn ingest_into(
         Arc::new(InMemory::new()),
         Arc::new(Store::new(primary)),
     );
-    let repo: RepoMetadata = state.rows.create(None).await?;
+    let repo: RepoMetadata = state
+        .rows
+        .create(None, &ExternalKey::new("push-bench"))
+        .await?;
     // Bound, never read: it has to outlive the push it holds the tree for.
     let (staging_backend, _staging_dir) = staging_backend(cli.staging)?;
     // Counted but never delayed: on disk the filesystem supplies the real
@@ -523,6 +527,7 @@ async fn measure(cli: &Cli, counters: &mut Counters, mut notes: Vec<String>) -> 
     };
 
     let tip = ObjectId::from_hex(corpus.tip.as_bytes())
+        .ok()
         .with_context(|| format!("{} is not an object id", corpus.tip))?;
     // Leaked so the reader handed to `ingest` can be `'static`, as the
     // worker's boxed `PackReader` requires.

@@ -26,7 +26,7 @@ grpcurl -plaintext 127.0.0.1:50051 describe enroute.hook.v1alpha1.HookRequest
 ```
 
 The API listener exposes gRPC reflection from the descriptors built into the
-server. Reflection does not require a tenant header and exposes protocol
+server. Reflection exposes protocol
 definitions, not repository data. Use it to inspect a running server; use a
 committed proto copy to generate and version a client.
 

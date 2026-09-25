@@ -3,26 +3,26 @@
 //!
 //! Chosen by the application rather than minted here, so an application
 //! addresses a repository by the id it already has and keeps no table mapping
-//! ours onto its own. Here beside [`TenantId`] because a key is unique within
-//! one tenant and means nothing outside it, which is what makes one customer's
-//! keys unreachable from another's — isolation by the shape of the namespace
-//! rather than by a check over a shared one. Opaque: Enroute stores a key,
-//! compares it byte for byte, and never parses it or derives anything from it.
-//! The shape is narrow on purpose: comparison is byte-exact, so anything that
-//! lets two keys look alike while differing makes two repositories a person
-//! cannot tell apart — outside ASCII that is homoglyphs and normalization
-//! forms, and inside it whitespace. What is left needs no escaping wherever a
-//! key is written, and holds no `/`, so a key is one path segment. No `/`
-//! because a key wants to be stable and the names that hold one — `owner/repo`
-//! above all — are the names that move: a rename or a transfer would change
-//! what a repository is called and so make it a different one. An application
-//! keys by an id of its own instead and maps its URLs onto that id in
-//! `authorize`, which is a lookup it already has.
-//!
-//! [`TenantId`]: super::TenantId
+//! ours onto its own. Unique across the install, and flat: a key names a
+//! repository and says nothing else about it. Opaque, too — Enroute stores a
+//! key, compares it byte for byte, and never parses it or derives anything
+//! from it. The shape is narrow on purpose: comparison is byte-exact, so
+//! anything that lets two keys look alike while differing makes two
+//! repositories a person cannot tell apart — outside ASCII that is homoglyphs
+//! and normalization forms, and inside it whitespace. What is left needs no
+//! escaping wherever a key is written, and holds no `/`, so a key is one path
+//! segment. No `/` because a key wants to be stable and the names that hold
+//! one — `owner/repo` above all — are the names that move: a rename or a
+//! transfer would change what a repository is called and so make it a
+//! different one. An application keys by an id of its own instead and maps its
+//! URLs onto that id in `authorize`, which is a lookup it already has. A
+//! deployment that wants repositories grouped spells the group into the key it
+//! chooses — see docs/patterns/namespacing.md.
 
 use std::fmt;
 use std::str::FromStr;
+
+use enroute_git_core::ExternalKey;
 
 /// The most an application may hand us.
 ///
@@ -30,14 +30,28 @@ use std::str::FromStr;
 /// the length is ours to cap rather than a caller's to choose.
 pub const MAX_REPO_KEY_BYTES: usize = 256;
 
+/// What a key is made of, wherever a key or the start of one is checked.
+const fn key_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')
+}
+
 /// What an application calls one of its repositories.
+///
+/// An [`ExternalKey`] that met the rules: the engine takes any key, and this
+/// is where what a key may be is answered.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct RepoKey(String);
+pub struct RepoKey(ExternalKey);
 
 impl RepoKey {
     /// The key as the ledger and a span want it.
     #[must_use]
     pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    /// The key as the engine takes one.
+    #[must_use]
+    pub(crate) fn external(&self) -> &ExternalKey {
         &self.0
     }
 }
@@ -55,7 +69,7 @@ pub struct BadRepoKey;
 
 impl fmt::Display for RepoKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        fmt::Display::fmt(&self.0, f)
     }
 }
 
@@ -67,19 +81,47 @@ impl FromStr for RepoKey {
         // separator it does not need, and none differs from another only by
         // punctuation nobody can see at the edge of a line.
         let ends_well = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric());
-        let held = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.');
         let ok = !key.is_empty()
             && key.len() <= MAX_REPO_KEY_BYTES
-            && key.chars().all(held)
+            && key.chars().all(key_char)
             && ends_well(key.chars().next())
             && ends_well(key.chars().next_back());
-        ok.then(|| Self(key.to_owned())).ok_or(BadRepoKey)
+        ok.then(|| Self(ExternalKey::new(key))).ok_or(BadRepoKey)
     }
+}
+
+/// Refuses a listing prefix that starts no key.
+///
+/// A prefix is not a key: it ends wherever the caller stopped and may be
+/// empty, which narrows nothing. What it holds is what a key holds.
+///
+/// # Errors
+///
+/// Returns an error if `prefix` holds what no key holds.
+pub(crate) fn check_prefix(prefix: &str) -> Result<(), BadRepoKey> {
+    let ok = prefix.len() <= MAX_REPO_KEY_BYTES && prefix.chars().all(key_char);
+    ok.then_some(()).ok_or(BadRepoKey)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A prefix ends wherever the caller stopped, which is not where a key may.
+    #[test]
+    fn a_prefix_need_not_be_a_key() {
+        for prefix in ["", "acme.", "acme-", "-", "_", "a"] {
+            check_prefix(prefix).unwrap_or_else(|bad| panic!("{prefix:?} refused: {bad}"));
+        }
+        // But it holds what a key holds: anything else starts no key.
+        for bad in ["acme/backend", "a b", "ünï", "a%2F"] {
+            assert_eq!(check_prefix(bad), Err(BadRepoKey), "{bad:?}");
+        }
+        assert_eq!(
+            check_prefix(&"k".repeat(MAX_REPO_KEY_BYTES + 1)),
+            Err(BadRepoKey)
+        );
+    }
 
     #[test]
     fn a_key_round_trips_unchanged() {

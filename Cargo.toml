@@ -23,7 +23,6 @@ members = [
     "crates/git/proto",
     "crates/git/remote",
     "crates/git/http",
-    "crates/git/hash",
     "crates/git/test-support",
     "dev/e2e",
     "dev/load-test",
@@ -34,7 +33,7 @@ members = [
 default-members = ["crates/server/app"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 publish = false
 license = "Apache-2.0"
@@ -103,7 +102,6 @@ enroute-postgres = { path = "crates/server/postgres" }
 enroute-git-proto = { path = "crates/git/proto" }
 enroute-git-remote = { path = "crates/git/remote" }
 enroute-git-http = { path = "crates/git/http" }
-enroute-git-hash = { path = "crates/git/hash" }
 enroute-git-test-support = { path = "crates/git/test-support" }
 
 # What a deployment configures, in the shapes both ends share. No clap: which
@@ -119,19 +117,18 @@ enroute-config = { path = "crates/server/config", default-features = false }
 enroute-ingest-lambda = { path = "crates/server/ingest-lambda", default-features = false }
 
 # git protocol primitives
-gix-packetline = { version = "0.22", features = ["blocking-io"] }
-gix-hash = { version = "0.26", features = ["sha1"] }
+gix-packetline = { version = "0.23", features = ["blocking-io"] }
+gix-hash = { version = "0.27", features = ["sha1"] }
 # HashMap/HashSet keyed by ObjectId, tuned for keys that are already
 # high-entropy hashes (skips re-hashing the full SHA-1 through SipHash)
-gix-hashtable = "0.16"
+gix-hashtable = "0.17"
 # plain (hardware-accelerated) SHA-1 for hashing data we serve; object ids get
-# the collision-detecting one in `enroute-git-hash`
+# the collision-detecting one in `gix-hash`
 sha1 = "0.11"
-digest = "0.11"
-gix-pack = "0.74"
-gix-actor = "0.42"
-gix-object = "0.64"
-gix-validate = "0.11"
+gix-pack = "0.75"
+gix-actor = "0.43"
+gix-object = "0.65"
+gix-validate = "0.12"
 bstr = "1"
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 # One-shot zlib for objects already resident in memory — faster than streaming
@@ -236,8 +233,7 @@ aws-sdk-lambda = { version = "1", default-features = false, features = [
 aws-config = "1"
 http = "1"
 
-# Configuration a deployment writes: a tenants file, and xtask's manifest
-# reading.
+# Configuration a deployment writes, and xtask's manifest reading.
 toml = "1"
 
 # dev

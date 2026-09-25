@@ -1,9 +1,8 @@
 //! Calling the contract from a test.
 //!
-//! The generated `tonic` clients with a bearer token attached and the
-//! `Option`s unwrapped. A test convenience and not a client library: this
-//! repository ships none, and one that grew here would be a client with a
-//! dependency on the engine.
+//! The generated `tonic` clients with the `Option`s unwrapped. A test
+//! convenience and not a client library: this repository ships none, and one
+//! that grew here would be a client with a dependency on the engine.
 
 #![allow(
     dead_code,
@@ -11,8 +10,6 @@
 )]
 
 use anyhow::{Context as _, Result};
-use tonic::metadata::{Ascii, MetadataValue};
-use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
 use enroute_api::api::v1alpha1::object_service_client::ObjectServiceClient;
@@ -57,72 +54,31 @@ pub(crate) fn repo_key(key: impl Into<String>) -> RepoKey {
     RepoKey { key: key.into() }
 }
 
-/// A channel naming its tenant on every call.
-///
-/// An interceptor rather than a header per call, so no call can forget. What a
-/// deployment's proxy would set, since nothing here is behind one.
-type Authenticated = InterceptedService<Channel, Names>;
-
-#[derive(Clone)]
-pub(crate) struct Names(Option<MetadataValue<Ascii>>);
-
-impl tonic::service::Interceptor for Names {
-    fn call(
-        &mut self,
-        mut request: tonic::Request<()>,
-    ) -> Result<tonic::Request<()>, tonic::Status> {
-        // `None` sends no header at all, which is what a call nothing
-        // authenticated looks like — an empty one would name a tenant instead.
-        if let Some(tenant) = self.0.clone() {
-            drop(
-                request
-                    .metadata_mut()
-                    .insert(crate::support::TENANT_HEADER, tenant),
-            );
-        }
-        Ok(request)
-    }
-}
-
 /// Everything these tests ask Enroute for.
 pub(crate) struct Client {
-    refs: RefServiceClient<Authenticated>,
-    repositories: RepositoryServiceClient<Authenticated>,
-    objects: ObjectServiceClient<Authenticated>,
-    sync: SyncServiceClient<Authenticated>,
+    refs: RefServiceClient<Channel>,
+    repositories: RepositoryServiceClient<Channel>,
+    objects: ObjectServiceClient<Channel>,
+    sync: SyncServiceClient<Channel>,
 }
 
 impl Client {
-    /// Connect to Enroute at `endpoint`, calling as `tenant`.
+    /// Connect to Enroute at `endpoint`.
     ///
     /// # Errors
     ///
-    /// Returns an error if the endpoint is unusable or unreachable, or the
-    /// tenant cannot be sent as a header.
-    pub(crate) async fn connect(endpoint: String, tenant: &str) -> Result<Self> {
-        let names = Names(Some(
-            tenant
-                .parse()
-                .context("the tenant is not sendable as a header")?,
-        ));
-        Self::naming(endpoint, names).await
-    }
-
-    /// The two connect paths' common half.
-    async fn naming(endpoint: String, bearer: Names) -> Result<Self> {
+    /// Returns an error if the endpoint is unusable or unreachable.
+    pub(crate) async fn connect(endpoint: String) -> Result<Self> {
         let channel = Channel::from_shared(endpoint)
             .context("not a usable endpoint URL")?
             .connect()
             .await
             .context("connecting to the contract")?;
         Ok(Self {
-            refs: RefServiceClient::with_interceptor(channel.clone(), bearer.clone()),
-            repositories: RepositoryServiceClient::with_interceptor(
-                channel.clone(),
-                bearer.clone(),
-            ),
-            objects: ObjectServiceClient::with_interceptor(channel.clone(), bearer.clone()),
-            sync: SyncServiceClient::with_interceptor(channel, bearer),
+            refs: RefServiceClient::new(channel.clone()),
+            repositories: RepositoryServiceClient::new(channel.clone()),
+            objects: ObjectServiceClient::new(channel.clone()),
+            sync: SyncServiceClient::new(channel),
         })
     }
 
@@ -154,18 +110,6 @@ impl Client {
             .context("calling push_to_remote")?
             .into_inner()
             .outcomes)
-    }
-
-    /// Connect presenting no token at all.
-    ///
-    /// What an unauthenticated caller is, which is not the same as one whose
-    /// token nobody minted.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the endpoint is unusable or unreachable.
-    pub(crate) async fn connect_anonymously(endpoint: String) -> Result<Self> {
-        Self::naming(endpoint, Names(None)).await
     }
 
     /// Create a repository under a key no other test will pick.
@@ -230,12 +174,27 @@ impl Client {
         limit: u32,
         page_token: &str,
     ) -> Result<(Vec<Repository>, String)> {
+        self.list_repositories_under("", limit, page_token).await
+    }
+
+    /// The same, narrowed to the keys starting with `prefix`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the call fails.
+    pub(crate) async fn list_repositories_under(
+        &self,
+        prefix: &str,
+        limit: u32,
+        page_token: &str,
+    ) -> Result<(Vec<Repository>, String)> {
         let page = self
             .repositories
             .clone()
             .list_repositories(ListRepositoriesRequest {
                 limit,
                 page_token: page_token.to_string(),
+                prefix: prefix.to_string(),
             })
             .await?
             .into_inner();

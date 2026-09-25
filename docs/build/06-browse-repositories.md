@@ -41,14 +41,14 @@ const objects = new ObjectServiceClient(ADDRESS, credentials.createInsecure());
 
 export function listRefs(key: string, prefixes: string[] = []) {
   return new Promise<ListRefsResponse>((resolve, reject) => {
-    refs.listRefs({ repo: { key }, prefixes }, tenant(), (err, res) =>
+    refs.listRefs({ repo: { key }, prefixes }, (err, res) =>
       err ? reject(err) : resolve(res),
     );
   });
 }
 
 export async function listTree(key: string, hex: string) {
-  const stream = objects.listTree({ repo: { key }, objectId: { hex } }, tenant());
+  const stream = objects.listTree({ repo: { key }, objectId: { hex } });
 
   const entries: TreeEntry[] = [];
   let truncated = false;
@@ -80,7 +80,7 @@ export type Blob =
   | { kind: "too-large"; size: number };
 
 export async function readBlob(key: string, hex: string): Promise<Blob> {
-  const stream = objects.getObject({ repo: { key }, objectId: { hex } }, tenant());
+  const stream = objects.getObject({ repo: { key }, objectId: { hex } });
 
   const chunks: Buffer[] = [];
   let size = 0;
@@ -115,9 +115,9 @@ asking for one blob ask the same question. Keep the ID of each entry beside its
 path in the listing, and opening a file costs no second lookup.
 
 **Serve bytes from a route of your app, never from the browser to Enroute.**
-Your app reaches the API from inside whatever authenticates it. A page that
-fetched for itself would need that same reach, and reaching the API listener is
-what says which tenant a call is for.
+Your app reaches the API from wherever it is allowed to. A page that fetched
+for itself would need that same reach, and whatever can reach the API listener
+is your application.
 
 ## The rendering libraries
 

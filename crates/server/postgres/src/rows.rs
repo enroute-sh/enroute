@@ -15,7 +15,7 @@ use gix_object::Kind;
 use sqlx::{PgConnection, PgPool, Row};
 use sqlx_pg_copy::CopyIn;
 
-use enroute_git_core::{ObjectHashMap, RepoId, Ulid, kind_from_u8, kind_to_u8};
+use enroute_git_core::{ExternalKey, ObjectHashMap, RepoId, Ulid, kind_from_u8, kind_to_u8};
 
 use enroute_git_metadata::{
     Identity, Metadata, Raced, RefEntry, RefUpdate, RefUpdateResult, RefsMap, RepoMetadata,
@@ -43,15 +43,21 @@ impl Postgres {
 
 #[async_trait]
 impl Metadata for Postgres {
-    async fn create(&self, default_branch: Option<&str>) -> Result<RepoMetadata> {
+    async fn create(
+        &self,
+        default_branch: Option<&str>,
+        key: &ExternalKey,
+    ) -> Result<RepoMetadata> {
         let mut tx = self
             .pool
             .begin()
             .await
             .context("beginning create_repository transaction")?;
-        let repo = crate::repos::insert(&mut tx, default_branch).await?;
+        let repo = crate::repos::insert(&mut tx, default_branch, key).await?;
         // In the same transaction as the row: a repository whose counters
-        // never landed exists and cannot take a push.
+        // never landed exists and cannot take a push. Run for a repeat as well
+        // as for a new repository, being a no-op on conflict, which is cheaper
+        // than working out which of the two this was.
         insert_counters(&mut tx, repo.id).await?;
         tx.commit()
             .await
@@ -171,6 +177,23 @@ impl Metadata for Postgres {
 
     async fn summarize(&self, repos: &[RepoId]) -> Result<Vec<RepoSummary>> {
         crate::repos::summarize(&self.pool, repos).await
+    }
+
+    async fn by_key(&self, key: &ExternalKey) -> Result<Option<RepoMetadata>> {
+        crate::repos::by_key(&self.pool, key).await
+    }
+
+    async fn key_of(&self, repo: RepoId) -> Result<Option<ExternalKey>> {
+        crate::repos::key_of(&self.pool, repo).await
+    }
+
+    async fn page_by_key(
+        &self,
+        prefix: &str,
+        after: &str,
+        limit: u32,
+    ) -> Result<Vec<(RepoSummary, ExternalKey)>> {
+        crate::repos::page_by_key(&self.pool, prefix, after, limit).await
     }
 
     async fn mark_deleted(&self, repo: RepoId) -> Result<bool> {
@@ -307,5 +330,7 @@ fn identity_of(row: &sqlx::postgres::PgRow) -> Result<Identity> {
 /// One `bytea` column as an oid.
 fn oid_at(row: &sqlx::postgres::PgRow, at: usize) -> Result<ObjectId> {
     let bytes: Vec<u8> = row.try_get(at)?;
-    ObjectId::try_from(bytes.as_slice()).context("an object oid that is not twenty bytes")
+    ObjectId::try_from(bytes.as_slice())
+        .ok()
+        .context("an object oid that is not twenty bytes")
 }

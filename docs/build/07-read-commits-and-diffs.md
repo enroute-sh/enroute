@@ -28,7 +28,6 @@ import type {
 export async function listCommits(key: string, hex: string, pageToken = "") {
   const stream = objects.listCommits(
     { repo: { key }, commitId: { hex }, limit: 50, pageToken },
-    tenant(),
   );
 
   const commits: Commit[] = [];
@@ -46,7 +45,6 @@ export async function diffCommit(key: string, hex: string) {
   // "what this commit changed" means.
   const stream = objects.diffCommit(
     { repo: { key }, commitId: { hex }, baseCommitId: undefined },
-    tenant(),
   );
 
   const changes: FileChange[] = [];

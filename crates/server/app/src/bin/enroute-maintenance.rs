@@ -19,7 +19,7 @@ use clap::Parser;
 use sqlx::postgres::PgPoolOptions;
 
 use enroute::maintenance::{Maintenance, run};
-use enroute_config::ObjectUri;
+use enroute_config::{CredentialSource, ObjectUri};
 use enroute_git_store::Store;
 
 #[derive(Parser)]
@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
     // The URI carried its own prefix, so `Store` adds none of its own, and
     // one store rather than two: a second build is a second credential chain
     // and a second connection pool over the same bucket.
-    let objects = deployment.bucket.build()?;
+    let objects = deployment.bucket.build(CredentialSource::Environment)?;
     let storage = enroute_postgres::storage(
         &PgPoolOptions::new()
             .connect(deployment.database.url.expose())

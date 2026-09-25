@@ -1,8 +1,8 @@
 //! The worker's end, driven without a Lambda: an in-memory store stands in for
 //! the directory bucket, and a real pack goes through the real ingest.
 //!
-//! Left untested is the envelope — event decoding, the response stream, the
-//! secrets extension — which needs the deployed function.
+//! Left untested is the envelope — event decoding and the response stream —
+//! which needs the deployed function.
 #![cfg(feature = "server")]
 #![allow(
     clippy::unwrap_used,
@@ -71,6 +71,15 @@ async fn serve(
             // hands `serve` the stores it already built.
             objects: "memory:///objects".parse().expect("a store URI"),
             staging: "memory:///staging".parse().expect("a store URI"),
+            credentials: wire::Credentials {
+                database: wire::Database {
+                    url: wire::Credential::from(""),
+                    max_connections: std::num::NonZeroU32::MIN,
+                },
+                objects: wire::Given::Environment,
+                staging: wire::Given::Environment,
+            },
+            telemetry: None,
             push,
         },
         &tx,

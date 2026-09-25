@@ -55,13 +55,18 @@ pub fn steps() -> Vec<Migration> {
             "object_index_catalogs",
             include_str!("../migrations/0003_object_index_catalogs.sql"),
         ),
-        // Holding no foreign key into the engine's tables: one Enroute serves
-        // many customers out of one engine, which does not know it.
+        // Holding no foreign key into the engine's tables, which know nothing
+        // about what a repository is called.
         step(4, "tenancy", include_str!("../migrations/0004_tenancy.sql")),
         step(
             5,
             "repository_keys",
             include_str!("../migrations/0005_repository_keys.sql"),
+        ),
+        step(
+            6,
+            "key_on_the_repository",
+            include_str!("../migrations/0006_key_on_the_repository.sql"),
         ),
     ]
 }
@@ -224,7 +229,7 @@ mod tests {
     #[test]
     fn every_table_enroute_reads_has_a_step() {
         let versions: Vec<i64> = steps().iter().map(|step| step.version).collect();
-        assert_eq!(versions, [1, 2, 3, 4, 5]);
+        assert_eq!(versions, [1, 2, 3, 4, 5, 6]);
     }
 
     #[test]
@@ -287,7 +292,7 @@ mod tests {
     ///
     /// A step that has run is checksummed in every deployment's ledger, so
     /// changing one refuses to serve. This fails in CI instead.
-    const APPLIED: [(i64, &str); 5] = [
+    const APPLIED: [(i64, &str); 6] = [
         (
             1,
             "9270cc4733750a491b26a1e57bd5668a8f7433b346226df45c2cc7e6635fd0c8\
@@ -312,6 +317,11 @@ mod tests {
             5,
             "913437f26917440a40b318d210158a48da0f6da42ffc30863aab88b6373fd332\
              debf984d0e223007c252f7605d4e56c8",
+        ),
+        (
+            6,
+            "0f3477471dc4daba00531d3528139aac2ddc031bff48d19b87cae66ece0e8a77\
+             14b91cc5c19b29f33d36ea6cd9c3602e",
         ),
     ];
 

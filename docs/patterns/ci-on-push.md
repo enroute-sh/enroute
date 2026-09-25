@@ -66,7 +66,6 @@ export async function changedPaths(repoId: string, command: RefCommand) {
       commitId: command.newObjectId,
       baseCommitId: command.oldObjectId,
     },
-    tenant(),
   );
 
   const paths: string[] = [];

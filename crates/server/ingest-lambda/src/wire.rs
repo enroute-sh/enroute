@@ -6,12 +6,12 @@
 //! instead makes [`super::convert`] stop compiling on such a change. Every
 //! enum a worker *sends* has an `Unknown` fallback, and structs tolerate
 //! unknown fields, for when the two ends are already different versions.
-//! [`Push`], [`Pack`] and [`Call`]'s two stores are the exceptions — a worker
-//! that cannot tell where the push is, or which bucket it is for, cannot run
-//! it — so the two ends must move together, which only a pinned qualifier
-//! makes possible. The stores carry no default deliberately: one would let an
-//! older worker ignore them and fall back to its own environment, which is the
-//! disagreement they exist to prevent, made invisible.
+//! [`Push`], [`Pack`], [`Call`]'s two stores and its [`Credentials`] are the
+//! exceptions — a worker that cannot tell where the push is, which bucket it
+//! is for, or what to reach it with, cannot run it — so the two ends must move
+//! together, which only a pinned qualifier makes possible. None of them
+//! carries a default deliberately: one would let an older worker ignore them
+//! and reach whatever its own environment last held.
 
 use std::collections::BTreeMap;
 
@@ -103,6 +103,123 @@ macro_rules! mirror {
     };
 }
 
+/// One credential on its way to the worker.
+///
+/// Wraps [`Secret`] rather than restating it, so what redacts a credential is
+/// written once and this file adds only the wire form.
+///
+/// [`Secret`]: enroute_config::Secret
+#[derive(Debug, Clone)]
+pub struct Credential(enroute_config::Secret);
+
+impl Credential {
+    /// As the configuration holds it, which is what reads one.
+    #[must_use]
+    pub fn secret(&self) -> &enroute_config::Secret {
+        &self.0
+    }
+}
+
+impl From<&enroute_config::Secret> for Credential {
+    fn from(value: &enroute_config::Secret) -> Self {
+        Self(value.clone())
+    }
+}
+
+impl From<&str> for Credential {
+    fn from(value: &str) -> Self {
+        Self(enroute_config::Secret::from(value))
+    }
+}
+
+impl Serialize for Credential {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.0.expose())
+    }
+}
+
+impl<'de> Deserialize<'de> for Credential {
+    /// Not [`Secret`]'s own, which expands `${VAR}` — the worker's environment
+    /// is not where a caller's credential comes from.
+    ///
+    /// [`Secret`]: enroute_config::Secret
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(|value| Self::from(value.as_str()))
+    }
+}
+
+impl std::hash::Hash for Credential {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.expose().hash(state);
+    }
+}
+
+/// How the worker reaches this deployment's metadata.
+///
+/// The cap travels with the URL because it answers to the database that URL
+/// names: what a pool may open depends on what else shares that server.
+#[derive(Debug, Clone, Hash, Serialize, Deserialize)]
+pub struct Database {
+    /// Where it is.
+    pub url: Credential,
+    /// Most connections one push may hold at once.
+    pub max_connections: std::num::NonZeroU32,
+}
+
+/// What the call gives the worker for reaching a bucket.
+///
+/// Said rather than inferred from an empty set: reaching a bucket as the
+/// function is a choice, and an omission should not be able to make it.
+#[derive(Debug, Clone, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Given {
+    /// These, and nothing else — by their `object_store` names.
+    Credentials(BTreeMap<String, Credential>),
+    /// Nothing: the function's own environment, for a function one
+    /// deployment owns.
+    Environment,
+}
+
+/// What the worker reaches this deployment's database and buckets with.
+///
+/// On the call so a function holds no deployment's credentials: its execution
+/// role is one every invocation shares, whoever sent them.
+#[derive(Debug, Clone, Hash, Serialize, Deserialize)]
+pub struct Credentials {
+    /// Where this deployment's metadata is, and how far a pool may open.
+    pub database: Database,
+    /// What [`Call::objects`] is reached with.
+    pub objects: Given,
+    /// What [`Call::staging`] is reached with.
+    pub staging: Given,
+}
+
+/// Where the worker's spans go, and what they carry.
+///
+/// A map rather than OTLP's `key=value,key=value`: that shape belonged to the
+/// environment variable this no longer travels in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Telemetry {
+    /// The collector's trace endpoint, in full.
+    pub endpoint: String,
+    /// What each export carries, which is how a collector knows the caller.
+    #[serde(default)]
+    pub headers: BTreeMap<String, Credential>,
+}
+
+impl From<&enroute_config::Telemetry> for Telemetry {
+    fn from(value: &enroute_config::Telemetry) -> Self {
+        Self {
+            endpoint: value.endpoint.clone(),
+            headers: value
+                .headers
+                .iter()
+                .map(|(name, secret)| (name.clone(), Credential::from(secret)))
+                .collect(),
+        }
+    }
+}
+
 /// One invocation: a push, and what the worker needs before it can read one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Call {
@@ -119,8 +236,34 @@ pub struct Call {
     pub objects: StoreUri,
     /// The bucket a staged push and a staged pack are read back from.
     pub staging: StoreUri,
+    /// What to reach the two above and the database with.
+    pub credentials: Credentials,
+    /// Where to export this push's spans, if anywhere.
+    ///
+    /// Defaulting, unlike the rest: a deployment exporting nothing is a
+    /// deployment, where one reaching nothing is not.
+    #[serde(default)]
+    pub telemetry: Option<Telemetry>,
     /// The push, or where to read it.
     pub push: Push,
+}
+
+impl Call {
+    /// A value that changes when what a worker is built from does.
+    ///
+    /// Hashed rather than held: what keys a cache is compared and never read,
+    /// and a credential is not a thing to keep a second copy of.
+    #[cfg(feature = "server")]
+    #[must_use]
+    pub(crate) fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash as _, Hasher as _};
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.credentials.hash(&mut hasher);
+        self.objects.hash(&mut hasher);
+        self.staging.hash(&mut hasher);
+        hasher.finish()
+    }
 }
 
 /// How the push reaches the worker.
@@ -510,6 +653,11 @@ mod tests {
         serde_json::json!({
             "objects": "s3://objects/prefix",
             "staging": "s3://handoff?s3_express=true",
+            "credentials": {
+                "database": { "url": "postgres:///enroute", "max_connections": 8 },
+                "objects": { "credentials": { "access_key_id": "for-objects" } },
+                "staging": { "credentials": { "access_key_id": "for-staging" } },
+            },
             "push": { "staged": { "key": "packs/one", "len": 12 } },
         })
     }
@@ -517,10 +665,10 @@ mod tests {
     /// The whole point of sending them.
     ///
     /// A worker too old to know these fields must fail to read the call, not
-    /// fall back to a bucket the front door does not serve.
+    /// reach whatever its own environment last held.
     #[test]
-    fn a_call_without_its_stores_is_refused() {
-        for missing in ["objects", "staging"] {
+    fn a_call_without_what_it_reaches_is_refused() {
+        for missing in ["objects", "staging", "credentials"] {
             let mut without = call();
             drop(
                 without
@@ -530,7 +678,7 @@ mod tests {
                     .expect("the field was there"),
             );
             let error = serde_json::from_value::<Call>(without)
-                .expect_err("a call missing a store it needs")
+                .expect_err("a call missing something it needs")
                 .to_string();
             assert!(error.contains(missing), "{error}");
         }
@@ -549,6 +697,28 @@ mod tests {
             there_and_back.staging.to_uri(),
             "s3://handoff?s3_express=true"
         );
+    }
+
+    /// What a call may reach has to survive the trip, and a log of it must
+    /// not.
+    #[test]
+    fn a_credential_crosses_the_wire_and_never_a_log() {
+        let call: Call = serde_json::from_value(call()).expect("a call");
+        let there_and_back: Call =
+            serde_json::from_str(&serde_json::to_string(&call).expect("encodes")).expect("decodes");
+
+        assert_eq!(
+            there_and_back.credentials.database.url.secret().expose(),
+            "postgres:///enroute"
+        );
+        let Given::Credentials(objects) = &there_and_back.credentials.objects else {
+            panic!("the call gave credentials for the objects bucket");
+        };
+        assert_eq!(objects["access_key_id"].secret().expose(), "for-objects");
+
+        let printed = format!("{:?}", there_and_back.credentials);
+        assert!(!printed.contains("postgres:///enroute"), "{printed}");
+        assert!(!printed.contains("for-objects"), "{printed}");
     }
 
     /// A traceparent is not a store: a front door that sends none still has

@@ -10,15 +10,15 @@ use tonic_reflection::pb::v1::server_reflection_client::ServerReflectionClient;
 use tonic_reflection::pb::v1::server_reflection_request::MessageRequest;
 use tonic_reflection::pb::v1::server_reflection_response::MessageResponse;
 
-use crate::support::{make_isolated_state, spawn_contract_without_hooks};
+use crate::support::{make_isolated_state, spawn_enroute};
 
 /// One reflection call against a contract, answered.
 ///
-/// No tenant header anywhere in here, unlike every other client in these
+/// Nothing authenticates here, as nothing authenticates anywhere on the
 /// tests: the four services are guarded and this is deliberately not.
 async fn ask(request: MessageRequest) -> MessageResponse {
     let state = make_isolated_state().await;
-    let addr = spawn_contract_without_hooks(state).await;
+    let addr = spawn_enroute(state).await;
 
     let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
         .expect("a usable contract URL")

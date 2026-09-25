@@ -14,6 +14,7 @@ mod metadata;
 pub mod refs;
 mod store;
 
+pub use enroute_git_core::ExternalKey;
 pub use memory::Memory;
 pub use metadata::{Metadata, MetadataRef};
 pub use store::{Identity, Raced, RepoRows, Rows};

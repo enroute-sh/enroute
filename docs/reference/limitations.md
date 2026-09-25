@@ -33,10 +33,12 @@ Enroute is a `0.x` release with the following current limits.
 - Reads are bounded: 100 repositories or commits per page and 50,000 tree or
   diff entries.
 
+- `ListRepositories` compares a `prefix` byte for byte and relies on the
+  database collating keys in byte order. See
+  [Configuration keys](configuration-keys.md).
+
 ## Operations
 
-- Tenants are file-managed; removal takes effect on the next refresh.
-- Tenant IDs cannot be renamed without losing repository ownership.
 - There are no quotas, rate limits, per-caller concurrency limits, or
   maintenance metrics.
 - `enroute-maintenance` is not included in the image.

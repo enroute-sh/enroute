@@ -3,11 +3,11 @@
 Your application calls Enroute over gRPC on `listen.api` (`:50051` by default).
 Enroute serves plain HTTP/2; terminate TLS before it.
 
-## Tenant header
+## Authentication
 
-Every RPC needs the `x-enroute-tenant` header by default. Authenticate callers
-at a proxy, gateway, or mesh, and replace this header with the caller's tenant.
-Missing, duplicate, and unknown tenant headers return `UNAUTHENTICATED`.
+Enroute authenticates nothing on this listener. Your application is its only
+caller, and any client that can reach the port can act as your application.
+Keep it unreachable from anywhere else. See [Security](../operate/security.md).
 
 ## Services
 
@@ -24,13 +24,15 @@ The proto files define all fields. See [Protocol Buffers](proto.md).
 
 Repository keys are application-owned, opaque identifiers. They are 1–256
 ASCII letters, digits, `-`, `_`, or `.`, start and end with a letter or digit,
-and are case-sensitive. A key is unique only within a tenant.
+and are case-sensitive. A key is unique across the deployment.
 
 Use a stable ID such as a UUID, ULID, or database ID. Do not use a mutable
 path or display name. The `authorize` hook maps Git URLs to keys.
 
 `CreateRepository` is idempotent. `default_branch` is used only when creating
-the repository and defaults to `refs/heads/main`. `ListRepositories` is
+the repository and defaults to `refs/heads/main`. `ListRepositories` takes an
+optional `prefix` and reports only the keys starting with it, byte for byte; a
+page token belongs to the prefix that minted it. `ListRepositories` is
 key-ordered and paginated at 100 items; follow `next_page_token` until empty.
 Do not treat a short page as the last page. `GetRepository` includes the
 repository key, default branch, and the time of the most recent push; the

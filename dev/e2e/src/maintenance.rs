@@ -9,7 +9,7 @@ mod tests {
     use enroute::maintenance::{Maintenance, run};
     use enroute_git_retrieve::{STARTING_COALESCE, coalesce};
 
-    use crate::support::{ALICE, front_door_for, git, make_isolated_state, spawn_server};
+    use crate::support::{ALICE, front_door_for, git, key_for, make_isolated_state, spawn_server};
 
     /// The policy's fanout is eight, so fewer pushes than this merges nothing
     /// and would prove nothing about a merged index.
@@ -19,9 +19,8 @@ mod tests {
     async fn a_pass_merges_the_index_and_the_repository_still_clones() {
         let state = make_isolated_state().await;
         let name = format!("repo-{}", uuid::Uuid::new_v4());
-        let repo = state.rows.create(None).await.unwrap();
-        let (door, token, _landed, servers) =
-            spawn_server(state.clone(), &[(&name, repo.id)]).await;
+        state.rows.create(None, &key_for(&name)).await.unwrap();
+        let (door, token, _landed, servers) = spawn_server(state.clone(), &[&name]).await;
 
         let tmp = tempfile::tempdir().unwrap();
         let local = tmp.path().join("work");
@@ -103,9 +102,8 @@ mod tests {
     async fn a_coalesce_moves_the_images_and_the_repository_still_clones() {
         let state = make_isolated_state().await;
         let name = format!("repo-{}", uuid::Uuid::new_v4());
-        let repo = state.rows.create(None).await.unwrap();
-        let (door, token, _landed, servers) =
-            spawn_server(state.clone(), &[(&name, repo.id)]).await;
+        let repo = state.rows.create(None, &key_for(&name)).await.unwrap();
+        let (door, token, _landed, servers) = spawn_server(state.clone(), &[&name]).await;
 
         let tmp = tempfile::tempdir().unwrap();
         let local = tmp.path().join("work");
@@ -207,9 +205,8 @@ mod tests {
     async fn a_gathered_segment_is_kept_for_a_window_and_then_reclaimed() {
         let state = make_isolated_state().await;
         let name = format!("repo-{}", uuid::Uuid::new_v4());
-        let repo = state.rows.create(None).await.unwrap();
-        let (door, token, _landed, servers) =
-            spawn_server(state.clone(), &[(&name, repo.id)]).await;
+        let repo = state.rows.create(None, &key_for(&name)).await.unwrap();
+        let (door, token, _landed, servers) = spawn_server(state.clone(), &[&name]).await;
 
         let tmp = tempfile::tempdir().unwrap();
         let local = tmp.path().join("work");

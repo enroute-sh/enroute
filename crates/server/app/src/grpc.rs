@@ -1,12 +1,11 @@
 //! The wire contract, served.
 //!
 //! Every method is a thin translation to the engine: this layer knows
-//! repositories by the key their application gave them, and the engine by a
+//! repositories by the key the application gave them, and the engine by a
 //! `RepoId` that never reaches a caller. [`Api::resolve`] is the only thing
-//! that turns one into the other, and it needs a [`Caller`], so a handler
-//! that forgot to authenticate does not compile. A key resolves only within the
-//! tenant that asked, which is what keeps one customer out of another's
-//! storage.
+//! that turns one into the other. Nothing here authenticates, the application
+//! being the only caller: whether it may reach this port is the deployment's
+//! to answer — see docs/operate/security.md.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -14,7 +13,6 @@ use std::sync::Arc;
 use futures::StreamExt as _;
 use gix_hash::ObjectId;
 use tonic::{Request, Response, Status};
-use tower::Layer as _;
 
 use enroute_api::api::v1alpha1::object_service_server::{ObjectService, ObjectServiceServer};
 use enroute_api::api::v1alpha1::ref_service_server::{RefService, RefServiceServer};
@@ -45,11 +43,10 @@ use enroute_git_retrieve::{
     TreeWalk,
 };
 
-use crate::callers::{Authenticate, tenant_of};
-use crate::tenancy::{RepoKey, Tenant, Tenants};
+use crate::repo_key::RepoKey;
 use crate::wire::{
     oid_or_null, parse_hex, parse_oid, parse_repo, require_oid, wire_oid, wire_oid_or_unset,
-    wire_repo, wire_time,
+    wire_time,
 };
 
 /// A server-streamed response.
@@ -58,18 +55,14 @@ use crate::wire::{
 /// types are not nameable.
 type ResponseStream<T> = Pin<Box<dyn futures::Stream<Item = Result<T, Status>> + Send>>;
 
-/// A service behind [`Authenticate`], which refuses anyone holding no token
-/// this Enroute knows.
-type Guarded<S> = crate::callers::Authenticated<S>;
-
 /// Everything Enroute serves on the contract port.
 ///
 /// Named so a binary holding one can spell its type rather than infer it.
 pub type Services = (
-    Guarded<RefServiceServer<Api>>,
-    Guarded<RepositoryServiceServer<Api>>,
-    Guarded<ObjectServiceServer<Api>>,
-    Guarded<SyncServiceServer<Api>>,
+    RefServiceServer<Api>,
+    RepositoryServiceServer<Api>,
+    ObjectServiceServer<Api>,
+    SyncServiceServer<Api>,
 );
 
 /// [`Services`] added to a `tonic` server, with reflection, ready to serve.
@@ -86,9 +79,6 @@ pub fn router(
 ) -> Result<tonic::transport::server::Router, tonic_reflection::server::Error> {
     let (refs, repositories, objects, sync) = services;
 
-    // Unguarded, unlike the four below: reflection answers with the contract,
-    // which ships in `proto/` and in the deploy image, so asking a caller for
-    // a tenant header would be guarding what is already published.
     let reflection = || {
         tonic_reflection::server::Builder::configure()
             .register_encoded_file_descriptor_set(enroute_api::FILE_DESCRIPTOR_SET)
@@ -111,97 +101,48 @@ pub fn router(
 /// Arguments, not things installed later: whoever reaches the contract is the
 /// application, and which remotes a sync may dial the deployment's answer.
 #[must_use]
-pub fn services(
-    state: Storage,
-    tenants: Arc<Tenants>,
-    remotes: enroute_git_remote::Client,
-    tenant_header: http::HeaderName,
-) -> Services {
-    let guard = Authenticate::new(Arc::clone(&tenants), tenant_header);
+pub fn services(state: Storage, remotes: enroute_git_remote::Client) -> Services {
     let api = Api {
         state,
-        tenants,
         // Shared rather than cloned: the four services are one client's
         // connection pool, and `Client` is not `Clone` in any case.
         remotes: Arc::new(remotes),
     };
     (
-        guard.layer(RefServiceServer::new(api.clone())),
-        guard.layer(RepositoryServiceServer::new(api.clone())),
-        guard.layer(ObjectServiceServer::new(api.clone())),
-        guard.layer(SyncServiceServer::new(api)),
+        RefServiceServer::new(api.clone()),
+        RepositoryServiceServer::new(api.clone()),
+        ObjectServiceServer::new(api.clone()),
+        SyncServiceServer::new(api),
     )
 }
 
 /// Everything the contract is served out of.
 ///
 /// One type behind all four services rather than four alike ones, which
-/// would be four copies of the same engine and tenants to keep in step.
+/// would be four copies of the same engine to keep in step.
 #[derive(Debug, Clone)]
 pub struct Api {
     state: Storage,
-    tenants: Arc<Tenants>,
     remotes: Arc<enroute_git_remote::Client>,
 }
 
 impl Api {
-    /// Who is calling, and what they sent.
-    ///
-    /// Both at once and in this order, since `into_inner` consumes the
-    /// request the tenant is read off — so a handler cannot skip it.
-    fn opened<T>(&self, request: Request<T>) -> Result<(Caller<'_>, T), Status> {
-        let caller = Caller {
-            tenants: &self.tenants,
-            tenant: tenant_of(&request)?,
-        };
-        Ok((caller, request.into_inner()))
-    }
-
     /// Turns the key a call arrived with into the repository the engine holds,
-    /// failing the call if it names nothing of `caller`'s.
+    /// failing the call if it names nothing here.
     ///
-    /// The ledger says which repository and the engine says what it is.
-    /// Neither checks ownership: a key resolves only inside its own tenant.
-    async fn resolve(
-        &self,
-        caller: &Caller<'_>,
-        repo: Option<&WireRepoKey>,
-    ) -> Result<RepoMetadata, Status> {
-        lookup(&self.state, caller.repo_id(&parse_repo(repo)?).await?).await
-    }
-}
-
-/// A contract caller, resolved to the tenant whose token they presented.
-///
-/// Holding one is proof that a call authenticated: [`Api::resolve`] is the
-/// single place a key becomes an engine id.
-#[derive(Debug)]
-pub(crate) struct Caller<'a> {
-    tenants: &'a Tenants,
-    tenant: Tenant,
-}
-
-impl Caller<'_> {
-    /// The tenant this call belongs to.
-    fn tenant(&self) -> &Tenant {
-        &self.tenant
-    }
-
-    /// The engine's id for the repository this caller calls `key`.
-    ///
-    /// A key that is not this tenant's names nothing here, so somebody else's
-    /// repository and one that never existed are one answer.
-    async fn repo_id(&self, key: &RepoKey) -> Result<RepoId, Status> {
-        self.held(key)
+    /// One read: the key is a column on the repository it names.
+    async fn resolve(&self, repo: Option<&WireRepoKey>) -> Result<RepoMetadata, Status> {
+        self.held(&parse_repo(repo)?)
             .await?
             .ok_or_else(|| Status::not_found("no such repository"))
     }
 
-    /// The same lookup for a caller that has an answer for `None` — a create
+    /// The same read for a caller that has an answer for `None` — a create
     /// repeated, or a delete of something already gone.
-    async fn held(&self, key: &RepoKey) -> Result<Option<RepoId>, Status> {
-        self.tenants
-            .resolve(&self.tenant, key)
+    async fn held(&self, key: &RepoKey) -> Result<Option<RepoMetadata>, Status> {
+        self.state
+            .rows
+            .by_key(key.external())
             .await
             .map_err(|error| internal(&error))
     }
@@ -214,8 +155,8 @@ impl RefService for Api {
         &self,
         request: Request<ListRefsRequest>,
     ) -> Result<Response<ListRefsResponse>, Status> {
-        let (caller, request) = self.opened(request)?;
-        let repo = self.resolve(&caller, request.repo.as_ref()).await?;
+        let request = request.into_inner();
+        let repo = self.resolve(request.repo.as_ref()).await?;
 
         // `HEAD` is not a ref in the contract: it is derivable from
         // `default_branch`, and sending both would let them disagree. So this
@@ -250,8 +191,8 @@ impl RefService for Api {
         &self,
         request: Request<UpdateRefsRequest>,
     ) -> Result<Response<UpdateRefsResponse>, Status> {
-        let (caller, request) = self.opened(request)?;
-        let repo = self.resolve(&caller, request.repo.as_ref()).await?;
+        let request = request.into_inner();
+        let repo = self.resolve(request.repo.as_ref()).await?;
         let updates = parse_updates(&request.updates)?;
 
         // No pack, and no `pre-receive`: the application authored that hook, so
@@ -272,8 +213,8 @@ impl RefService for Api {
         &self,
         request: Request<IsAncestorRequest>,
     ) -> Result<Response<IsAncestorResponse>, Status> {
-        let (caller, request) = self.opened(request)?;
-        let repo = self.resolve(&caller, request.repo.as_ref()).await?;
+        let request = request.into_inner();
+        let repo = self.resolve(request.repo.as_ref()).await?;
 
         let ancestor = require_oid(request.ancestor_commit_id.as_ref(), "ancestor_commit_id")?;
         let descendant = require_oid(
@@ -300,8 +241,8 @@ impl SyncService for Api {
         &self,
         request: Request<PushToRemoteRequest>,
     ) -> Result<Response<PushToRemoteResponse>, Status> {
-        let (caller, request) = self.opened(request)?;
-        let repo = self.resolve(&caller, request.repo.as_ref()).await?;
+        let request = request.into_inner();
+        let repo = self.resolve(request.repo.as_ref()).await?;
         let push = parse_push(request)?;
 
         let outcomes = self
@@ -464,7 +405,7 @@ impl Api {
             .ok_or_else(|| Status::not_found("no such repository"))?;
         Ok(described(
             &summary.repo,
-            key,
+            key.to_string(),
             summary.last_push_unix_seconds,
         ))
     }
@@ -477,7 +418,7 @@ impl RepositoryService for Api {
         &self,
         request: Request<CreateRepositoryRequest>,
     ) -> Result<Response<CreateRepositoryResponse>, Status> {
-        let (caller, request) = self.opened(request)?;
+        let request = request.into_inner();
         let key = parse_repo(request.repo.as_ref())?;
         let default_branch = request.default_branch;
         // `HEAD` is advertised as a symbolic ref to this name, so a value
@@ -493,59 +434,21 @@ impl RepositoryService for Api {
             }
         };
 
-        // Answered before anything is made, so the ordinary repeat — a retry,
-        // or a caller that never recorded the first one — costs one read.
-        if let Some(held) = caller.held(&key).await? {
-            return Ok(Response::new(CreateRepositoryResponse {
-                repository: Some(self.describe(held, &key).await?),
-            }));
-        }
-
+        // One write, and the key is part of it: the repository and the name it
+        // is reached by land together or not at all. A key already taken is
+        // answered with the repository holding it, so a create repeated after
+        // a lost answer is the same create rather than a second repository.
         let repo = self
             .state
             .rows
-            .create(default_branch)
+            .create(default_branch, key.external())
             .await
             .map_err(|error| internal(&error))?;
 
-        // Claimed second, because the engine mints the id this row is keyed
-        // by. A claim that fails leaves a repository nobody owns and nobody
-        // can reach, so it is deleted again rather than left to be counted
-        // against a customer who never got it.
-        let held = match self.tenants.claim(caller.tenant(), repo.id, &key).await {
-            Ok(held) => held,
-            Err(error) => {
-                let undo = self.state.rows.repo(repo.id).mark_deleted().await;
-                tracing::error!(
-                    %error,
-                    repo_id = %repo.id,
-                    undone = undo.is_ok(),
-                    "could not record which tenant a new repository belongs to"
-                );
-                return Err(Status::internal("internal error"));
-            }
-        };
-
-        // Another create held the key between the read above and this insert.
-        // Theirs is the repository, and the one just made is dropped rather
-        // than left for a janitor to find with nothing pointing at it.
-        if held != repo.id {
-            let undo = self.state.rows.repo(repo.id).mark_deleted().await;
-            tracing::info!(
-                %held,
-                discarded = %repo.id,
-                undone = undo.is_ok(),
-                "two creates raced on one repository key"
-            );
-            return Ok(Response::new(CreateRepositoryResponse {
-                repository: Some(self.describe(held, &key).await?),
-            }));
-        }
-
-        // Nothing has been pushed to a repository one call old, so there is
-        // no timestamp to look up.
+        // Described rather than reported from what `create` returned, since a
+        // repeat is answering for a repository that may have been pushed to.
         Ok(Response::new(CreateRepositoryResponse {
-            repository: Some(described(&repo, &key, None)),
+            repository: Some(self.describe(repo.id, &key).await?),
         }))
     }
 
@@ -554,24 +457,24 @@ impl RepositoryService for Api {
         &self,
         request: Request<GetRepositoryRequest>,
     ) -> Result<Response<GetRepositoryResponse>, Status> {
-        let (caller, request) = self.opened(request)?;
+        let request = request.into_inner();
         let key = parse_repo(request.repo.as_ref())?;
-        let id = caller.repo_id(&key).await?;
+        let repo = self
+            .held(&key)
+            .await?
+            .ok_or_else(|| Status::not_found("no such repository"))?;
         Ok(Response::new(GetRepositoryResponse {
-            repository: Some(self.describe(id, &key).await?),
+            repository: Some(self.describe(repo.id, &key).await?),
         }))
     }
 
-    /// Every repository this caller has, in key order.
-    ///
-    /// Two reads, not a join: the ledger holds the keys and the engine holds
-    /// what they name, and nothing joins the two by design.
+    /// Every repository, in key order.
     #[tracing::instrument(name = "enroute::grpc::list_repositories", skip(self, request))]
     async fn list_repositories(
         &self,
         request: Request<ListRepositoriesRequest>,
     ) -> Result<Response<ListRepositoriesResponse>, Status> {
-        let (caller, request) = self.opened(request)?;
+        let request = request.into_inner();
 
         // A token is one this call minted, so a malformed one says only that.
         // Which rule a key broke is for `CreateRepository`, where the key is
@@ -586,15 +489,33 @@ impl RepositoryService for Api {
         };
         let limit = page_limit(request.limit, REPOSITORY_LIMIT);
 
+        // Refused rather than ignored: a prefix of what no key holds would
+        // report nothing, which reads like an empty deployment.
+        let prefix = request.prefix.as_str();
+        crate::repo_key::check_prefix(prefix)
+            .map_err(|bad| Status::invalid_argument(bad.to_string()))?;
+
+        // A token is the last key of a page this call minted, so one from
+        // outside the prefix is two walks confused for one.
+        if let Some(after) = after.as_ref()
+            && !after.as_str().starts_with(prefix)
+        {
+            return Err(Status::invalid_argument(
+                "the page token is not inside the prefix",
+            ));
+        }
+
         // One past the page, so a next one is known without a second query.
+        // A key starts with a letter or digit, so the empty string sorts
+        // before every one of them and starts the walk.
+        let after = after.as_ref().map_or("", RepoKey::as_str);
         let mut held = self
-            .tenants
-            .repositories(caller.tenant(), after.as_ref(), limit + 1)
+            .state
+            .rows
+            .page_by_key(prefix, after, limit + 1)
             .await
             .map_err(|error| internal(&error))?;
 
-        // From the ledger, not the engine: a repository deleted mid-walk is
-        // absent from the page but is still where the next one resumes.
         let page = usize::try_from(limit).unwrap_or(usize::MAX);
         let more = held.len() > page;
         held.truncate(page);
@@ -603,26 +524,11 @@ impl RepositoryService for Api {
             _ => String::new(),
         };
 
-        let ids: Vec<RepoId> = held.iter().map(|(id, _)| *id).collect();
-        let found = self
-            .state
-            .rows
-            .summarize(&ids)
-            .await
-            .map_err(|error| internal(&error))?;
-
-        // Walked in the ledger's order, which is the key order the page
-        // promises; the engine answers in its own and may be short one.
         Ok(Response::new(ListRepositoriesResponse {
             repositories: held
-                .iter()
-                .filter_map(|(id, key)| {
-                    let summary = found.iter().find(|one| one.repo.id == *id)?;
-                    Some(described(
-                        &summary.repo,
-                        key,
-                        summary.last_push_unix_seconds,
-                    ))
+                .into_iter()
+                .map(|(summary, key)| {
+                    described(&summary.repo, key.into(), summary.last_push_unix_seconds)
                 })
                 .collect(),
             next_page_token,
@@ -637,30 +543,26 @@ impl RepositoryService for Api {
         // Idempotent: a never-existed id and one deleted a moment ago answer
         // alike. Somebody else's repository answers alike too and deletes
         // nothing — refusing would say it exists.
-        let (caller, request) = self.opened(request)?;
+        let request = request.into_inner();
         let key = parse_repo(request.repo.as_ref())?;
         // An error answers alike as well: this call cannot say why it did
         // nothing without saying the repository is there.
-        let Ok(Some(id)) = caller.held(&key).await else {
+        let Ok(Some(held)) = self.held(&key).await else {
             return Ok(Response::new(DeleteRepositoryResponse {}));
         };
 
+        // One write, which is also what frees the key: it is unique among
+        // repositories that are not deleted, so this hands the name back
+        // without waiting for maintenance to reclaim the row.
         let deleted = self
             .state
             .rows
-            .repo(id)
+            .repo(held.id)
             .mark_deleted()
             .await
             .map_err(|error| internal(&error))?;
-        // Released after the delete: a row left behind names a repository the
-        // engine no longer has, which resolves to nothing, while releasing
-        // first would leave a live repository belonging to nobody.
-        if let Err(error) = self.tenants.release(id).await {
-            tracing::error!(%error, repo_id = %id, "could not release a deleted repository");
-        }
         tracing::info!(
-            tenant = %caller.tenant().id,
-            repo_id = %id,
+            repo_id = %held.id,
             %key,
             deleted,
             "delete_repository"
@@ -693,8 +595,8 @@ impl ObjectService for Api {
         &self,
         request: Request<GetObjectRequest>,
     ) -> Result<Response<Self::GetObjectStream>, Status> {
-        let (caller, request) = self.opened(request)?;
-        let repo = self.resolve(&caller, request.repo.as_ref()).await?;
+        let request = request.into_inner();
+        let repo = self.resolve(request.repo.as_ref()).await?;
         let oid = require_oid(request.object_id.as_ref(), "object_id")?;
 
         // Read whole, then chunk. The engine reconstructs an object by
@@ -733,8 +635,8 @@ impl ObjectService for Api {
         &self,
         request: Request<ListTreeRequest>,
     ) -> Result<Response<Self::ListTreeStream>, Status> {
-        let (caller, request) = self.opened(request)?;
-        let repo = self.resolve(&caller, request.repo.as_ref()).await?;
+        let request = request.into_inner();
+        let repo = self.resolve(request.repo.as_ref()).await?;
         let oid = require_oid(request.object_id.as_ref(), "object_id")?;
 
         let walk = enroute_git_retrieve::tree(&self.state, &repo, oid, TREE_ENTRY_LIMIT)
@@ -754,8 +656,8 @@ impl ObjectService for Api {
         &self,
         request: Request<ListCommitsRequest>,
     ) -> Result<Response<Self::ListCommitsStream>, Status> {
-        let (caller, request) = self.opened(request)?;
-        let repo = self.resolve(&caller, request.repo.as_ref()).await?;
+        let request = request.into_inner();
+        let repo = self.resolve(request.repo.as_ref()).await?;
 
         // A page token names where to resume, and is the only thing read when
         // it is set: a caller that pages is walking one history, and taking
@@ -824,8 +726,8 @@ impl ObjectService for Api {
         &self,
         request: Request<DiffCommitRequest>,
     ) -> Result<Response<Self::DiffCommitStream>, Status> {
-        let (caller, request) = self.opened(request)?;
-        let repo = self.resolve(&caller, request.repo.as_ref()).await?;
+        let request = request.into_inner();
+        let repo = self.resolve(request.repo.as_ref()).await?;
         let oid = require_oid(request.commit_id.as_ref(), "commit_id")?;
         let base = request.base_commit_id.as_ref().map(parse_oid).transpose()?;
 
@@ -901,8 +803,8 @@ impl ObjectService for Api {
         &self,
         request: Request<FindMergeBasesRequest>,
     ) -> Result<Response<FindMergeBasesResponse>, Status> {
-        let (caller, request) = self.opened(request)?;
-        let repo = self.resolve(&caller, request.repo.as_ref()).await?;
+        let request = request.into_inner();
+        let repo = self.resolve(request.repo.as_ref()).await?;
 
         let a = require_oid(request.commit_id_a.as_ref(), "commit_id_a")?;
         let b = require_oid(request.commit_id_b.as_ref(), "commit_id_b")?;
@@ -1185,30 +1087,12 @@ fn object_failed(oid: &ObjectId, error: &enroute_git_core::Error) -> Status {
     Status::internal("internal error")
 }
 
-fn described(
-    repo: &RepoMetadata,
-    key: &RepoKey,
-    last_push_unix_seconds: Option<i64>,
-) -> Repository {
+fn described(repo: &RepoMetadata, key: String, last_push_unix_seconds: Option<i64>) -> Repository {
     Repository {
-        repo: Some(wire_repo(key)),
+        repo: Some(WireRepoKey { key }),
         default_branch: repo.default_branch.clone(),
         last_push: last_push_unix_seconds.map(wire_time),
     }
-}
-
-/// The repository `id` names, which the ledger has just said is there.
-///
-/// Absent means it was deleted between the two reads, which to a caller is the
-/// same as never having been there.
-async fn lookup(state: &Storage, id: RepoId) -> Result<RepoMetadata, Status> {
-    state
-        .rows
-        .repo(id)
-        .lookup()
-        .await
-        .map_err(|error| internal(&error))?
-        .ok_or_else(|| Status::not_found("no such repository"))
 }
 
 /// Engine failures reach a caller as `Internal` with no detail: what went

@@ -14,15 +14,14 @@ hooks. Its security controls are part of the deployment boundary.
 | `listen.git` | Public, behind TLS termination |
 | `listen.api` | Private; application callers only |
 
-Enroute does not terminate TLS or authenticate gRPC callers. The tenant header
-selects the tenant. Any caller that can reach the API listener and set that
-header can access every tenant.
+Enroute does not terminate TLS or authenticate gRPC callers. Any caller that
+can reach the API listener can read, write, and delete every repository in the
+deployment.
 
-Place a proxy, gateway, or service mesh in front of the API listener. It must
-authenticate callers and replace, rather than append, the tenant header.
-Enroute rejects requests with multiple tenant headers. gRPC reflection is
-available before tenant validation; do not expose the listener if its API shape
-is confidential.
+Reachability is therefore the whole of the control. Bind `listen.api` to a
+private interface, and restrict it further with a network policy, a security
+group, or a service mesh. gRPC reflection is served on the same listener, so do
+not expose it if your API shape is confidential.
 
 ## Hook signatures
 
@@ -44,10 +43,12 @@ uses a public RFC test key and is only suitable for local development. See
 URLs and redirects, and permits only public `https` hosts unless
 `sync.allow_private_remotes` is enabled.
 
-Repository ownership is scoped by tenant ID. A key owned by another tenant is
-not found. Tenant-file removals take effect at the next refresh; restart to
-revoke immediately or deny access in your application.
+A deployment holds one application's repositories. Enroute enforces no
+boundary inside that set: every key is reachable by whoever reaches the API
+listener, and by whatever your `authorize` hook grants. To serve parties that
+must not reach each other's repositories, run a deployment per party, each with
+its own database and bucket.
 
-Enroute validates Git paths, tenant ownership, hook-context size, and ref
+Enroute validates Git paths, repository keys, hook-context size, and ref
 targets. It does not provide rate limits, quotas, per-caller concurrency
 limits, encryption at rest, or protection against a compromised application.

@@ -11,8 +11,12 @@ mod tests {
     async fn a_password_gets_a_usable_explanation_over_the_wire() {
         let state = make_isolated_state().await;
         let repo = format!("repo-{}", uuid::Uuid::new_v4());
-        let created = state.rows.create(None).await.unwrap();
-        let (addr, _token, _landed, _servers) = spawn_server(state, &[(&repo, created.id)]).await;
+        state
+            .rows
+            .create(None, &crate::support::key_for(&repo))
+            .await
+            .unwrap();
+        let (addr, _token, _landed, _servers) = spawn_server(state, &[&repo]).await;
 
         let tmp = tempfile::tempdir().unwrap();
         let mut cmd = tokio::process::Command::new("git");

@@ -13,7 +13,7 @@ use tonic::Status;
 
 use enroute_api::common::v1alpha1::{ObjectId as WireObjectId, RepoKey as WireRepoKey};
 
-use crate::tenancy::RepoKey;
+use crate::repo_key::RepoKey;
 
 /// Object ids cross the contract as hex.
 ///

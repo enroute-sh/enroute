@@ -19,8 +19,8 @@ mod store_uri;
 #[cfg(feature = "file")]
 pub use file::{
     Config, Database, Hooks, InProcess, Ingest, JustDatabase, JustMaintenance, Lambda, Listen,
-    Local, Maintenance, Migrate, Off, Run, Sync, Telemetry, Tenants,
+    Local, Maintenance, Migrate, Off, Run, Sync, Telemetry,
 };
 pub use read::{Capped, MAX_BYTES, read_capped};
 pub use secret::Secret;
-pub use store_uri::{Bucket, ObjectUri, ScratchUri, StoreUri};
+pub use store_uri::{Bucket, CredentialSource, ObjectUri, ScratchUri, StoreUri};

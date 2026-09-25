@@ -10,7 +10,7 @@ use gix_hash::ObjectId;
 use gix_object::Kind;
 use sqlx::PgPool;
 
-use enroute_git_core::{RepoId, oid};
+use enroute_git_core::{ExternalKey, RepoId, oid};
 use enroute_git_metadata::{Identity, Raced, Rows};
 
 /// One dedicated connection, in a `pg_temp` schema of its own.
@@ -54,7 +54,11 @@ async fn record(rows: &Rows, repo: RepoId, of: &[(ObjectId, Identity)]) -> Resul
 #[tokio::test]
 async fn a_recorded_object_reads_back_as_what_it_was_called() {
     let rows = rows!();
-    let repo = rows.create(None).await.expect("a repository").id;
+    let repo = rows
+        .create(None, &ExternalKey::new("identity-one"))
+        .await
+        .expect("a repository")
+        .id;
     let oids = oids(64);
     let named = named(&oids, Kind::Tree);
 
@@ -72,7 +76,11 @@ async fn a_recorded_object_reads_back_as_what_it_was_called() {
 #[tokio::test]
 async fn one_seq_under_every_kind_is_four_objects() {
     let rows = rows!();
-    let repo = rows.create(None).await.expect("a repository").id;
+    let repo = rows
+        .create(None, &ExternalKey::new("identity-two"))
+        .await
+        .expect("a repository")
+        .id;
     let kinds = [Kind::Commit, Kind::Tree, Kind::Blob, Kind::Tag];
     let oids = oids(4);
     let named: Vec<(ObjectId, Identity)> = oids
@@ -97,7 +105,11 @@ async fn one_seq_under_every_kind_is_four_objects() {
 #[tokio::test]
 async fn a_duplicate_oid_is_the_race_over_a_unique_violation() {
     let rows = rows!();
-    let repo = rows.create(None).await.expect("a repository").id;
+    let repo = rows
+        .create(None, &ExternalKey::new("identity-three"))
+        .await
+        .expect("a repository")
+        .id;
     let named = named(&oids(8), Kind::Blob);
 
     record(&rows, repo, &named).await.expect("recording");

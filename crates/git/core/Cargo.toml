@@ -28,7 +28,6 @@ gix-hash.workspace = true
 gix-hashtable.workspace = true
 gix-validate.workspace = true
 bstr.workspace = true
-enroute-git-hash.workspace = true
 ulid.workspace = true
 uuid.workspace = true
 

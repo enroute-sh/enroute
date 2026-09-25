@@ -1,8 +1,7 @@
-//! One capped read of one object, for the two things a process reads.
+//! One capped read of one object.
 //!
-//! The deployment file and the tenants arrive the same way: a store, a key,
-//! and a cap that refuses a URI pointing at the wrong object before its
-//! bytes are held. One reader, so the two cannot cap at different sizes.
+//! The deployment file arrives this way: a store, a key, and a cap that
+//! refuses a URI pointing at the wrong object before its bytes are held.
 
 use anyhow::{Context as _, Result, bail};
 use object_store::path::Path;

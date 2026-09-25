@@ -85,7 +85,7 @@ every request for that name.
   repository still serving Git. `DeleteRepository` is idempotent, so the retry
   is free.
 
-`ListRepositories` finds the orphans. It walks every key the tenant holds, a
+`ListRepositories` finds the orphans. It walks every key Enroute holds, a
 page at a time, and a key no row names is one to delete:
 
 ```ts

@@ -36,23 +36,16 @@ max_connections = 10
 migrate = "auto"
 
 [hooks]
+# Where your application answers. Every hook call is a POST to this one URL.
+# Keep the path in whatever namespace your framework reserves for machine
+# traffic: a forge serves repositories at paths named after repositories, so a
+# hook at `/enroute/hooks` is a hook a repository named `enroute` takes away.
+endpoint_url = "https://app.example.com/api/enroute/hooks"
 # Enroute holds this half, an application holds the public one.
 signing_key = "${ENROUTE_HOOK_SIGNING_KEY}"
 # How long your application has to answer before the git request fails. Your
 # budget, not Enroute's: raise it for a heavy cold start, lower it to fail fast.
 timeout_secs = 10
-
-[tenants]
-# Re-read on a timer, so adding a tenant is an edit to that file and not a
-# restart of this one. It is the only thing here that changes while running.
-uri = "file:///etc/enroute/tenants.toml"
-
-# The revocation window: a tenant taken out of the list serves this long.
-refresh_secs = 30
-
-# Whatever can set this header is every tenant, so the `api` listener must not
-# be reachable except through whatever sets it — read docs/operate/security.md.
-header = "x-enroute-tenant"
 
 # Where a push's work runs: exactly one of these two tables, and the values a
 # choice needs are its own keys — a `region` under `local` is not a key.
@@ -61,18 +54,28 @@ header = "x-enroute-tenant"
 scratch = "file:///data/scratch"
 
 # [ingest.lambda]
+# tenant = "acme"                 # only on a function shared with others
 # function = "enroute-ingest"                       # name or ARN
 # region = "eu-central-1"
 # handoff.uri = "s3://enroute-handoff?s3_express=true"   # directory bucket
 # max_pack_bytes = 1073741824
+# database_max_connections = 8    # one push's fan-out, not this server's
+# objects_credentials = "sent"    # or "environment", to reach it as itself
+# handoff_credentials = "sent"
 # qualifier = "7"                                   # omit for the latest
 #
 # Both URIs go on every call to the function, which is configured with neither,
-# so the two ends cannot be pointed at different buckets. Their credentials do
-# not travel: an invoke payload is a thing CloudTrail keeps, and the function
-# reads its own from Secrets Manager. `handoff` takes a
-# `[ingest.lambda.handoff.credentials]` of its own, being routinely a different
-# provider from `bucket`.
+# so the two ends cannot be pointed at different buckets. Their credentials
+# travel with them, and so does `database.url`, so the function holds no
+# credentials of this deployment's and needs no secret of its own.
+#
+# A function serves this deployment alone unless you say otherwise, and is
+# already nobody else's. Set `tenant` only to share one between deployments,
+# and only on a function created in tenant isolation mode — Lambda refuses a
+# tenant id for a function without it. See docs/operate/hosting.md.
+#
+# `handoff` takes a `[ingest.lambda.handoff.credentials]` of its own, being
+# routinely a different provider from `bucket`.
 
 # Both default to every interface, which is what a container needs.
 [listen]

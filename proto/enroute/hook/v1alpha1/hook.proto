@@ -92,7 +92,7 @@ message AuthorizeResponse {
 message Granted {
   // The repository to serve, by the key this application gave it at
   // CreateRepository — resolving a path to one is the whole of what it was
-  // asked. A key naming nothing this tenant has is a 404.
+  // asked. A key naming no repository is a 404.
   common.v1alpha1.RepoKey repo = 1;
 
   // Whoever is asking, in the application's own namespace. Recorded on the

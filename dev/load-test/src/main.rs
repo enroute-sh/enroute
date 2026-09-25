@@ -33,6 +33,7 @@ use bench_support::store::{LatencyProfile, LatencyStore, units_since};
 use client::GitHttpClient;
 use cost::{AuroraReadsReport, AuroraStorageReport, DataReport, SectionReport};
 use enroute_git_cost::{CountingStore, Meter, StoreRole, StoreUnits};
+use enroute_git_metadata::ExternalKey;
 use enroute_git_retrieve::Storage;
 use enroute_git_store::Store;
 
@@ -201,21 +202,13 @@ async fn serve_forever(cli: &Cli) -> Result<()> {
     let (metadata_pool, schema) = scratch_metadata_pool("loadtest", 32).await?;
     let state = enroute_postgres::storage(&metadata_pool, Arc::new(InMemory::new()), store);
     enroute_postgres::schema::apply(&metadata_pool).await?;
-    let created = state.rows.create(None).await?;
+    state.rows.create(None, &ExternalKey::new(repo)).await?;
     let token = bench_support::hooks::TOKEN;
 
-    let addr = serve_git(
-        repo,
-        state,
-        staging,
-        ([127, 0, 0, 1], 0).into(),
-        metadata_pool.clone(),
-        created.id,
-    )
-    .await?;
+    let addr = serve_git(repo, state, staging, ([127, 0, 0, 1], 0).into()).await?;
     // Credentials embedded in the URL: git and reqwest both read
     // `user:secret@host` as Basic auth without setup. No owner segment in
-    // the path — Enroute reads the tenant from `Host`, via `--against-host`.
+    // the path — the host a client sends, via `--against-host`.
     let url = format!("http://{owner}:{token}@{addr}/{repo}.git");
     seed(&url, cli).await?;
 
@@ -281,22 +274,14 @@ async fn bench_local(cli: Cli) -> Result<()> {
     // to the seed/clone workload.
     let baseline_bytes = schema_storage_bytes(&metadata_pool, &schema).await?;
 
-    let created = state.rows.create(None).await?;
+    state.rows.create(None, &ExternalKey::new(repo)).await?;
     let token = bench_support::hooks::TOKEN;
 
-    let addr = serve_git(
-        repo,
-        state,
-        staging,
-        ([127, 0, 0, 1], 0).into(),
-        metadata_pool.clone(),
-        created.id,
-    )
-    .await?;
+    let addr = serve_git(repo, state, staging, ([127, 0, 0, 1], 0).into()).await?;
 
     // Credentials embedded in the URL: git and reqwest both read
     // `user:secret@host` as Basic auth without setup. No owner segment in
-    // the path — Enroute reads the tenant from `Host`, via `CloneBench.host_override`.
+    // the path — the host a client sends, via `CloneBench.host_override`.
     let url = format!("http://{owner}:{token}@{addr}/{repo}.git");
     seed(&url, &cli).await?;
     let after_seed = primary_meter.units().primary;
@@ -493,8 +478,6 @@ async fn serve_git(
     state: Storage,
     staging: Arc<dyn ObjectStore>,
     bind: std::net::SocketAddr,
-    ledger: sqlx::PgPool,
-    repo: enroute_git_core::RepoId,
 ) -> Result<std::net::SocketAddr> {
     let signing_key = bench_support::hooks::signing_key();
     // Bound before it is served, so the URL both ends sign against is known
@@ -503,35 +486,13 @@ async fn serve_git(
     let endpoint_addr = listener.local_addr()?;
     let endpoint_url = bench_support::hooks::endpoint_url(&format!("http://{endpoint_addr}"));
     bench_support::serve_listener_in_background(
-        hooks::router(
-            repo_name,
-            repo.as_i64(),
-            vec![signing_key.verifying_key()],
-            &endpoint_url,
-        ),
+        hooks::router(repo_name, vec![signing_key.verifying_key()], &endpoint_url),
         listener,
     );
 
-    // Named once the endpoint has an address, since a tenant is what says
-    // where its application answers, and `*` because the bench listens on
-    // loopback under whatever `Host` a client sends.
-    let directory = enroute::tenancy::Directory::from_toml(&format!(
-        "[tenants.bench]\n\
-         hook_endpoint_url = \"{endpoint_url}\"\ndomains = [\"*\"]\n"
-    ))?;
-    let tenants = Arc::new(enroute::tenancy::Tenants::new(directory, ledger));
-    // The repository was minted straight into the engine above, so nothing
-    // claimed it on the way through.
-    let tenant = tenants
-        .by_id("bench")
-        .ok_or_else(|| anyhow::anyhow!("the tenant just named"))?;
-    let key = repo_name
-        .parse()
-        .map_err(|bad| anyhow::anyhow!("the bench repository key: {bad}"))?;
-    tenants.claim(&tenant, repo, &key).await?;
-
     let authorizer = Arc::new(enroute::hooks::Hooks::new(
-        Arc::clone(&tenants),
+        state.clone(),
+        endpoint_url.parse()?,
         signing_key,
         // The stub answers in-process, so this only has to be non-zero.
         std::time::Duration::from_secs(10),

@@ -16,7 +16,7 @@ use anyhow::Result;
 use gix_hash::ObjectId;
 use gix_object::Kind;
 
-use enroute_git_core::oid;
+use enroute_git_core::{ExternalKey, oid};
 
 use crate::{Identity, Raced, RefUpdate, RefUpdateRejection, RepoMetadata, Rows};
 
@@ -27,6 +27,10 @@ use crate::{Identity, Raced, RefUpdate, RefUpdateRejection, RepoMetadata, Rows};
 pub async fn check(rows: &Rows) {
     println!("case: a_created_repository_reads_back");
     a_created_repository_reads_back(rows).await;
+    println!("case: a_prefix_narrows_a_page_to_one_grouping");
+    a_prefix_narrows_a_page_to_one_grouping(rows).await;
+    println!("case: a_key_names_one_live_repository");
+    a_key_names_one_live_repository(rows).await;
     println!("case: a_fresh_repository_offers_head_alone");
     a_fresh_repository_offers_head_alone(rows).await;
     println!("case: each_kind_is_counted_in_a_space_of_its_own");
@@ -75,9 +79,121 @@ fn update(refname: &str, old: ObjectId, new: ObjectId) -> RefUpdate {
     }
 }
 
+/// A key no other case in this run has used.
+///
+/// A store keeps rows for every case and a key names one live repository, so
+/// a fixed one would answer the second case with the first case's repository.
+fn a_key() -> ExternalKey {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ExternalKey::new(format!("conformance-{next}"))
+}
+
 /// A repository with counters, as `create` leaves one.
 async fn repo(rows: &Rows) -> Result<RepoMetadata> {
-    rows.create(None).await
+    rows.create(None, &a_key()).await
+}
+
+/// A prefix reports the keys starting with it and nothing else.
+///
+/// Byte for byte: what a key is grouped under is the caller's convention, so
+/// the separator is part of the prefix rather than something read out here.
+async fn a_prefix_narrows_a_page_to_one_grouping(rows: &Rows) {
+    let group = a_key();
+    // `<group>.one`, `<group>.two`, and the neighbour a prefix without the
+    // separator would sweep in with them.
+    for suffix in [".one", ".two", "x"] {
+        rows.create(None, &ExternalKey::new(format!("{group}{suffix}")))
+            .await
+            .expect("a repository");
+    }
+
+    let under = |prefix: String| async move {
+        let page = rows.page_by_key(&prefix, "", 50).await;
+        let mut keys: Vec<String> = page
+            .expect("a page")
+            .into_iter()
+            .map(|(_, key)| String::from(key))
+            .collect();
+        keys.sort();
+        keys
+    };
+
+    assert_eq!(
+        under(format!("{group}.")).await,
+        [format!("{group}.one"), format!("{group}.two")],
+        "a prefix carrying the separator reported something else"
+    );
+    // Without it the neighbour is in the group, which is why the separator is
+    // the caller's to send.
+    assert_eq!(under(group.to_string()).await.len(), 3);
+    assert!(under(format!("{group}.nothing")).await.is_empty());
+
+    // A page inside a prefix resumes inside it.
+    let first = rows
+        .page_by_key(&format!("{group}."), "", 1)
+        .await
+        .expect("a page");
+    assert_eq!(first.len(), 1, "a page of one");
+    let one = &first[0].1;
+    let rest = rows
+        .page_by_key(&format!("{group}."), one.as_str(), 50)
+        .await
+        .expect("the page after");
+    assert_eq!(rest.len(), 1, "resuming inside a prefix left it");
+}
+
+/// A key names one live repository, and a delete hands it back.
+///
+/// The whole of what the key column is: a repeat is the same create, and the
+/// name is free the moment it is deleted rather than when it is reclaimed.
+async fn a_key_names_one_live_repository(rows: &Rows) {
+    let key = a_key();
+
+    let made = rows
+        .create(Some("refs/heads/trunk"), &key)
+        .await
+        .expect("a repository");
+    let again = rows
+        .create(Some("refs/heads/other"), &key)
+        .await
+        .expect("a repeat of one create");
+
+    assert_eq!(again.id, made.id, "one key made two repositories");
+    assert_eq!(
+        again.default_branch, "refs/heads/trunk",
+        "a repeat moved the default branch"
+    );
+
+    let found = rows.by_key(&key).await.expect("resolving a key");
+    assert_eq!(
+        found.map(|repo| repo.id),
+        Some(made.id),
+        "a key did not resolve to the repository it names"
+    );
+
+    rows.repo(made.id)
+        .mark_deleted()
+        .await
+        .expect("deleting a repository");
+
+    assert!(
+        rows.by_key(&key).await.expect("resolving a key").is_none(),
+        "a deleted repository still answered to its key"
+    );
+
+    let after = rows
+        .create(None, &key)
+        .await
+        .expect("a key freed by a delete");
+    assert_ne!(
+        after.id, made.id,
+        "a key freed by a delete named the deleted repository"
+    );
+    assert_ne!(
+        after.storage_key, made.storage_key,
+        "a reused key is a new repository and gets storage of its own"
+    );
 }
 
 /// `oid`, numbered as a commit, so a branch may point at it.
@@ -117,7 +233,7 @@ async fn a_created_repository_reads_back(rows: &Rows) {
     );
 
     let named = rows
-        .create(Some("refs/heads/trunk"))
+        .create(Some("refs/heads/trunk"), &a_key())
         .await
         .expect("a repository");
     assert_eq!(named.default_branch, "refs/heads/trunk");

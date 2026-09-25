@@ -32,9 +32,6 @@ const INLINE_MAX_LINES: usize = 4;
 /// Word forms whose trailing period ends an abbreviation, not a sentence.
 const ABBREVIATIONS: [&str; 6] = ["e.g", "i.e", "etc", "cf", "vs", "approx"];
 
-/// Paths kept verbatim from a third party, with license headers not ours to shorten.
-const VENDORED: [&str; 4] = ["ubc_check.rs", "scalar.rs", "hw.rs", "simd.rs"];
-
 /// Which marker opened a comment block, since the three answer to different
 /// rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,10 +62,6 @@ enum Para {
 /// A multi-sentence or over-long summary, a body past [`BODY_MAX_LINES`], a
 /// second body paragraph, or an inline run past [`INLINE_MAX_LINES`].
 pub(crate) fn check(source: &str, file: &Path) -> Vec<Violation> {
-    if is_vendored(file) {
-        return Vec::new();
-    }
-
     let violation = |line: usize, message: String| Violation {
         file: file.to_path_buf(),
         line: Some(line),
@@ -368,14 +361,6 @@ fn quote_count(line: &str) -> usize {
         .count()
 }
 
-/// True for a file kept verbatim from a third party.
-fn is_vendored(file: &Path) -> bool {
-    let Some(name) = file.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    file.components().any(|part| part.as_os_str() == "hash") && VENDORED.contains(&name)
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -396,14 +381,14 @@ mod tests {
     #[test]
     fn well_shaped_doc_has_no_violations() {
         let source = "
-/// Resolves a wire repository id to an engine one for the caller's tenant.
+/// Resolves a wire repository key to the engine id it names.
 ///
 /// An application is a customer's own code, so its answer is not taken on
 /// trust.
 ///
 /// # Errors
 ///
-/// Returns `NotFound` when the id is not the tenant's.
+/// Returns `NotFound` when the key names no repository.
 fn resolve() {}
 ";
         assert!(messages(source).is_empty());
@@ -412,7 +397,7 @@ fn resolve() {}
     #[test]
     fn two_sentence_summary_is_reported() {
         let source = "
-/// Resolves an id. It also checks the tenant.
+/// Resolves a key. It also checks the length.
 fn resolve() {}
 ";
         let found = messages(source);
@@ -423,9 +408,9 @@ fn resolve() {}
     #[test]
     fn summary_over_two_lines_is_reported() {
         let source = "
-/// Resolves a wire repository id to an engine one for the caller's tenant,
-/// refusing an id the tenant does not own, because an application is a
-/// customer's own code and its answer is not taken on trust in this path.
+/// Resolves a wire repository key to the engine id it names, refusing a key
+/// no repository holds, because an application is a customer's own code and
+/// its answer is not taken on trust in this path.
 fn resolve() {}
 ";
         let found = messages(source);
@@ -582,27 +567,13 @@ fn resolve() {}
     }
 
     #[test]
-    fn vendored_files_are_skipped() {
-        let source = "
-// A license header that runs
-// well past the inline cap and
-// is not ours to shorten, so it
-// must not be reported at all
-// by this rule.
-";
-        let vendored = Path::new("crates/git/hash/src/ubc_check.rs");
-        assert!(check(source, vendored).is_empty());
-        assert!(!check(source, file()).is_empty());
-    }
-
-    #[test]
     fn abbreviations_do_not_end_a_sentence() {
         assert_eq!(
             sentence_count("Holds a name, e.g. `Foo`, for the caller."),
             1
         );
         assert_eq!(sentence_count("Reads `main.rs` from the root."), 1);
-        assert_eq!(sentence_count("Holds a name. Checks the tenant."), 2);
+        assert_eq!(sentence_count("Holds a name. Checks the length."), 2);
         assert_eq!(sentence_count("Covers RFC 9421 4.2 and nothing else."), 1);
     }
 }

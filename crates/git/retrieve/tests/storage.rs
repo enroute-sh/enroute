@@ -8,8 +8,8 @@
 mod storage {
 
     use enroute_git_core::{
-        COMMIT_PACK_HEADER_SIZE, CommitPackLocation, NewCommit, NewObject, ObjectHashMap,
-        ObjectMeta, PackImageLocation, RepoId, SegmentLocation, oid,
+        COMMIT_PACK_HEADER_SIZE, CommitPackLocation, ExternalKey, NewCommit, NewObject,
+        ObjectHashMap, ObjectMeta, PackImageLocation, RepoId, SegmentLocation, oid,
     };
     use gix_hash::ObjectId;
     use gix_object::Kind;
@@ -115,7 +115,7 @@ mod storage {
     /// Create a fresh repo via `create_repository` itself, so every test
     /// needing a `repo_id` exercises the real creation path too.
     async fn seed_repo(store: &Storage) -> RepoMetadata {
-        let repo = store.rows.create(None).await.unwrap();
+        let repo = enroute_git_test_support::create_repo(store).await;
         seed_placeholder_tree(store, repo.id).await;
         repo
     }
@@ -1463,7 +1463,11 @@ mod storage {
     #[tokio::test]
     async fn a_retired_segment_stays_referenced_until_its_window_passes() {
         let store = test_store!();
-        let repo = store.rows.create(None).await.expect("a repository");
+        let repo = store
+            .rows
+            .create(None, &ExternalKey::new("retrieve-storage-two"))
+            .await
+            .expect("a repository");
         let rows = store.rows.repo(repo.id);
         let id = enroute_git_core::Ulid::generate();
 

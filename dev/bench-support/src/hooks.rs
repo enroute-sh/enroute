@@ -44,7 +44,7 @@ const SIGNING_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\n\
 /// to be threaded through every caller.
 pub const TOKEN: &str = "stub-hook-token";
 
-/// The URL to register a tenant with, for an application served at `public_url`.
+/// The hook endpoint URL of an application served at `public_url`.
 #[must_use]
 pub fn endpoint_url(public_url: &str) -> String {
     format!("{}{ENDPOINT_PATH}", public_url.trim_end_matches('/'))

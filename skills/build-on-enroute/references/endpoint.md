@@ -6,7 +6,7 @@ only the user's application can make.
 | Part           | Value                                  |
 | -------------- | -------------------------------------- |
 | Method         | `POST`                                 |
-| URL            | Whatever was registered for the tenant |
+| URL            | The configured `hooks.endpoint_url`    |
 | `Content-Type` | `application/x-protobuf`               |
 | Request body   | A binary `HookRequest`                 |
 | Response       | `200` with a binary `HookResponse`     |
@@ -99,8 +99,8 @@ Granted { repo: RepoKey, actor: string, context: bytes }
 
 - `repo` is the **key** the application passed to `CreateRepository`. Look the
   path up in the user's table, as the application does to render a page, and
-  answer with that row's id. Enroute resolves the key within the tenant the
-  request arrived for. A key the tenant does not hold is a 404 to the client.
+  answer with that row's id. A key no repository holds is a 404 to the
+  client.
 - `actor` is who is asking, in the user's namespace. Enroute records it on
   spans and on what the request cost, so put an id there. Never a credential,
   and never an email address.

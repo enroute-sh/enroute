@@ -1,7 +1,7 @@
 # Hooks
 
 Hooks let your application make decisions that Enroute cannot make from Git
-data alone. Enroute sends a signed HTTP `POST` to the tenant's configured
+data alone. Enroute sends a signed HTTP `POST` to the configured
 endpoint and waits for the response.
 
 | Hook | Timing | Application decision |
@@ -43,8 +43,8 @@ separately if correctness depends on processing an event.
 ## Request context
 
 `authorize` returns a repository key, actor ID, and optional context. Enroute
-resolves the key within the request tenant, records the actor in traces and
-usage data, and passes the context unchanged to later hooks for that request.
+resolves the key, records the actor in traces and usage data, and passes the
+context unchanged to later hooks for that request.
 It does not parse or log the context.
 
 Large pushes can take minutes between authorization and `pre_receive`. Recheck
@@ -62,5 +62,5 @@ verification procedure.
 ## Ingestion
 
 The server process runs hooks and moves refs. Ingestion stores uploaded
-objects and builds indexes, and can run separately. It does not resolve
-tenants, move refs, or use the hook signing key. See [Storage](storage.md).
+objects and builds indexes, and can run separately. It does not move refs or
+use the hook signing key. See [Storage](storage.md).

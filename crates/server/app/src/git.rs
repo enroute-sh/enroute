@@ -1,9 +1,8 @@
 //! Enroute's git front door: smart HTTP, terminated here.
 //!
 //! The routes and the protocol are `enroute-git-http`'s. What this adds is the
-//! two things the engine has no way to decide — which tenant a request belongs
-//! to, and which repository within it — by handing it an [`Authorizer`] that
-//! resolves the first and asks that tenant's application about the second.
+//! one thing the engine has no way to decide — which repository a request is
+//! for — by handing it an [`Authorizer`] that asks the application.
 //!
 //! [`Authorizer`]: enroute_git_http::Authorizer
 

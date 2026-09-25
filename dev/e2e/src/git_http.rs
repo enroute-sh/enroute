@@ -5,7 +5,11 @@
 
 #[cfg(test)]
 mod fetch {
-    use crate::support::{ALICE, Servers, front_door_for, git, make_isolated_state, spawn_server};
+    use enroute_git_core::ExternalKey;
+
+    use crate::support::{
+        ALICE, Servers, front_door_for, git, key_for, make_isolated_state, spawn_server,
+    };
 
     /// A repository with `commits` commits on one branch, plus the two
     /// servers in front of it.
@@ -16,12 +20,11 @@ mod fetch {
     ) -> (tempfile::TempDir, std::net::SocketAddr, String, Servers) {
         let state = make_isolated_state().await;
         let name = format!("repo-{}", uuid::Uuid::new_v4());
-        let repo = state.rows.create(None).await.unwrap();
+        state.rows.create(None, &key_for(&name)).await.unwrap();
 
         // Seeded through an application front door of its own, because these
         // tests are about the read path rather than about who may reach it.
-        let (legacy, token, _landed, seeding) =
-            spawn_server(state.clone(), &[(&name, repo.id)]).await;
+        let (legacy, token, _landed, seeding) = spawn_server(state.clone(), &[&name]).await;
         let tmp = tempfile::tempdir().unwrap();
         let local = tmp.path().to_path_buf();
         git(&["init", "-b", "main"], Some(&local)).await;
@@ -65,7 +68,11 @@ mod fetch {
     /// Push tests must reach it through git alone, or prove nothing about the write path.
     pub(crate) async fn front_door_only() -> (tempfile::TempDir, std::net::SocketAddr, Servers) {
         let state = make_isolated_state().await;
-        state.rows.create(None).await.unwrap();
+        state
+            .rows
+            .create(None, &ExternalKey::new("git-http-two"))
+            .await
+            .unwrap();
         let (front_door, servers) = front_door_for(state).await;
         (tempfile::tempdir().unwrap(), front_door, servers)
     }

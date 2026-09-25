@@ -104,7 +104,7 @@ MCowBQYDK2VwAyEAJrQLj5P/89iXES9+vFgrIy29clF9CC/oPPsw3c5D0bs=
 -----END PUBLIC KEY-----`,
 );
 
-// Exactly the hook_endpoint_url configured for the tenant.
+// Exactly the hooks.endpoint_url Enroute is configured with.
 const ENDPOINT =
   process.env.ENROUTE_HOOK_URL ??
   "http://host.docker.internal:3000/api/enroute/hooks";
@@ -134,7 +134,7 @@ export async function verifyHook(headers: Headers, body: Uint8Array) {
         maxAge: MAX_SKEW_SECONDS,
         tolerance: MAX_SKEW_SECONDS,
       },
-      // The URL you registered, never the one that arrived.
+      // The URL Enroute is configured with, never the one that arrived.
       { method: "POST", url: ENDPOINT, headers: Object.fromEntries(headers) },
     );
   } catch {
@@ -161,11 +161,11 @@ to be wrong in.
 
 [RFC 9530]: https://www.rfc-editor.org/rfc/rfc9530.html
 
-**Verify against the URL you registered**, not the `Host` header and path that
-arrived. A proxy rewrites those, and Enroute signed the string you configured
-in chapter 1. This is why `url` is passed explicitly rather than taken from the
-request. If the two differ by one byte, every call is a `401` and nothing says
-why.
+**Verify against the URL Enroute is configured with**, not the `Host` header
+and path that arrived. A proxy rewrites those, and Enroute signed the string
+you configured in chapter 1. This is why `url` is passed explicitly rather than
+taken from the request. If the two differ by one byte, every call is a `401`
+and nothing says why.
 
 > **Note:** `@authority` includes a port only when the URL names one. Enroute
 > signs over the configured URL, so `host.docker.internal:3000` carries its
@@ -199,13 +199,13 @@ than guess. Your dev server log shows the request arriving and passing
 verification.
 
 If instead you see a `401` in the log, the signature check failed. The cause is
-almost always that `ENROUTE_HOOK_URL` and `hook_endpoint_url` disagree.
+almost always that `ENROUTE_HOOK_URL` and `hooks.endpoint_url` disagree.
 
 ## Result
 
 - One route that receives every hook.
 - A verifier that proves a request came from Enroute, checked against the URL
-  you registered rather than the one that arrived.
+  you configured rather than the one that arrived.
 
 Next: [Authenticate Git clients](04-authenticate-git-clients.md), where the clone starts
 working.

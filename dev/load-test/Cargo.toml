@@ -13,9 +13,9 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+enroute-git-metadata.workspace = true
 enroute-postgres.workspace = true
 enroute-signature.workspace = true
-enroute-git-core.workspace = true
 enroute-git-ingest.workspace = true
 enroute-git-http.workspace = true
 enroute = { path = "../../crates/server/app" }

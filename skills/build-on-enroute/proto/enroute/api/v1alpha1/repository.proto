@@ -75,6 +75,9 @@ message ListRepositoriesRequest {
   // Resume from a `ListRepositoriesResponse.next_page_token`. Empty starts at
   // the first key.
   string page_token = 2;
+  // Report only keys starting with this, byte for byte. Empty reports all of
+  // them. Made of a key's characters, but need not end as a key does.
+  string prefix = 3;
 }
 
 message ListRepositoriesResponse {

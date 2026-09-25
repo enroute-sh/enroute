@@ -13,6 +13,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+enroute-git-metadata.workspace = true
 enroute-postgres.workspace = true
 enroute-git-cost.workspace = true
 enroute-git-ingest.workspace = true

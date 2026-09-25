@@ -13,12 +13,13 @@ use enroute_postgres::schema;
 use enroute_postgres::test_database_url;
 
 /// Every step of the real list, as an operator reads them.
-const EVERY_STEP: [&str; 5] = [
+const EVERY_STEP: [&str; 6] = [
     "0001_engine_rows",
     "0002_commit_graph_catalogs",
     "0003_object_index_catalogs",
     "0004_tenancy",
     "0005_repository_keys",
+    "0006_key_on_the_repository",
 ];
 
 /// One dedicated connection in its own `pg_temp`.

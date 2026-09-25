@@ -10,7 +10,7 @@ an endpoint.
 
 | Page | Covers |
 | --- | --- |
-| [Data model](model.md) | Repository keys, refs, objects, and tenants |
+| [Data model](model.md) | Repository keys, refs, and objects |
 | [Clients and interfaces](two-callers.md) | Git, gRPC, hooks, and network boundaries |
 | [Hooks](hooks.md) | Application policy decisions and hook limits |
 | [Storage](storage.md) | Object storage, Postgres, indexes, and ingestion |

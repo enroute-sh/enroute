@@ -33,43 +33,29 @@ process that can inspect Enroute's environment can read them.
 
 Unknown keys are rejected. Configure exactly one ingestion table
 (`ingest.local` or `ingest.lambda`) and exactly one maintenance runner table
-(`maintenance.run.in-process` or `maintenance.run.off`). A main-file change
-requires a restart.
+(`maintenance.run.in-process` or `maintenance.run.off`). Configuration is read
+once, so any change requires a restart.
 
-The tenant file is the exception: Enroute reloads it while running.
+## Your application
 
-## Tenants
-
-`tenants.uri` points to a second TOML file:
+A deployment serves one application:
 
 ```toml
-[tenants.acme]
-hook_endpoint_url = "https://acme.example.com/api/enroute/hooks"
-domains = ["acme.enroute.sh", "git.acme.com", "*.acme.com"]
+[hooks]
+endpoint_url = "https://acme.example.com/api/enroute/hooks"
+signing_key = "${ENROUTE_HOOK_SIGNING_KEY}"
 ```
 
-The table name is the tenant ID: 1–64 lowercase letters, digits, `-`, or `_`.
-It is permanent because repositories are owned by that ID. Use an opaque ID,
-not a mutable display name.
+`endpoint_url` is the exact URL Enroute signs and sends every hook to. It is
+validated at startup, so a URL that will not parse stops the process rather
+than failing the first Git request.
 
-`hook_endpoint_url` is the exact URL Enroute signs for hook requests.
-`domains` maps Git hostnames to a tenant. Exact domains win over wildcards;
-among wildcard suffixes, the longest match wins. `*` is a fallback and may be
-claimed by only one tenant. An unclaimed hostname returns 404.
+Enroute reads nothing from the Git request's `Host` header. Every hostname that
+reaches `listen.git` is served by this one application, which decides in
+`authorize` whether the path it was given names a repository.
 
-The tenant file does not authenticate API clients. Authenticate them before
-the API listener; see [Security](security.md).
-
-### Refresh behavior
-
-Enroute checks for tenant-file changes every `tenants.refresh_secs` (30 seconds
-by default). The interval is also the maximum revocation delay. If a reload
-fails, Enroute retains the last valid tenant list and logs an error. The first
-load must succeed. The file limit is 1 MiB.
-
-Write a replacement beside the current file and rename it into place. In
-Docker, mount the containing directory rather than the file so the container
-can observe the replacement inode.
+This does not authenticate API clients. Nothing does; see
+[Security](security.md).
 
 ## Schema and maintenance tools
 
@@ -89,15 +75,30 @@ database until you run `enroute-schema`. Migrations use the connection's
 
 ## Lambda ingestion
 
-The ingest function receives `bucket.uri` and `ingest.lambda.handoff.uri` in
-its invocation, not the configuration file. It reads credentials from Secrets
-Manager so they are not retained in invocation payloads.
+The ingest function receives `bucket.uri`, `ingest.lambda.handoff.uri`, the
+credentials for both, `database.url` with its connection cap, and where to
+export spans — all in its invocation, not a configuration file. It reads no
+configuration of its own, so one function can serve deployments whose
+databases and buckets have nothing in common. The only variables it reads are
+the ones Lambda sets for every function, and `RUST_LOG`.
 
-| Variable | Purpose |
-| --- | --- |
-| `ENROUTE_SECRET_ID` | Secrets Manager secret |
-| `DATABASE_MAX_CONNECTIONS` | Per-invocation connection limit |
-| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | OTLP traces endpoint; unset disables export |
+Say where the function takes each bucket's credentials from:
+`ingest.lambda.objects_credentials` for `bucket` and `.handoff_credentials`
+for the handoff bucket. `sent` carries that bucket's credentials on every call,
+and the function reaches it with those and nothing else. `environment` leaves
+the function to reach it as itself, using the role it runs under.
 
-The secret contains `DATABASE_URL`, `STORAGE_ACCESS_KEY_ID`,
-`STORAGE_SECRET_ACCESS_KEY`, and `OTEL_EXPORTER_OTLP_HEADERS`.
+A deployment has a function to itself by default, and that function serves
+nobody else. To share one between deployments, create it in tenant isolation
+mode and give each deployment an `ingest.lambda.tenant` of its own. Lambda
+keeps an execution environment to the one tenant it first served, so no two
+deployments share a `/tmp` or a connection pool. Set the mode when you create
+the function: it cannot be turned on later, and Lambda refuses a tenant id for
+a function without it.
+
+A shared function runs under one role, which every deployment on it reaches a
+bucket as. Use `environment` there only for a bucket the function's operator
+holds for all of them, and `sent` for a bucket that belongs to one deployment.
+
+It holds no credentials, so it needs no secret and no storage permissions.
+Give its execution role only what Lambda requires to run and to write logs.

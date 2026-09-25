@@ -24,28 +24,21 @@
 # the schema, and the ledger saying which steps had run. No configuration is
 # in the volume — that is the mount.
 #
-# The tenants are `dev/config/tenants.toml`. Enroute
-# re-reads it every couple of seconds, so pointing it at your application, or
-# adding a second tenant, is an edit to that file and not a restart:
+# Where your application answers is `hooks.endpoint_url` in
+# `dev/config/enroute.toml`. That file is read once, so pointing it somewhere
+# else is an edit and a restart:
 #
-#     $EDITOR dev/config/tenants.toml       # hook_endpoint_url is yours
+#     $EDITOR dev/config/enroute.toml       # hooks.endpoint_url is yours
+#     docker compose restart enroute
 #
-# The contract authenticates nobody. A call names its tenant in a header, and
-# this stack puts nothing in front of the listener that would set it:
+# The contract authenticates nobody, and this stack puts nothing in front of
+# the listener. That is a laptop, not a deployment: anything that can reach
+# 50051 is the application. A real one keeps the port unreachable except by the
+# application — see docs/operate/security.md.
 #
-#     x-enroute-tenant: dev
-#
-# That is a laptop, not a deployment: anything that can reach 50051 is that
-# tenant. A real one puts a proxy in front which authenticates the caller and
-# sets the header — see docs/operate/security.md.
-#
-# There is no application in this stack, because an application is a customer's
-# own service. It does not have to answer yet: Enroute calls it when a git
-# request arrives and not before, so until then the contract is the whole of
-# what works.
-#
-# A tenants file that will not load is refused rather than served, and the
-# server logs that at ERROR and keeps serving what it already read.
+# There is no application in this stack, because an application is your own
+# service. It does not have to answer yet: Enroute calls it when a git request
+# arrives and not before, so until then the contract is the whole of what works.
 #
 # Git is published on 8080 and the contract on 50051, so both a git client and
 # an application on the host reach them the way anything else would.
@@ -88,9 +81,9 @@ services:
       - "50051:50051"
     volumes:
       - enroute-objects:/data
-      # The directory, never the file. A bind mount of one file is a bind
-      # mount of one inode, and replacing a tenants file means renaming over
-      # it — which would leave the container reading the old one forever.
+      # The directory, never the file. A bind mount of one file is a bind mount
+      # of one inode, so an editor that writes by renaming over the file would
+      # leave the container reading the old one forever.
       - ./dev/config:/etc/enroute:ro
     # The application runs outside this stack, and on Linux the host is not
     # otherwise nameable from inside a container.

@@ -158,7 +158,7 @@ fn obj(oid: ObjectId, kind: Kind, pack: ObjectId) -> NewObject {
 /// Create a fresh repo, with the placeholder tree every `nc()` commit's
 /// `root_tree_seq` resolves through.
 async fn seed_repo(store: &Storage) -> RepoMetadata {
-    let repo = store.rows.create(None).await.unwrap();
+    let repo = create_repo(store).await;
     append_to(
         store,
         repo.id,

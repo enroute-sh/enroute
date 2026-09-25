@@ -67,7 +67,7 @@ blueprint under its own prefix in Express, FastAPI, or Flask; a route outside
 the resource routes in Rails or Phoenix. `/enroute/hooks` is wrong, because a
 repository named `enroute` takes it.
 
-Phase 2 registers the URL before the endpoint exists. Choose it now, write it
+Phase 2 configures the URL before the endpoint exists. Choose it now, write it
 down, and serve the route there in phase 4.
 
 Then check the tools:
@@ -85,12 +85,12 @@ Read `references/local-stack.md` and follow it. The stack runs the published
 image, so nothing is cloned and nothing compiles. It starts in about a minute.
 
 Copy the `stack/` directory beside this file to where the user wants it, put
-the endpoint URL into the tenant file, and start it:
+the endpoint URL into the configuration, and start it:
 
 ```sh
 cp -R <this skill>/stack enroute-stack
 cd enroute-stack
-$EDITOR config/tenants.toml    # hook_endpoint_url is the user's
+$EDITOR config/enroute.toml    # hooks.endpoint_url is the user's
 docker compose up -d
 ```
 
@@ -107,20 +107,15 @@ These values are fixed. None of them is a secret:
 | --------------- | -------------------------------------------------------- |
 | Git             | `http://127.0.0.1:8080`                                  |
 | Contract (gRPC) | `127.0.0.1:50051`, plaintext HTTP/2                      |
-| Contract tenant | `x-enroute-tenant: dev`                                  |
 | Signing key     | RFC 9421's `test-key-ed25519`, in `config/enroute.toml`  |
 
-The contract authenticates nobody. A call names its tenant in a header, and
-this stack puts nothing in front of the listener to set it, so the caller sends
-it:
+The contract authenticates nobody, and needs no header. This stack puts nothing
+in front of the listener, so anything that can reach 50051 can read, write and
+delete every repository.
 
-```
-x-enroute-tenant: dev
-```
-
-That is correct on a laptop and wrong in a deployment. A deployment puts a
-proxy in front that authenticates the caller and sets the header. Tell the user
-this, so they do not ship the local shape.
+That is correct on a laptop and wrong in a deployment, where the port must be
+reachable only by the user's application. Tell the user this, so they do not
+ship the local shape.
 
 **Checkpoint.** The containers are up, and `docker compose logs enroute` shows
 a start line with a `keyid`. Do not continue until it does.
@@ -149,8 +144,8 @@ the skill, and the contract of a project must not move when that happens.
 
 Then generate a client and write the smallest program that:
 
-1. Calls `RepositoryService.CreateRepository` with `x-enroute-tenant: dev`,
-   with a key of the user's own choosing.
+1. Calls `RepositoryService.CreateRepository` with a key of the user's own
+   choosing.
 2. Prints the key the answer carries.
 
 Use a key the application already has for a repository: a row id, a UUID, a
@@ -162,8 +157,8 @@ the same key: it answers with the same repository and makes nothing new. Then
 check the generated code holds `HookRequest` and `HookResponse`. A codegen run
 that skipped `hook.proto` fails here, not two phases later.
 
-Stop here if the key does not come back. That key proves the contract, the
-tenant, and the database all work. After it, every failure is in the user's
+Stop here if the key does not come back. That key proves the contract and the
+database both work. After it, every failure is in the user's
 code, not the stack.
 
 No endpoint answers yet, so git has nothing to ask and a clone fails. The git
@@ -182,8 +177,8 @@ handle each one on purpose:
 - **Read the raw body bytes.** The signature covers exactly what arrived. A
   framework that parses or re-serializes the body first breaks every call.
   `references/endpoint.md` names the call to use for each framework.
-- **Verify against the URL you registered**, not the arriving `Host` header
-  and path. A proxy rewrites those.
+- **Verify against the URL Enroute is configured with**, not the arriving
+  `Host` header and path. A proxy rewrites those.
 - **Answer the call that was asked.** An empty answer makes Enroute refuse the
   git request. That is deliberate: it means "not implemented", not "allow".
 - **Deny with `200`.** A refusal is a field in the answer. A non-200 is a
@@ -204,9 +199,9 @@ passes every test in phase 5 and is useless in production.
 The stack already names the user's endpoint, from phase 2. Start the endpoint
 and go to the checkpoint.
 
-If the endpoint ended up on a different URL, edit `hook_endpoint_url` in
-`config/tenants.toml` in the copied stack. Enroute reads it again within two
-seconds. No restart, no reset.
+If the endpoint ended up on a different URL, edit `hooks.endpoint_url` in
+`config/enroute.toml` in the copied stack, then `docker compose restart
+enroute`. Configuration is read once, at startup.
 
 Enroute signs over that exact authority and path. If it differs by one byte
 from what the endpoint verifies against, every call is a `401` with no reason

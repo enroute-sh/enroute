@@ -18,7 +18,9 @@ use anyhow::{Result, anyhow};
 use gix_hash::ObjectId;
 use gix_object::Kind;
 
-use enroute_git_core::{ObjectHashMap, RepoId, StorageKey, Ulid, is_funny_refname, kind_to_u8};
+use enroute_git_core::{
+    ExternalKey, ObjectHashMap, RepoId, StorageKey, Ulid, is_funny_refname, kind_to_u8,
+};
 
 use crate::store::{Identity, Raced};
 use crate::{
@@ -62,6 +64,10 @@ struct Ref {
 #[derive(Debug, Default)]
 struct Repo {
     storage_key: Option<StorageKey>,
+    /// What the caller calls it, compared and never read.
+    ///
+    /// Absent until `create` names it, as the storage key above is.
+    key: Option<ExternalKey>,
     default_branch: String,
     deleted_at: Option<i64>,
     /// Next seq per kind, by the number the kind column holds.
@@ -112,6 +118,17 @@ struct State {
 }
 
 impl State {
+    /// The live repository called `key`.
+    ///
+    /// Live means not deleted, which is what the other store's unique index
+    /// is: a deleted repository keeps its name and nothing resolves to it.
+    fn live_with_key(&self, key: &ExternalKey) -> Option<RepoMetadata> {
+        self.repos
+            .iter()
+            .find(|(_, repo)| repo.deleted_at.is_none() && repo.key.as_ref() == Some(key))
+            .and_then(|(id, repo)| repo.meta(*id))
+    }
+
     /// One repository's rows, created empty if this is the first mention.
     ///
     /// Absent and empty answer every question here alike, which is what the
@@ -165,8 +182,7 @@ impl Memory {
     /// When its default branch last moved.
     fn last_push(&self, repo: &RepoMetadata) -> Option<i64> {
         let state = self.locked();
-        let held = state.held(repo.id)?;
-        Some(secs(held.branches.get(&repo.default_branch)?.updated))
+        last_push_of(state.held(repo.id)?)
     }
 
     /// Keeps these pack images alive against the sweep.
@@ -209,10 +225,24 @@ impl Memory {
     }
 }
 
+/// When `repo`'s default branch last moved, for a caller already holding the
+/// lock that [`Memory::last_push`] takes.
+fn last_push_of(repo: &Repo) -> Option<i64> {
+    Some(secs(repo.branches.get(&repo.default_branch)?.updated))
+}
+
 #[async_trait::async_trait]
 impl crate::metadata::Metadata for Memory {
-    async fn create(&self, default_branch: Option<&str>) -> Result<RepoMetadata> {
+    async fn create(
+        &self,
+        default_branch: Option<&str>,
+        key: &ExternalKey,
+    ) -> Result<RepoMetadata> {
         let mut state = self.locked();
+        if let Some(held) = state.live_with_key(key) {
+            return Ok(held);
+        }
+
         state.next_id += 1;
         let id = RepoId::new(state.next_id);
         let meta = RepoMetadata {
@@ -222,6 +252,7 @@ impl crate::metadata::Metadata for Memory {
         };
         let repo = state.repo(id);
         repo.storage_key = Some(meta.storage_key);
+        repo.key = Some(key.clone());
         repo.default_branch.clone_from(&meta.default_branch);
         counters(repo);
         Ok(meta)
@@ -338,6 +369,51 @@ impl crate::metadata::Metadata for Memory {
             .collect();
         found.sort_by_key(|summary| summary.repo.id.as_i64());
         Ok(found)
+    }
+
+    async fn by_key(&self, key: &ExternalKey) -> Result<Option<RepoMetadata>> {
+        Ok(self.locked().live_with_key(key))
+    }
+
+    async fn key_of(&self, repo: RepoId) -> Result<Option<ExternalKey>> {
+        let state = self.locked();
+        Ok(state
+            .repos
+            .get(&repo)
+            .filter(|held| held.deleted_at.is_none())
+            .and_then(|held| held.key.clone()))
+    }
+
+    async fn page_by_key(
+        &self,
+        prefix: &str,
+        after: &str,
+        limit: u32,
+    ) -> Result<Vec<(RepoSummary, ExternalKey)>> {
+        let state = self.locked();
+        let mut page: Vec<(RepoSummary, ExternalKey)> = state
+            .repos
+            .iter()
+            .filter(|(_, repo)| repo.deleted_at.is_none())
+            .filter_map(|(id, repo)| {
+                let key = repo.key.clone()?;
+                if key.as_str() <= after || !key.as_str().starts_with(prefix) {
+                    return None;
+                }
+                let meta = repo.meta(*id)?;
+                let last_push_unix_seconds = last_push_of(repo);
+                Some((
+                    RepoSummary {
+                        repo: meta,
+                        last_push_unix_seconds,
+                    },
+                    key,
+                ))
+            })
+            .collect();
+        page.sort_by(|(_, one), (_, two)| one.cmp(two));
+        page.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        Ok(page)
     }
 
     async fn mark_deleted(&self, repo: RepoId) -> Result<bool> {

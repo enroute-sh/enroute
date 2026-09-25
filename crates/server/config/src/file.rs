@@ -8,7 +8,6 @@
 //! did nothing. Read once, at startup, because what is here decides what gets
 //! *built* — a store, a listener, a worker — and rebuilding those under live
 //! requests is what a restart is for. The one thing that does change while the
-//! process runs is named here and read from elsewhere: [`Tenants::uri`]. A
 //! credential is *named* here and need not be held here — a [`Secret`] is
 //! usually a `${VAR}` — so the file stays something to commit, diff and roll
 //! back, and nothing that holds one will print it.
@@ -21,7 +20,7 @@ use anyhow::{Context as _, Result};
 use serde::Deserialize;
 
 use crate::expand;
-use crate::{Bucket, ObjectUri, ScratchUri, Secret, read_capped};
+use crate::{Bucket, CredentialSource, ObjectUri, ScratchUri, Secret, read_capped};
 
 /// A deployment, as its file names it.
 #[derive(Debug, Clone, Deserialize)]
@@ -29,8 +28,6 @@ use crate::{Bucket, ObjectUri, ScratchUri, Secret, read_capped};
 pub struct Config {
     /// Where a repository's permanent objects live.
     pub bucket: Bucket,
-    /// Who this serves, and how a call names one of them.
-    pub tenants: Tenants,
     /// Where a push's work runs.
     ///
     /// No default: both answers need values of their own, so there is no
@@ -126,33 +123,6 @@ pub struct Listen {
     pub git: SocketAddr,
 }
 
-/// Who this serves, and how a contract call names one of them.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Tenants {
-    /// Where the tenants are named, as a URL down to the object.
-    ///
-    /// Named here and read from there, because this file is read once and
-    /// that list is re-read: a tenant is added without a restart.
-    #[serde(deserialize_with = "expand::parsed::deserialize")]
-    pub uri: ObjectUri,
-    /// How often that list is read again.
-    ///
-    /// A tenant taken out of it keeps serving for up to this long, so this is
-    /// the revocation window.
-    #[serde(default = "Tenants::refresh")]
-    pub refresh_secs: NonZeroU64,
-    /// The header naming which tenant a contract call is for.
-    ///
-    /// Whatever can set it is every tenant, so the contract listener must not
-    /// be reachable except through whatever does — see docs/operate/security.md.
-    #[serde(
-        default = "Tenants::header",
-        deserialize_with = "expand::parsed::deserialize"
-    )]
-    pub header: http::HeaderName,
-}
-
 /// Postgres, and what connects to it.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -191,6 +161,12 @@ pub enum Migrate {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Hooks {
+    /// Where the application answers.
+    ///
+    /// Parsed here, so the hook path neither re-parses it per call nor carries
+    /// an error for something startup already proved.
+    #[serde(deserialize_with = "expand::parsed::deserialize")]
+    pub endpoint_url: url::Url,
     /// The Ed25519 private key, in PEM, that every call is signed with.
     ///
     /// Enroute holds this half and an application holds only the public one,
@@ -213,8 +189,7 @@ pub struct Hooks {
 pub enum Ingest {
     /// In this process, against this process's stores.
     Local(Local),
-    /// In the ingest Lambda, which holds no signing key and resolves no
-    /// tenant.
+    /// In the ingest Lambda, which holds no signing key and calls no hooks.
     Lambda(Lambda),
 }
 
@@ -234,6 +209,12 @@ pub struct Local {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Lambda {
+    /// What this deployment is called where it shares a function.
+    ///
+    /// Unset for a function this deployment has to itself, which is already
+    /// nobody else's; set it only on one created in tenant isolation mode.
+    #[serde(default, deserialize_with = "expand::optional::deserialize")]
+    pub tenant: Option<String>,
     /// The function's name or ARN.
     #[serde(deserialize_with = "expand::string::deserialize")]
     pub function: String,
@@ -245,6 +226,20 @@ pub struct Lambda {
     /// Its own credentials, not the objects bucket's: the two are routinely
     /// different providers.
     pub handoff: Bucket,
+    /// Most connections one of its pushes may hold at once.
+    ///
+    /// Not `database.max_connections`, which caps this server's concurrent
+    /// pushes: one invocation runs one push, whose fan-out is what this caps.
+    pub database_max_connections: NonZeroU32,
+    /// Where the function takes `bucket`'s credentials from.
+    ///
+    /// Every deployment on a shared function reaches an `environment` bucket
+    /// as that function, so its owner must hold the bucket for all of them.
+    pub objects_credentials: CredentialSource,
+    /// Where the function takes `handoff`'s credentials from.
+    ///
+    /// Its own answer, the two being routinely different providers.
+    pub handoff_credentials: CredentialSource,
     /// The largest pack this will hand the function.
     pub max_pack_bytes: NonZeroU64,
     /// A published version to pin the code a deploy rolls forward to.
@@ -355,10 +350,38 @@ impl Config {
     ///
     /// Returns an error if the file does not parse, or if a value it names is
     /// not one of the thing it names.
-    pub fn from_toml(toml: &str) -> Result<Self> {
+    pub(crate) fn from_toml(toml: &str) -> Result<Self> {
         // No context of its own: the caller knows where the bytes came from,
         // and "the configuration" twice in one chain says nothing twice.
-        Ok(toml::from_str(toml)?)
+        let config: Self = toml::from_str(toml)?;
+        config.check()?;
+        Ok(config)
+    }
+
+    /// What no field can say on its own.
+    fn check(&self) -> Result<()> {
+        let Ingest::Lambda(lambda) = &self.ingest else {
+            return Ok(());
+        };
+        for (named, source, bucket) in [
+            (
+                "objects_credentials",
+                lambda.objects_credentials,
+                &self.bucket,
+            ),
+            (
+                "handoff_credentials",
+                lambda.handoff_credentials,
+                &lambda.handoff,
+            ),
+        ] {
+            anyhow::ensure!(
+                source != CredentialSource::Sent || !bucket.credentials.is_empty(),
+                "ingest.lambda.{named} is \"sent\", so that bucket needs \
+                 credentials of its own to send"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -428,18 +451,6 @@ impl Default for Listen {
     }
 }
 
-impl Tenants {
-    /// Thirty seconds, the revocation window a deployment gets unless it asks
-    /// for another.
-    fn refresh() -> NonZeroU64 {
-        NonZeroU64::MIN.saturating_add(29)
-    }
-
-    fn header() -> http::HeaderName {
-        http::HeaderName::from_static("x-enroute-tenant")
-    }
-}
-
 impl Hooks {
     /// Ten seconds, which a cold serverless start fits inside.
     fn timeout() -> NonZeroU64 {
@@ -497,8 +508,6 @@ mod tests {
     fn minimal() -> String {
         format!(
             "bucket.uri = \"s3://objects\"\n\
-             [tenants]\n\
-             uri = \"file:///etc/enroute/tenants.toml\"\n\
              [ingest.local]\n\
              scratch = \"file:///data/scratch\"\n\
              {REQUIRED}"
@@ -508,7 +517,8 @@ mod tests {
     /// The two tables every fixture needs, since both are required and
     /// neither is what the test is about.
     const REQUIRED: &str = "[database]\nurl = \"postgres://enroute@localhost/enroute\"\n\
-                            [hooks]\nsigning_key = \"pem\"\n";
+                            [hooks]\nsigning_key = \"pem\"\n\
+                            endpoint_url = \"https://app.example/hooks\"\n";
 
     /// The whole chain: the outer context alone says only "the
     /// configuration", which is not what any of these assert on.
@@ -531,8 +541,6 @@ mod tests {
         assert_eq!(config.database.max_connections.get(), 10);
         assert_eq!(config.hooks.timeout_secs.get(), 10);
         assert!(config.telemetry.is_none());
-        assert_eq!(config.tenants.refresh_secs.get(), 30);
-        assert_eq!(config.tenants.header.as_str(), "x-enroute-tenant");
         assert!(!config.sync.allow_private_remotes);
         assert_eq!(config.maintenance.grace_secs, 6 * 60 * 60);
         assert_eq!(config.maintenance.deleted_grace_secs, 24 * 60 * 60);
@@ -548,9 +556,10 @@ mod tests {
     fn a_lambda_ingest_missing_a_value_it_needs_is_refused() {
         let error = refused(
             "bucket.uri = \"s3://objects\"\n\
-             [tenants]\nuri = \"file:///tenants.toml\"\n\
              [ingest.lambda]\nfunction = \"ingest\"\n\
-             handoff.uri = \"s3://handoff\"\nmax_pack_bytes = 1024\n",
+             handoff.uri = \"s3://handoff\"\nmax_pack_bytes = 1024\n\
+             database_max_connections = 8\nobjects_credentials = \"sent\"\n\
+             handoff_credentials = \"sent\"\n",
         );
         assert!(error.contains("region"), "{error}");
     }
@@ -563,7 +572,6 @@ mod tests {
     fn a_value_belonging_to_the_other_ingest_is_refused() {
         let error = refused(
             "bucket.uri = \"s3://objects\"\n\
-             [tenants]\nuri = \"file:///tenants.toml\"\n\
              [ingest.local]\nscratch = \"file:///scratch\"\n\
              region = \"eu-central-1\"\n",
         );
@@ -627,20 +635,9 @@ mod tests {
     fn a_scratch_that_a_second_process_could_reach_is_refused() {
         let error = refused(
             "bucket.uri = \"s3://objects\"\n\
-             [tenants]\nuri = \"file:///tenants.toml\"\n\
              [ingest.local]\nscratch = \"s3://shared\"\n",
         );
         assert!(error.contains("one process must own it alone"), "{error}");
-    }
-
-    #[test]
-    fn a_tenants_uri_naming_no_object_is_refused() {
-        let error = refused(
-            "bucket.uri = \"s3://objects\"\n\
-             [tenants]\nuri = \"s3://config\"\n\
-             [ingest.local]\nscratch = \"file:///scratch\"\n",
-        );
-        assert!(error.contains("no object in it"), "{error}");
     }
 
     /// The commented example loads, and says what its comments say it says.
@@ -662,7 +659,7 @@ mod tests {
         let config = Config::from_toml(&filled).expect("dev/enroute.example.toml");
 
         assert!(matches!(config.ingest, Ingest::Local(_)));
-        assert_eq!(config.tenants.refresh_secs.get(), 30);
+        assert_eq!(config.hooks.timeout_secs.get(), 10);
     }
 
     /// The one the local stack runs, checked the same way — a stack that will
@@ -672,8 +669,14 @@ mod tests {
         let local = include_str!("../../../../dev/config/enroute.toml");
         let config = Config::from_toml(local).expect("dev/config/enroute.toml");
 
-        // The two the file overrides, and the defaults it leaves alone.
-        assert_eq!(config.tenants.refresh_secs.get(), 2);
+        // The ones the file overrides, and the defaults it leaves alone.
+        assert!(
+            config
+                .hooks
+                .endpoint_url
+                .as_str()
+                .contains("host.docker.internal")
+        );
         assert!(matches!(config.ingest, Ingest::Local(_)));
         assert_eq!(config.listen.git.port(), 8080);
         assert!(!config.sync.allow_private_remotes);
@@ -685,10 +688,10 @@ mod tests {
     fn a_configs_own_debug_prints_no_secret_it_holds() {
         let toml = "bucket.uri = \"s3://objects\"\n\
              [bucket.credentials]\nsecret_access_key = \"hunter2\"\n\
-             [tenants]\nuri = \"file:///tenants.toml\"\n\
              [ingest.local]\nscratch = \"file:///scratch\"\n\
              [database]\nurl = \"postgres://enroute:hunter2@host/enroute\"\n\
-             [hooks]\nsigning_key = \"hunter2-as-a-pem\"\n";
+             [hooks]\nsigning_key = \"hunter2-as-a-pem\"\n\
+             endpoint_url = \"https://app.example/hooks\"\n";
         let config = Config::from_toml(toml).expect("a config holding secrets");
 
         for printed in [format!("{config:?}"), format!("{config:#?}")] {
@@ -752,11 +755,14 @@ mod tests {
     fn a_string_field_expands() {
         let path = std::env::var("PATH").expect("PATH is set wherever tests run");
         let config = Config::from_toml(&whole(
-            "bucket.uri = \"memory:///\"\n\
-             [tenants]\nuri = \"file:///tenants.toml\"\n\
-             [ingest.lambda]\nfunction = \"ingest-${PATH}\"\n\
+            "bucket.uri = \"s3://objects\"\n\
+             bucket.credentials.access_key_id = \"k\"\n\
+             [ingest.lambda]\ntenant = \"acme\"\n\
+             function = \"ingest-${PATH}\"\n\
              region = \"eu-central-1\"\nhandoff.uri = \"s3://handoff\"\n\
-             max_pack_bytes = 1024\n",
+             handoff.credentials.access_key_id = \"k\"\n\
+             max_pack_bytes = 1024\ndatabase_max_connections = 8\n\
+             objects_credentials = \"sent\"\nhandoff_credentials = \"sent\"\n",
         ))
         .expect("a config naming PATH");
 
@@ -764,6 +770,82 @@ mod tests {
             panic!("a lambda ingest");
         };
         assert_eq!(lambda.function, format!("ingest-{path}"));
+        assert_eq!(lambda.tenant.as_deref(), Some("acme"));
+        assert_eq!(lambda.objects_credentials, CredentialSource::Sent);
+    }
+
+    /// The cap answers to the database, so there is no default to fall back
+    /// on: a pool sized for the wrong server is worse than a refusal.
+    #[test]
+    fn a_lambda_ingest_needs_a_connection_cap() {
+        let error = refused(
+            "bucket.uri = \"s3://objects\"\n\
+             [ingest.lambda]\nfunction = \"ingest\"\n\
+             region = \"eu-central-1\"\nhandoff.uri = \"s3://handoff\"\n\
+             max_pack_bytes = 1024\n",
+        );
+
+        assert!(error.contains("database_max_connections"), "{error}");
+    }
+
+    /// A deployment with a function to itself names no tenant.
+    ///
+    /// Lambda refuses a tenant id for a function it has not isolated, so the
+    /// key is for a function several deployments share.
+    #[test]
+    fn a_lambda_ingest_needs_no_tenant() {
+        let config = Config::from_toml(&whole(
+            "bucket.uri = \"s3://objects\"\n\
+             bucket.credentials.access_key_id = \"k\"\n\
+             [ingest.lambda]\nfunction = \"ingest\"\n\
+             region = \"eu-central-1\"\nhandoff.uri = \"s3://handoff\"\n\
+             max_pack_bytes = 1024\ndatabase_max_connections = 8\n\
+             objects_credentials = \"sent\"\nhandoff_credentials = \"environment\"\n",
+        ))
+        .expect("a config naming no tenant");
+
+        let Ingest::Lambda(lambda) = config.ingest else {
+            panic!("a lambda ingest");
+        };
+        assert_eq!(lambda.tenant, None);
+        assert_eq!(lambda.handoff_credentials, CredentialSource::Environment);
+    }
+
+    /// `sent` names credentials, so a bucket without any cannot be sent.
+    #[test]
+    fn a_sent_bucket_needs_credentials_to_send() {
+        let error = refused(
+            "bucket.uri = \"s3://objects\"\n\
+             [ingest.lambda]\nfunction = \"ingest\"\n\
+             region = \"eu-central-1\"\nhandoff.uri = \"s3://handoff\"\n\
+             max_pack_bytes = 1024\ndatabase_max_connections = 8\n\
+             objects_credentials = \"sent\"\n\
+             handoff_credentials = \"environment\"\n",
+        );
+
+        assert!(error.contains("objects_credentials"), "{error}");
+    }
+
+    /// A hosted deployment names a tenant on a function whose environment
+    /// reaches a bucket its operator holds for every deployment on it.
+    #[test]
+    fn a_shared_function_may_reach_a_bucket_as_itself() {
+        let config = Config::from_toml(&whole(
+            "bucket.uri = \"s3://objects\"\n\
+             bucket.credentials.access_key_id = \"k\"\n\
+             [ingest.lambda]\ntenant = \"acme\"\nfunction = \"ingest\"\n\
+             region = \"eu-central-1\"\nhandoff.uri = \"s3://handoff\"\n\
+             max_pack_bytes = 1024\ndatabase_max_connections = 8\n\
+             objects_credentials = \"sent\"\n\
+             handoff_credentials = \"environment\"\n",
+        ))
+        .expect("a config naming a tenant and an environment credential");
+
+        let Ingest::Lambda(lambda) = config.ingest else {
+            panic!("a lambda ingest");
+        };
+        assert_eq!(lambda.tenant.as_deref(), Some("acme"));
+        assert_eq!(lambda.handoff_credentials, CredentialSource::Environment);
     }
 
     /// So does a value the schema turns into something else.
@@ -774,7 +856,6 @@ mod tests {
     fn every_string_shaped_value_goes_through_expansion() {
         let config = Config::from_toml(&whole(
             "bucket.uri = \"memory:///objects$$one\"\n\
-             [tenants]\nuri = \"file:///tenants$$one.toml\"\nheader = \"x-a$$b\"\n\
              [listen]\napi = \"127.0.0.1:1$$\"\n\
              [ingest.local]\nscratch = \"file:///scratch$$one\"\n",
         ));
@@ -785,16 +866,19 @@ mod tests {
         let error = format!("{:#}", config.unwrap_err());
         assert!(error.contains("api"), "{error}");
 
-        let config = Config::from_toml(&whole(
+        // Written whole rather than through `whole`, since `[hooks]` is one of
+        // the values under test and the fixture already names that table.
+        let config = Config::from_toml(
             "bucket.uri = \"memory:///objects$$one\"\n\
-             [tenants]\nuri = \"file:///tenants$$one.toml\"\nheader = \"x-a$$b\"\n\
-             [ingest.local]\nscratch = \"file:///scratch$$one\"\n",
-        ))
+             [ingest.local]\nscratch = \"file:///scratch$$one\"\n\
+             [database]\nurl = \"postgres://enroute@localhost/enroute\"\n\
+             [hooks]\nsigning_key = \"pem\"\n\
+             endpoint_url = \"https://app.example/hooks$$one\"\n",
+        )
         .expect("a config whose strings hold a literal dollar");
 
         assert!(config.bucket.uri.to_uri().ends_with("objects$one"));
-        assert!(config.tenants.uri.as_str().ends_with("tenants$one.toml"));
-        assert_eq!(config.tenants.header.as_str(), "x-a$b");
+        assert!(config.hooks.endpoint_url.as_str().ends_with("hooks$one"));
     }
 
     /// A name nothing holds stops the load, rather than building a store out
@@ -803,7 +887,6 @@ mod tests {
     fn a_value_naming_nothing_the_environment_holds_is_refused() {
         let error = refused(
             "bucket.uri = \"s3://${ENROUTE_NO_SUCH_VARIABLE_ANYWHERE}\"\n\
-             [tenants]\nuri = \"file:///tenants.toml\"\n\
              [ingest.local]\nscratch = \"file:///scratch\"\n",
         );
         assert!(
@@ -812,12 +895,13 @@ mod tests {
         );
     }
 
+    /// Proved once, at startup, so the hook path carries no error for it.
     #[test]
-    fn a_header_the_http_layer_would_refuse_is_refused_here() {
+    fn an_endpoint_that_is_not_a_url_is_refused_here() {
         let toml = minimal().replace(
-            "uri = \"file:///etc/enroute/tenants.toml\"",
-            "uri = \"file:///etc/enroute/tenants.toml\"\nheader = \"not a header\"",
+            "endpoint_url = \"https://app.example/hooks\"",
+            "endpoint_url = \"not a url\"",
         );
-        Config::from_toml(&toml).expect_err("a header name with a space in it");
+        Config::from_toml(&toml).expect_err("an endpoint that is not a URL");
     }
 }

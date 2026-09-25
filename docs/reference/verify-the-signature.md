@@ -13,7 +13,7 @@ the deployment public key and verify a request before reading its body.
    entry (RFC 9530).
 5. Build the RFC 9421 signature base and verify `Signature` with Ed25519.
 
-Use `@authority` and `@path` from the configured `hook_endpoint_url`, not the
+Use `@authority` and `@path` from the configured `hooks.endpoint_url`, not the
 URL as delivered by a proxy. The configured authority includes a port only when
 the URL includes one.
 
