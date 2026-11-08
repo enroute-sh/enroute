@@ -23,8 +23,9 @@ use arc_swap::ArcSwap;
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::watch;
 
+use crate::meta::RepoState;
 use crate::storage::{Layer, Storage};
-use enroute_shared::state::{LayerMeta, RepoMeta};
+use enroute_shared::state::LayerMeta;
 use view::{Caches, Snapshot};
 
 /// One repository's view and the state that builds it.
@@ -32,7 +33,7 @@ pub struct Repo {
     pub name: String,
     view: ArcSwap<Snapshot>,
     /// Latest metadata from the state machine not yet materialized.
-    pending: Mutex<Option<Arc<RepoMeta>>>,
+    pending: Mutex<Option<Arc<RepoState>>>,
     materializing: tokio::sync::Mutex<()>,
     version_tx: watch::Sender<u64>,
     /// When the view was last used (for eviction).
@@ -75,7 +76,7 @@ impl Repo {
     }
 
     /// Note a use of the view (it is kept a while longer).
-    pub fn touch(&self) {
+    pub(crate) fn touch(&self) {
         *self.used.lock() = Instant::now();
     }
 
@@ -165,7 +166,7 @@ impl Repos {
 
     /// A new state of `name` (must be cheap): materialized in the
     /// background.
-    pub(crate) fn on_apply(self: &Arc<Self>, name: &str, meta: &Arc<RepoMeta>) {
+    pub(crate) fn on_apply(self: &Arc<Self>, name: &str, meta: &Arc<RepoState>) {
         let repo = self.handle(name);
         self.open_ahead(&repo, meta);
         {
@@ -182,7 +183,7 @@ impl Repos {
     /// Start opening the inline layers `meta` added since the last
     /// command (pushes: appended, with ids from the previous `next_id` on),
     /// each in a task of its own.
-    fn open_ahead(&self, repo: &Arc<Repo>, meta: &RepoMeta) {
+    fn open_ahead(&self, repo: &Arc<Repo>, meta: &RepoState) {
         let prev = repo
             .seen_next_id
             .fetch_max(meta.next_id, std::sync::atomic::Ordering::AcqRel);
@@ -266,7 +267,7 @@ impl Repos {
         &self,
         repo: &Repo,
         cur: &Arc<Snapshot>,
-        meta: &Arc<RepoMeta>,
+        meta: &Arc<RepoState>,
     ) -> Result<(Snapshot, usize)> {
         let reuse = cur.reuse(meta.clone());
         // Open the layers that need views concurrently (a cold node may
@@ -335,7 +336,7 @@ impl Repos {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git::oid::{Kind, Oid, try_hash_object};
+    use crate::git::oid::{Kind, ObjectFormat, Oid, try_hash_object};
     use crate::git::pack::{encode_entry_header, full_entry, pack_of};
     use crate::storage::{Access, Sealed};
     use bytes::Bytes;
@@ -360,11 +361,11 @@ mod tests {
 
     /// A layer of pack `entries`, as [`layer_of`] builds it.
     async fn layer_of_entries(repos: &Repos, entries: &[Vec<u8>]) -> (Sealed, u32) {
-        let pack = pack_of(entries);
+        let pack = pack_of(ObjectFormat::Sha1, entries);
         let empty = repos.handle("empty").snapshot();
         let pack: Arc<dyn crate::git::io::ReadAt> = Arc::new(crate::git::io::Owned(pack));
         let ws = repos.storage().workspace();
-        ingest::ingest_stored(empty, pack, ws, vec![], None)
+        ingest::ingest_stored(empty, pack, ws, vec![], None, u64::MAX)
             .await
             .unwrap()
             .layer
@@ -471,12 +472,12 @@ mod tests {
     async fn lookups_find_the_oldest_copy() {
         let (_dir, repos) = repos();
         let shared: &[u8] = b"the same object, in two layers\n";
-        let oid = try_hash_object(Kind::Blob, shared).unwrap();
+        let oid = try_hash_object(ObjectFormat::Sha1, Kind::Blob, shared).unwrap();
         for (repo, stored_first) in [("stored-first", true), ("inline-first", false)] {
             let a = layer_of(&repos, &[shared, format!("{repo} a\n").as_bytes()]).await;
             let b = layer_of(&repos, &[shared, format!("{repo} b\n").as_bytes()]).await;
             let (first, second) = stored_and_inline(&repos, repo, a, b, stored_first).await;
-            let mut meta = RepoMeta::new();
+            let mut meta = RepoState::new();
             meta.version = 2;
             meta.layers = vec![first.clone(), second];
             number(&mut meta.layers);
@@ -499,7 +500,7 @@ mod tests {
         let (_dir, repos) = repos();
         let repo = "flush";
         let shared: &[u8] = b"in layers 0, 1 and 2\n";
-        let oid = try_hash_object(Kind::Blob, shared).unwrap();
+        let oid = try_hash_object(ObjectFormat::Sha1, Kind::Blob, shared).unwrap();
         let mut layers = Vec::new();
         for blobs in [
             &[shared, b"a\n"][..],
@@ -510,7 +511,7 @@ mod tests {
             layers.push(inline(layer_of(&repos, blobs).await).await);
         }
         number(&mut layers);
-        let mut meta = RepoMeta::new();
+        let mut meta = RepoState::new();
         meta.version = 2;
         meta.layers = layers.clone();
         repos.on_apply(repo, &Arc::new(meta.clone()));
@@ -577,7 +578,7 @@ mod tests {
             layers.push(stored(&repos, repo, layer_of(&repos, blobs).await).await);
         }
         number(&mut layers);
-        let mut meta = RepoMeta::new();
+        let mut meta = RepoState::new();
         meta.version = 2;
         meta.layers = layers.clone();
         repos.on_apply(repo, &Arc::new(meta));
@@ -608,7 +609,7 @@ mod tests {
         let (_dir, repos) = repos();
         let repo = "compact";
         let shared: &[u8] = b"in stored layers 1 and 3, and inline\n";
-        let oid = try_hash_object(Kind::Blob, shared).unwrap();
+        let oid = try_hash_object(ObjectFormat::Sha1, Kind::Blob, shared).unwrap();
         let mut layers = Vec::new();
         for i in 0..5 {
             let own = format!("layer {i}\n");
@@ -620,7 +621,7 @@ mod tests {
         }
         layers.push(inline(layer_of(&repos, &[shared, b"inline\n"]).await).await);
         number(&mut layers);
-        let mut meta = RepoMeta::new();
+        let mut meta = RepoState::new();
         meta.version = 2;
         meta.layers = layers.clone();
         repos.on_apply(repo, &Arc::new(meta.clone()));
@@ -653,25 +654,23 @@ mod tests {
     /// a level that ingest does not use itself.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ingest_keeps_sent_zlib_data() {
-        use std::io::Write;
         let (_dir, repos) = repos();
         let repo = "verbatim";
         let blob = b"stored as sent, not compressed again\n".repeat(8);
-        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::none());
-        z.write_all(&blob).unwrap();
+        let z = sirocco::compress(sirocco::Format::Zlib, sirocco::deflate::Level::NONE, &blob);
         let mut sent = Vec::new();
         encode_entry_header(BLOB_CODE, u64::try_from(blob.len()).unwrap(), &mut sent);
-        sent.extend_from_slice(&z.finish().unwrap());
+        sent.extend_from_slice(&z);
         assert_ne!(sent, full_entry(Kind::Blob, &blob));
         let layer = layer_of_entries(&repos, std::slice::from_ref(&sent)).await;
-        let mut meta = RepoMeta::new();
+        let mut meta = RepoState::new();
         meta.version = 1;
         meta.layers = vec![inline(layer).await];
         number(&mut meta.layers);
         repos.on_apply(repo, &Arc::new(meta));
         let snap = repos.handle(repo).wait_version(1).await.unwrap();
         let d = snap
-            .lookup(&try_hash_object(Kind::Blob, &blob).unwrap())
+            .lookup(&try_hash_object(ObjectFormat::Sha1, Kind::Blob, &blob).unwrap())
             .unwrap();
         let loc = snap.entry_loc(d).unwrap();
         let stored = snap

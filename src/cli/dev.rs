@@ -287,6 +287,11 @@ fn config_toml(dir: &Path, ports: Ports, hooks: Option<&DevHooks>) -> String {
 fn banner(dir: &Path, ports: Ports, hooks: Option<&DevHooks>) -> String {
     let git = format!("http://{}", ports.reach(ports.git));
     let api = format!("http://{}", ports.reach(ports.api));
+    // With hooks on, Git waits for the endpoint, so only the API is a try.
+    let push = match hooks {
+        None => format!("  git push {git}/hello.git main\n"),
+        Some(_) => String::new(),
+    };
     let hooks = match hooks {
         None => "off (every request may read and push; pass --hooks URL to opt in)".to_string(),
         Some(h) => {
@@ -311,7 +316,7 @@ fn banner(dir: &Path, ports: Ports, hooks: Option<&DevHooks>) -> String {
     format!(
         "\nenroute dev is running. Press Ctrl-C to stop.\n\n  \
          git      {git}\n  api      {api}\n  dir      {}\n  hooks    {hooks}\n\n\
-         Try:\n  git push {git}/hello.git main\n  enroute repo list{api_flag}\n",
+         Try:\n{push}  enroute repo list{api_flag}\n",
         dir.display(),
     )
 }
@@ -376,6 +381,10 @@ mod tests {
             [Hook::Authorize]
         );
         assert_eq!(endpoint.signing_key.keyid(), hooks.keyid);
+        // Git waits for the endpoint, so the banner suggests no push.
+        let text = banner(dir.path(), ports, Some(&hooks));
+        assert!(!text.contains("git push"), "{text}");
+        assert!(banner(dir.path(), ports, None).contains("git push"));
 
         // The key persists.
         let again = dev_hooks(

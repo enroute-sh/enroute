@@ -9,7 +9,7 @@ use anyhow::{Context as _, Result};
 use serde_json::{Value, json};
 
 use enroute::config::{Bucket, Config, ObjectUri, StoreUri};
-use enroute_shared::registry::{self, Registry};
+use enroute_ledger::cluster;
 
 /// How long one node has to answer `/status`.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(3);
@@ -92,50 +92,46 @@ async fn checks(bucket: &Bucket, local: Option<SocketAddr>) -> Vec<Check> {
             return checks;
         }
     };
-    let members = match registry::members(&objects).await {
-        Ok(members) => members,
+    let named = match cluster::named(&objects).await {
+        Ok(named) => named,
         Err(error) => {
             checks.push(check("object store", false, format!("{error:#}")));
             return checks;
         }
     };
     checks.push(check("object store", true, "reachable".to_string()));
-    checks.push(check(
-        "members",
-        true,
-        format!(
-            "members {:?}, removed {:?}",
-            members.members, members.removed
-        ),
-    ));
-    let registry = match Registry::watch(objects).await {
-        Ok(registry) => registry,
-        Err(error) => {
-            checks.push(check("node registry", false, format!("{error:#}")));
-            return checks;
-        }
-    };
-    let alive = registry.alive();
-    checks.push(check(
-        "node registry",
-        true,
-        format!("{} live", alive.len()),
-    ));
-    for id in &members.members {
-        let live = alive.contains(id);
-        let address = registry.address(*id).unwrap_or_default();
-        let detail = if live { "alive" } else { "no heartbeat" };
+    let url = |id: u64| named.iter().find(|m| m.id == id).map(|m| m.url.clone());
+    let members = cluster::members(&objects).await;
+    match &members {
+        Ok(m) if !named.is_empty() => checks.push(check(
+            "members",
+            true,
+            format!(
+                "members {:?}, removed {:?}, {} alive",
+                m.members,
+                m.removed,
+                m.alive.len()
+            ),
+        )),
+        Ok(_) => {}
+        Err(error) => checks.push(check("members", false, format!("{error:#}"))),
+    }
+    let members = members.unwrap_or_default();
+    let mut targets: Vec<(String, String)> = Vec::new();
+    for &id in &members.members {
+        let live = members.alive.contains(&id);
+        let address = url(id).unwrap_or_default();
+        let detail = if live { "alive" } else { "not answering" };
         checks.push(check(
             &format!("ledger node {id:016x}"),
             live,
             format!("{detail} {address}"),
         ));
+        if live && let Some(u) = url(id) {
+            targets.push((format!("node {id:016x} /status"), u));
+        }
     }
-    let mut targets: Vec<(String, String)> = alive
-        .iter()
-        .filter_map(|id| Some((format!("node {id:016x} /status"), registry.address(*id)?)))
-        .collect();
-    // A node with no advertise_url is in no registry: ask the one configured.
+    // A node with no advertise_url is in no cluster: ask the one configured.
     if targets.is_empty()
         && let Some(addr) = local
     {

@@ -7,13 +7,14 @@ use enroute_api::api::v1alpha1::repository_service_server::RepositoryService;
 use enroute_api::api::v1alpha1::{
     CreateRepositoryRequest, CreateRepositoryResponse, DeleteRepositoryRequest,
     DeleteRepositoryResponse, GetRepositoryRequest, GetRepositoryResponse, ListRepositoriesRequest,
-    ListRepositoriesResponse, Repository,
+    ListRepositoriesResponse, ObjectFormat as WireObjectFormat, Repository,
 };
 use enroute_api::common::v1alpha1::RepoKey as WireRepoKey;
 
 use crate::compute::RepoInfo;
 use crate::contract::repo_key::{self, RepoKey};
 use crate::contract::wire::{parse_repo, wire_system_time};
+use crate::git::oid::ObjectFormat;
 use crate::query::{self, page_limit};
 
 use super::{Api, internal};
@@ -21,12 +22,27 @@ use super::{Api, internal};
 /// How many repositories one listing reports.
 const REPOSITORY_LIMIT: u32 = 100;
 
+/// The ledger's refusal of a create it is set up not to make (a SHA-256
+/// repository where those are off), as the caller sees it.
+fn refused(error: &anyhow::Error) -> Option<Status> {
+    error
+        .chain()
+        .filter_map(|c| c.downcast_ref::<Status>())
+        .find(|s| s.code() == tonic::Code::FailedPrecondition)
+        .map(|s| Status::failed_precondition(s.message()))
+}
+
 /// A repository as the contract reports one.
 fn described(info: RepoInfo) -> Repository {
+    let format = match info.format {
+        ObjectFormat::Sha1 => WireObjectFormat::Sha1,
+        ObjectFormat::Sha256 => WireObjectFormat::Sha256,
+    };
     Repository {
         repo: Some(WireRepoKey { key: info.name }),
         default_branch: info.head,
         last_push: wire_system_time(info.last_push),
+        object_format: format.into(),
     }
 }
 
@@ -46,13 +62,18 @@ impl RepositoryService for Api {
                 "default_branch must be under refs/heads/: {branch}"
             )));
         }
+        let format = match request.object_format() {
+            WireObjectFormat::Unspecified => self.compute.config.default_object_format,
+            WireObjectFormat::Sha1 => ObjectFormat::Sha1,
+            WireObjectFormat::Sha256 => ObjectFormat::Sha256,
+        };
         // An existing repository is left as it is, so a repeat is the same
         // create.
         let info = self
             .compute
-            .create_repo(key.as_str(), branch)
+            .create_repo_in(key.as_str(), branch, format)
             .await
-            .map_err(|error| internal(&error))?;
+            .map_err(|error| refused(&error).unwrap_or_else(|| internal(&error)))?;
         Ok(Response::new(CreateRepositoryResponse {
             repository: Some(described(info)),
         }))
@@ -143,6 +164,7 @@ mod tests {
             name: "repo-1".into(),
             head: "refs/heads/main".into(),
             last_push: Some(at),
+            format: ObjectFormat::Sha1,
         });
         assert_eq!(wire.last_push.map(|t| t.seconds), Some(1_700_000_000));
         assert_eq!(wire.default_branch, "refs/heads/main");
@@ -151,6 +173,7 @@ mod tests {
             name: "repo-1".into(),
             head: "refs/heads/main".into(),
             last_push: None,
+            format: ObjectFormat::Sha1,
         });
         assert!(never.last_push.is_none());
     }

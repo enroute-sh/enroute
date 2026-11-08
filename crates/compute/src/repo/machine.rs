@@ -14,13 +14,15 @@
 
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use foldhash::{HashMap, HashMapExt};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use roaring::RoaringBitmap;
 
-use crate::git::object::{parse_tag, tree_entries};
+use enroute_shared::store::io;
+
+use crate::git::object::{tag_target, tree_entries};
 use crate::git::oid::Kind;
 use crate::storage::{Access, NotResident, Pinned, load_pinned};
 
@@ -106,8 +108,8 @@ pub(crate) async fn drive<M: Machine>(mut m: M) -> Result<M::Output> {
         for (t, wait) in waits.new.drain(..) {
             let h = match wait {
                 // Loads of the same bytes for other tickets share one fetch.
-                Wait::Load(need, access) => tokio::spawn(load_pinned(need, access)),
-                Wait::Event(f) => tokio::spawn(async move { f.await.map(|()| Vec::new()) }),
+                Wait::Load(need, access) => io::spawn(load_pinned(need, access)),
+                Wait::Event(f) => io::spawn(async move { f.await.map(|()| Vec::new()) }),
             };
             pending.push(async move { (t, h.await) });
         }
@@ -223,34 +225,46 @@ pub(crate) async fn load_objects(snap: &Arc<Snapshot>, ds: Vec<DenseId>) -> Resu
     load_pinned(need, Access::Hot).await
 }
 
-/// Read objects (deltas resolved), loading what is not local.
-pub(crate) async fn read_objects(
-    snap: &Arc<Snapshot>,
-    ds: Vec<DenseId>,
-) -> Result<Vec<(DenseId, Arc<Vec<u8>>)>> {
-    struct Read(Vec<(DenseId, Arc<Vec<u8>>)>);
-    impl ObjectWork for Read {
-        type Item = DenseId;
-        type Output = Vec<(DenseId, Arc<Vec<u8>>)>;
-        fn object(&self, _: &Snapshot, d: &DenseId) -> Option<DenseId> {
-            Some(*d)
+impl Snapshot {
+    /// The content of `ds` (deltas resolved), each once, loading what is not
+    /// local.
+    pub(crate) async fn load_many(
+        self: &Arc<Self>,
+        ds: impl IntoIterator<Item = DenseId>,
+    ) -> Result<HashMap<DenseId, Arc<Vec<u8>>>> {
+        struct Read(HashMap<DenseId, Arc<Vec<u8>>>);
+        impl ObjectWork for Read {
+            type Item = DenseId;
+            type Output = HashMap<DenseId, Arc<Vec<u8>>>;
+            fn object(&self, _: &Snapshot, d: &DenseId) -> Option<DenseId> {
+                (!self.0.contains_key(d)).then_some(*d)
+            }
+            fn process(
+                &mut self,
+                _: &Snapshot,
+                d: DenseId,
+                c: Option<Arc<Vec<u8>>>,
+                _: &mut Vec<DenseId>,
+            ) -> Result<()> {
+                // No content: read already.
+                self.0.extend(c.map(|c| (d, c)));
+                Ok(())
+            }
+            fn finish(self) -> Self::Output {
+                self.0
+            }
         }
-        #[expect(clippy::expect_used, reason = "every read item has content")]
-        fn process(
-            &mut self,
-            _: &Snapshot,
-            d: DenseId,
-            c: Option<Arc<Vec<u8>>>,
-            _: &mut Vec<DenseId>,
-        ) -> Result<()> {
-            self.0.push((d, c.expect("read")));
-            Ok(())
-        }
-        fn finish(self) -> Self::Output {
-            self.0
-        }
+        let ds: Vec<DenseId> = ds.into_iter().collect();
+        drive(Objects::new(self.clone(), Read(HashMap::new()), ds)).await
     }
-    drive(Objects::new(snap.clone(), Read(Vec::new()), ds)).await
+
+    /// The content of `d` (deltas resolved), loading it if it is not local.
+    pub(crate) async fn load(self: &Arc<Self>, d: DenseId) -> Result<Arc<Vec<u8>>> {
+        self.load_many([d])
+            .await?
+            .remove(&d)
+            .context("object not read")
+    }
 }
 
 /// Every object reachable from some trees (including them), skipping
@@ -280,7 +294,7 @@ impl ObjectWork for TreeWalk {
         if !self.out.insert(t) {
             return Ok(());
         }
-        for e in tree_entries(&data) {
+        for e in tree_entries(snap.format(), &data) {
             let e = e?;
             let Some(k) = e.kind() else { continue };
             if Some(k) == self.skip {
@@ -361,7 +375,7 @@ impl ObjectWork for Peel {
         };
         let cur = p.end.expect("reading a tag");
         p.tags.push(cur);
-        p.end = snap.lookup(&parse_tag(&data)?.target);
+        p.end = snap.lookup(&tag_target(&data)?);
         match p.end {
             Some(_) => more.push(p),
             None => self.0.push(p),

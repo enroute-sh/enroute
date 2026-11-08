@@ -2,7 +2,13 @@
 
 This page describes how a compute node serves a fetch: planning on metadata,
 streaming stored bytes, and the node-private views that make both fast. It also
-covers what a node keeps across restarts.
+covers why local disk does not outlive a node's process.
+
+**The key idea.** A fetch is planned on metadata alone (the commit graph and the
+list of objects that each commit introduced) and then served by copying stored
+pack entries as they are, without decompressing or re-encoding them. Each fetch
+reads one immutable snapshot, so it never blocks a push and never sees half of
+one.
 
 ## Fetch
 
@@ -184,38 +190,34 @@ inline index, then the stored layers in order, so the oldest copy wins.
   than `layers.merge_factor` stored layers per size class
   ([Compaction](maintenance.md#compaction)).
 
-## Restarts and the node catalog
+## Local disk is a cache
 
-A restart must not lose the sparse files, chunk presence and verification state
-of a node, and a fresh node must attach quickly. Rebuilding views is cheap, so
-Enroute persists only the catalog and the chunk hashes.
+A compute node's local disk lives as long as its process. At startup the node
+moves its old local copies and scratch aside and deletes them in the
+background, so a restarted node starts like a fresh one: it attaches to the
+log and serves layers by range from the object store at once. Only fresh
+starts need to be fast, and nothing on disk needs to be recorded, checked or
+reconciled after a crash. A node also starts fresh on a new machine, after
+losing its disk and when scaling out, so this is the one start path.
 
 | Class | Examples | Lives in | Integrity and lifetime |
 |---|---|---|---|
 | Authoritative shared | refs, layer manifest, inline layers | the log; layer bytes in the object store | consensus |
-| Node-private | which files and chunks are on local disk, pending deletes | node catalog | loss costs a re-fetch |
-| Scratch | spooled bodies, temp tables | temp directory | wiped at startup |
+| Node-private | local copies, their chunk bitmaps, views | local disk and memory | the process; loss costs a re-fetch |
+| Scratch | spooled bodies, temp tables | temp directory | the operation |
 
 Authoritative state needs agreement. Derived state does not. The layers carry
 what can be computed when they are written: the commit section, the segments,
 and the per-chunk hashes (SHA-256 of each 1 MiB chunk, in the index region). The
-hashes verify ranged reads from the object store and local copies of unknown
-state.
+hashes verify ranged reads from the object store and linked copies.
 
-**Node catalog.** The catalog records every local copy of a stored layer (its
-length and present chunks). It stays in memory. The compute writes it whole to
-`catalog.json` in the local file store, to a temporary file and then moved into
-place. It does this about once a second when the catalog changed, and when the
-node stops.
+**Local copies.** A local copy of a stored layer is a sparse file of the
+layer's length, and its chunk bitmap is in memory. Nothing is written per load
+or per eviction besides the chunks themselves.
 
 - Inline layers have no local copies, because the node serves them from their
-  bytes in the log. Recording them would add one entry per push, kept until the
-  layer is flushed and evicted.
-- Nothing waits for the catalog or needs it to be current. A node fetches a
-  chunk recorded after the last write again. The chunk hashes catch a record
-  that survives its data.
-- Local copies (`<id>.layer`) survive closing the file.
-- At startup the node wipes scratch, drops catalog entries whose file is gone or
-  has the wrong size, and deletes local files that the catalog does not know. It
-  also removes local copies of layers that no manifest references (older than 10
-  minutes).
+  bytes in the log.
+- A layer that closes keeps its local copy, open, for two minutes, so a
+  reopen finds the chunks it loaded. Then the copy is deleted.
+- WarpStream agents and Snowflake warehouses treat local disk the same way. A
+  restart costs downloads, never correctness.

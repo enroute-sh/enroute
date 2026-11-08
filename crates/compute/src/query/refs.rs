@@ -5,10 +5,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use foldhash::{HashMap, HashMapExt};
 
-use enroute_shared::state::RepoMeta;
-
 use crate::access::Hidden;
-use crate::git::oid::{Kind, Oid};
+use crate::git::oid::{Kind, ObjectFormat, Oid};
+use crate::meta::RepoState;
 use crate::repo::machine::peel;
 use crate::repo::view::Snapshot;
 
@@ -24,12 +23,14 @@ pub(crate) struct RefView<'a> {
     /// What the annotated tags among `refs` point at, after
     /// [`RefView::peel`].
     pub peeled: HashMap<Oid, Oid>,
+    /// How the repository names its objects.
+    pub format: ObjectFormat,
 }
 
 impl<'a> RefView<'a> {
     /// The refs of `meta` that are not `hidden`, under any of `prefixes` (all
     /// of them when there are none). `HEAD` is filtered as a ref named `HEAD`.
-    pub(crate) fn new(meta: &'a RepoMeta, hidden: &Hidden, prefixes: &[impl AsRef<str>]) -> Self {
+    pub(crate) fn new(meta: &'a RepoState, hidden: &Hidden, prefixes: &[impl AsRef<str>]) -> Self {
         let sees = |name: &str| {
             (prefixes.is_empty() || prefixes.iter().any(|p| name.starts_with(p.as_ref())))
                 && !hidden.hides(name)
@@ -44,6 +45,7 @@ impl<'a> RefView<'a> {
                 .map(|(name, oid)| (name.as_str(), *oid))
                 .collect(),
             peeled: HashMap::new(),
+            format: meta.format(),
         }
     }
 

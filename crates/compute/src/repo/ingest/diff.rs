@@ -5,8 +5,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 
 use crate::git::delta;
-use crate::git::object::{TreeEntry, tree_entries_at, tree_order};
-use crate::git::oid::{Kind, OID_LEN, Oid};
+use crate::git::object::{TreeEntry, max_tree_entries, tree_entries_at, tree_order};
+use crate::git::oid::{Kind, ObjectFormat, Oid};
 use crate::repo::view::must;
 
 use super::encode::delta_size;
@@ -57,6 +57,16 @@ fn push_member(
 /// A tree's entries and the bytes each takes.
 type Entries<'a> = Vec<(TreeEntry<'a>, std::ops::Range<usize>)>;
 
+/// The entries of `data`, a tree of a `format` repository.
+fn entries_of(format: ObjectFormat, data: &[u8]) -> Result<Entries<'_>> {
+    // Sized up front: a tree's entries are read for every version of it.
+    let mut v = Vec::with_capacity(max_tree_entries(format, data.len()));
+    for e in tree_entries_at(format, data) {
+        v.push(e?);
+    }
+    Ok(v)
+}
+
 /// For each entry of `tree`, the entry of `parent` with its name and kind,
 /// found by a merge in git's tree order.
 fn matches(tree: &Entries<'_>, parent: &Entries<'_>) -> Vec<Option<usize>> {
@@ -79,6 +89,7 @@ fn matches(tree: &Entries<'_>, parent: &Entries<'_>) -> Vec<Option<usize>> {
 /// changed copies its mode and name. `None` if the delta is not under half
 /// the tree, the same bar as for other objects.
 fn tree_delta(
+    format: ObjectFormat,
     (base, base_entries): (&[u8], &Entries<'_>),
     (target, entries): (&[u8], &Entries<'_>),
     found: &[Option<usize>],
@@ -86,15 +97,16 @@ fn tree_delta(
     if !delta_size(target.len()) {
         return None;
     }
+    let n = format.len();
     let mut w = delta::Writer::new(base.len(), target.len(), target.len() / 2)?;
     for ((_, at), j) in entries.iter().zip(found) {
         let bytes = target.get(at.clone())?;
-        let (head, oid) = bytes.split_at(bytes.len() - OID_LEN);
+        let (head, oid) = bytes.split_at(bytes.len() - n);
         match j.and_then(|j| base_entries.get(j)) {
-            Some((_, b)) if base.get(b.start..b.end - OID_LEN) == Some(head) => {
+            Some((_, b)) if base.get(b.start..b.end - n) == Some(head) => {
                 w.copy(b.start, head.len());
-                if base.get(b.end - OID_LEN..b.end) == Some(oid) {
-                    w.copy(b.end - OID_LEN, OID_LEN);
+                if base.get(b.end - n..b.end) == Some(oid) {
+                    w.copy(b.end - n, n);
                 } else {
                     w.insert(oid);
                 }
@@ -141,12 +153,13 @@ pub(super) fn diff_level(
         return Ok(Diffed::Missing(need));
     }
     let data = must(data, "tree was read");
-    let entries: Entries<'_> = tree_entries_at(&data).collect::<Result<_>>()?;
+    let format = cx.snap.format();
+    let entries = entries_of(format, &data)?;
     let parent_entries = parent_data
         .iter()
         .map(|pd| {
             pd.as_deref()
-                .map_or_else(|| Ok(Vec::new()), |pd| tree_entries_at(pd).collect())
+                .map_or_else(|| Ok(Vec::new()), |pd| entries_of(format, pd))
         })
         .collect::<Result<Vec<Entries<'_>>>>()?;
     let parent_matches: Vec<Vec<Option<usize>>> = parent_entries
@@ -157,7 +170,7 @@ pub(super) fn diff_level(
     push_member(cx, &mut out, tree, parents, parent_commits, |p| {
         let base = parent_data.get(p)?.as_deref()?;
         let b = parent_entries.get(p)?;
-        tree_delta((base, b), (&data, &entries), parent_matches.get(p)?)
+        tree_delta(format, (base, b), (&data, &entries), parent_matches.get(p)?)
     });
     let mut children = Vec::new();
     for (n, (e, _)) in entries.iter().enumerate() {
@@ -205,7 +218,7 @@ mod tests {
             Some(TreeEntry {
                 mode: *MODES.get(*m)?,
                 name: name.as_bytes(),
-                oid: Oid([*n; OID_LEN]),
+                oid: Oid::sha1([*n; 20]),
             })
         }))
         .unwrap()
@@ -236,7 +249,11 @@ mod tests {
         #[test]
         fn a_tree_diff_gives_its_delta((base, target) in any_tree_pair()) {
             use crate::git::object::EntryMode;
-            let entries = |t| tree_entries_at(t).collect::<Result<Entries<'_>>>().unwrap();
+            let entries = |t| {
+                tree_entries_at(ObjectFormat::Sha1, t)
+                    .collect::<Result<Entries<'_>>>()
+                    .unwrap()
+            };
             let (b, t) = (entries(&base), entries(&target));
             let found = matches(&t, &b);
             let dir = |e: &TreeEntry<'_>| e.mode == EntryMode::TREE;
@@ -244,7 +261,7 @@ mod tests {
                 let by_name = b.iter().position(|(p, _)| p.name == e.name && dir(p) == dir(e));
                 proptest::prop_assert_eq!(*j, by_name);
             }
-            if let Some(delta) = tree_delta((&base, &b), (&target, &t), &found) {
+            if let Some(delta) = tree_delta(ObjectFormat::Sha1, (&base, &b), (&target, &t), &found) {
                 proptest::prop_assert_eq!(delta::target_size(&delta).unwrap(), target.len());
                 proptest::prop_assert_eq!(delta::apply(&base, &delta).unwrap(), target);
             } else {

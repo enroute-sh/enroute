@@ -17,6 +17,8 @@ mod git;
 mod hooks;
 mod http;
 mod maintenance;
+mod membership;
+mod meta;
 mod protocol;
 mod push;
 mod query;
@@ -25,13 +27,20 @@ mod remote_ledger;
 mod repo;
 mod states;
 mod storage;
-#[expect(unsafe_code, reason = "calls with no safe wrapper, all in sys")]
+mod subscriptions;
+#[cfg_attr(
+    target_os = "macos",
+    expect(unsafe_code, reason = "calls with no safe wrapper, all in sys")
+)]
 mod sys;
 mod util;
 
 // The node, and the parts a node assembles it from.
 pub use compute::{Compute, ComputeConfig, RepoInfo, RepoPage};
-pub use remote_ledger::RemoteLedger;
+pub use maintenance::compute_id;
+pub use membership::{join, join_at, members};
+pub use meta::RepoState;
+pub use remote_ledger::{LedgerUrls, RemoteLedger};
 pub use storage::Storage;
 pub use util::init_cpu_pool;
 
@@ -57,4 +66,5 @@ pub mod testing {
     pub use crate::query::{Error, PushPack, pack_for_push};
     pub use crate::remote_ledger::client;
     pub use crate::storage::{Sealed, new_layer_id};
+    pub use crate::subscriptions::Mux;
 }

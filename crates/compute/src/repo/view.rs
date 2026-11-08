@@ -21,10 +21,11 @@ use foldhash::HashMap;
 use zerocopy::little_endian::{I64, U32};
 use zerocopy::{FromBytes, Immutable, IntoBytes, Unaligned};
 
-use enroute_shared::state::{LayerMeta, RepoMeta};
+use enroute_shared::state::LayerMeta;
 
-use crate::git::oid::{Kind, Oid};
+use crate::git::oid::{Kind, ObjectFormat, Oid};
 use crate::git::pack::StoredEntry;
+use crate::meta::RepoState;
 use crate::storage::Access;
 use crate::storage::{Layer, NotResident, Ref, RefTarget, TableRecord};
 use crate::util::{ByteCache, byte_cache, ix};
@@ -46,11 +47,19 @@ pub(super) fn must<T>(v: Option<T>, what: &str) -> T {
     v.unwrap_or_else(|| fatal(format_args!("broken invariant: {what}")))
 }
 
+/// The number of a commit: its position among the snapshot's commits.
+///
+/// Merges keep every commit's id and drop only newer copies, so a commit's
+/// number never changes. A stored graph can name parents by number.
+pub(crate) type CommitNum = u32;
+
 /// A commit in the graph, borrowed from its layer view's arrays.
 #[derive(Clone, Copy, Debug)]
 pub struct CommitNode<'a> {
-    /// Dense ids of the parents.
-    pub parents: &'a [DenseId],
+    pub num: CommitNum,
+    /// Dense id of the commit.
+    pub id: DenseId,
+    pub parents: &'a [CommitNum],
     /// Dense id of the root tree.
     pub tree: DenseId,
     /// Length of the longest path to a root commit.
@@ -62,45 +71,89 @@ pub struct CommitNode<'a> {
     pub segment: &'a [DenseId],
 }
 
-/// A layer's commit graph as flat arrays indexed by commit rank (the
-/// number of commits before it in the object table).
+/// What a walk reads of a commit: fewer arrays than a [`CommitNode`].
+/// Ordered by generation, then number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct CommitLinks<'a> {
+    pub generation: u32,
+    pub num: CommitNum,
+    pub id: DenseId,
+    pub parents: &'a [CommitNum],
+}
+
+/// A layer's commit graph as flat arrays, one row per commit in rank order
+/// (duplicates of older copies have none). Row `r` is commit `first + r`.
 #[derive(Default)]
 #[cfg_attr(test, derive(Debug, PartialEq))]
 struct CommitGraph {
-    /// `NO_COMMIT` for duplicates of older copies.
+    /// Not stored: the number of commits in older layers.
+    first: CommitNum,
+    /// Commit rank -> row (`NO_COMMIT`: a duplicate); `None` if every
+    /// commit has a row, as in every stored graph.
+    rows: Option<Vec<u32>>,
+    /// What a walk reads, together, so that a commit costs one cache line.
+    walk: Vec<WalkRow>,
+    /// `NO_COMMIT` until the row is filled.
     tree: Vec<DenseId>,
-    generation: Vec<u32>,
     time: Vec<i64>,
-    /// (start, len) into `parents` / `members`.
-    parent_range: Vec<(u32, u32)>,
+    /// (start, len) into `members`.
     member_range: Vec<(u32, u32)>,
-    parents: Vec<DenseId>,
+    parents: Vec<CommitNum>,
     members: Vec<DenseId>,
 }
 
 const NO_COMMIT: DenseId = DenseId::MAX;
 
+#[derive(Clone, Copy, Default)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
+struct WalkRow {
+    id: DenseId,
+    generation: u32,
+    /// (start, len) into `parents`.
+    parents: (u32, u32),
+}
+
 impl CommitGraph {
-    fn get(&self, local: usize) -> Option<CommitNode<'_>> {
-        let tree = *self.tree.get(local)?;
+    /// The number after the layer's last commit.
+    fn end(&self) -> CommitNum {
+        self.first + must(u32::try_from(self.walk.len()).ok(), "commit graph")
+    }
+
+    /// The row of the commit of rank `rank`, if it has one.
+    fn row(&self, rank: usize) -> Option<usize> {
+        match &self.rows {
+            None => Some(rank),
+            Some(rows) => rows.get(rank).filter(|&&r| r != NO_COMMIT).map(|&r| ix(r)),
+        }
+    }
+
+    fn links(&self, row: usize) -> Option<CommitLinks<'_>> {
+        let w = self.walk.get(row)?;
+        Some(CommitLinks {
+            num: self.first + u32::try_from(row).ok()?,
+            id: w.id,
+            generation: w.generation,
+            parents: sub_slice(&self.parents, w.parents)?,
+        })
+    }
+
+    fn get(&self, row: usize) -> Option<CommitNode<'_>> {
+        let tree = *self.tree.get(row)?;
         if tree == NO_COMMIT {
             return None;
         }
+        let links = must(self.links(row), "commit graph");
         Some(CommitNode {
-            parents: must(
-                sub_slice(
-                    &self.parents,
-                    must(self.parent_range.get(local).copied(), "commit graph"),
-                ),
-                "commit graph parents",
-            ),
+            num: links.num,
+            id: links.id,
+            parents: links.parents,
             tree,
-            generation: must(self.generation.get(local).copied(), "commit graph"),
-            time: must(self.time.get(local).copied(), "commit graph"),
+            generation: links.generation,
+            time: must(self.time.get(row).copied(), "commit graph"),
             segment: must(
                 sub_slice(
                     &self.members,
-                    must(self.member_range.get(local).copied(), "commit graph"),
+                    must(self.member_range.get(row).copied(), "commit graph"),
                 ),
                 "commit graph members",
             ),
@@ -118,13 +171,14 @@ impl CommitGraph {
                 Some((start.checked_add(u32::try_from(base).ok()?)?, len))
             };
             let (pbase, mbase) = (g.parents.len(), g.members.len());
-            let rows = s.tree.iter().enumerate().filter(|(_, t)| **t != NO_COMMIT);
-            for (i, &tree) in rows {
-                g.tree.push(tree);
-                g.generation.push(*s.generation.get(i)?);
-                g.time.push(*s.time.get(i)?);
-                g.parent_range.push(shift(*s.parent_range.get(i)?, pbase)?);
-                g.member_range.push(shift(*s.member_range.get(i)?, mbase)?);
+            g.tree.extend_from_slice(&s.tree);
+            g.time.extend_from_slice(&s.time);
+            for (w, &mr) in s.walk.iter().zip(&s.member_range) {
+                g.walk.push(WalkRow {
+                    parents: shift(w.parents, pbase)?,
+                    ..*w
+                });
+                g.member_range.push(shift(mr, mbase)?);
             }
             g.parents.extend_from_slice(&s.parents);
             g.members.extend_from_slice(&s.members);
@@ -140,13 +194,16 @@ impl CommitGraph {
         let pairs = |v: &[(u32, u32)]| v.iter().flat_map(|&(a, b)| [a, b]).collect::<Vec<_>>();
         let len = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
         let mut out = Vec::new();
-        let head = [self.tree.len(), self.parents.len(), self.members.len()].map(len);
+        let head = [self.walk.len(), self.parents.len(), self.members.len()].map(len);
         out.extend_from_slice(words(&head).as_bytes());
+        let walk = self
+            .walk
+            .iter()
+            .flat_map(|w| [w.id, w.generation, w.parents.0, w.parents.1]);
+        out.extend_from_slice(words(&walk.collect::<Vec<_>>()).as_bytes());
         out.extend_from_slice(words(&self.tree).as_bytes());
-        out.extend_from_slice(words(&self.generation).as_bytes());
         let time: Vec<I64> = self.time.iter().map(|&t| I64::new(t)).collect();
         out.extend_from_slice(time.as_bytes());
-        out.extend_from_slice(words(&pairs(&self.parent_range)).as_bytes());
         out.extend_from_slice(words(&pairs(&self.member_range)).as_bytes());
         out.extend_from_slice(words(&self.parents).as_bytes());
         out.extend_from_slice(words(&self.members).as_bytes());
@@ -171,11 +228,22 @@ impl CommitGraph {
         let (n, np, nm) = (ix(n.get()), ix(np.get()), ix(nm.get()));
         let words = |v: &[U32]| v.iter().map(|w| w.get()).collect::<Vec<_>>();
         let pairs = |v: &[[U32; 2]]| v.iter().map(|[a, b]| (a.get(), b.get())).collect();
+        let walk = take::<[U32; 4]>(&mut b, n)?
+            .iter()
+            .map(|[id, generation, start, len]| WalkRow {
+                id: id.get(),
+                generation: generation.get(),
+                parents: (start.get(), len.get()),
+            })
+            .collect();
+        let tree = words(take(&mut b, n)?);
+        let time = take::<I64>(&mut b, n)?.iter().map(|t| t.get()).collect();
         let g = CommitGraph {
-            tree: words(take(&mut b, n)?),
-            generation: words(take(&mut b, n)?),
-            time: take::<I64>(&mut b, n)?.iter().map(|t| t.get()).collect(),
-            parent_range: pairs(take(&mut b, n)?),
+            first: 0,
+            rows: None,
+            walk,
+            tree,
+            time,
             member_range: pairs(take(&mut b, n)?),
             parents: words(take(&mut b, np)?),
             members: words(take(&mut b, nm)?),
@@ -314,13 +382,15 @@ impl LayerView {
     /// The view of merge output `layer` (of manifest entry `m`), with the
     /// commit graph it stores: `None` for a pushed layer, which stores
     /// none, or if they do not match.
-    fn of_merge(layer: Arc<Layer>, m: &LayerMeta) -> Result<Option<LayerView>> {
+    /// Its first commit is `first`.
+    fn of_merge(layer: Arc<Layer>, m: &LayerMeta, first: CommitNum) -> Result<Option<LayerView>> {
         let matches = |g: &CommitGraph| {
-            layer.id_span() == m.id_span && g.tree.len() == ix(layer.count(Kind::Commit))
+            layer.id_span() == m.id_span && g.walk.len() == ix(layer.count(Kind::Commit))
         };
-        let Some(g) = CommitGraph::from_file(&layer.graph()?).filter(matches) else {
+        let Some(mut g) = CommitGraph::from_file(&layer.graph()?).filter(matches) else {
             return Ok(None);
         };
+        g.first = first;
         Ok(Some(LayerView {
             layer,
             stored: m.is_stored(),
@@ -337,18 +407,29 @@ impl LayerView {
         stored: &[Arc<LayerView>],
         index: &InlineIndex,
     ) -> Result<CommitGraph> {
-        let records = self.layer.commits()?;
-        let ncommits = ix(self.layer.count(Kind::Commit));
+        // Duplicates of older copies get no row.
+        let mut rows = Vec::with_capacity(ix(self.layer.count(Kind::Commit)));
+        let mut n = 0u32;
+        for local in self.layer.locals_of(Kind::Commit) {
+            if self.dense(local) == self.own(local) {
+                rows.push(n);
+                n += 1;
+            } else {
+                rows.push(NO_COMMIT);
+            }
+        }
+        let n = ix(n);
         let mut g = CommitGraph {
-            tree: vec![NO_COMMIT; ncommits],
-            generation: vec![0; ncommits],
-            time: vec![0; ncommits],
-            parent_range: vec![(0, 0); ncommits],
-            member_range: vec![(0, 0); ncommits],
+            first: commit_end(prev),
+            rows: (n < rows.len()).then_some(rows),
+            walk: vec![WalkRow::default(); n],
+            tree: vec![NO_COMMIT; n],
+            time: vec![0; n],
+            member_range: vec![(0, 0); n],
             parents: Vec::new(),
             members: Vec::new(),
         };
-        for rec in records {
+        for rec in self.layer.commits()? {
             let me = self.dense(rec.local);
             if me != self.own(rec.local) {
                 continue; // duplicate of an older copy
@@ -385,22 +466,21 @@ impl LayerView {
         } = *older;
         let me = rec.me;
         let resolve = |r: Ref, kind| self.resolve(r, kind, stored, index);
-        let local = must(self.commit_slot(rec.local), "commit record of a commit");
+        let rank = must(self.commit_slot(rec.local), "commit record of a commit");
+        let row = must(g.row(rank), "a row for each canonical commit");
         let tree = resolve(rec.tree, Some(Kind::Tree)).context("commit tree missing")?;
         let pstart = offset(&g.parents)?;
         let mut generation = 1;
         for p in rec.parents {
             let pd = resolve(p, Some(Kind::Commit)).context("commit parent missing")?;
-            let pg = if let Some(l) = self.local(pd) {
-                self.commit_slot(l)
-                    .and_then(|s| g.get(s))
-                    .map(|c| c.generation)
+            let parent = if let Some(l) = self.local(pd) {
+                self.commit_slot(l).and_then(|s| g.get(g.row(s)?))
             } else {
-                commit_in(prev, pd).map(|c| c.generation)
+                commit_in(prev, pd)
             }
             .context("parent commit has no graph node")?;
-            generation = generation.max(pg + 1);
-            g.parents.push(pd);
+            generation = generation.max(parent.generation + 1);
+            g.parents.push(parent.num);
         }
         let mstart = offset(&g.members)?;
         g.members.push(me);
@@ -417,21 +497,23 @@ impl LayerView {
         g.members.truncate(ix(mstart) + kept);
         let plen = offset(&g.parents)? - pstart;
         let mlen = u32::try_from(kept).context("commit segment too large")?;
-        let (Some(t), Some(gen_), Some(tm), Some(pr), Some(mr)) = (
-            g.tree.get_mut(local),
-            g.generation.get_mut(local),
-            g.time.get_mut(local),
-            g.parent_range.get_mut(local),
-            g.member_range.get_mut(local),
+        let (Some(w), Some(t), Some(tm), Some(mr)) = (
+            g.walk.get_mut(row),
+            g.tree.get_mut(row),
+            g.time.get_mut(row),
+            g.member_range.get_mut(row),
         ) else {
             fatal(format_args!(
-                "commit {local} outside the layer's commit range"
+                "commit {row} outside the layer's commit range"
             ));
         };
+        *w = WalkRow {
+            id: me,
+            generation,
+            parents: (pstart, plen),
+        };
         *t = tree;
-        *gen_ = generation;
         *tm = rec.time;
-        *pr = (pstart, plen);
         *mr = (mstart, mlen);
         Ok(())
     }
@@ -602,8 +684,6 @@ pub(crate) struct EntryLoc {
     pub len: u32,
     /// Delta base, if stored as a delta.
     pub base: Option<DenseId>,
-    /// The commit the base was chosen in the context of, if any.
-    pub ctx: Option<DenseId>,
 }
 
 /// The kind of the delta base of `l` in `lv`: a delta and its base are of
@@ -626,14 +706,25 @@ fn locate(layers: &[Arc<LayerView>], d: DenseId) -> Option<(&LayerView, u32)> {
 
 fn commit_in(layers: &[Arc<LayerView>], d: DenseId) -> Option<CommitNode<'_>> {
     let (lv, local) = locate(layers, d)?;
-    lv.commits.get(lv.commit_slot(local)?)
+    lv.commits.get(lv.commits.row(lv.commit_slot(local)?)?)
+}
+
+/// The number after the last commit of `layers`.
+fn commit_end(layers: &[Arc<LayerView>]) -> CommitNum {
+    layers.last().map_or(0, |lv| lv.commits.end())
+}
+
+/// The graph of the layer holding commit `c`, and `c`'s row in it.
+fn graph_of(layers: &[Arc<LayerView>], c: CommitNum) -> Option<(&CommitGraph, usize)> {
+    let lv = layers.get(layers.partition_point(|lv| lv.commits.end() <= c))?;
+    Some((&lv.commits, ix(c.checked_sub(lv.commits.first)?)))
 }
 
 /// A consistent view of a repository at one replicated version.
 pub struct Snapshot {
     /// The replicated state this snapshot reflects (refs, HEAD, version,
     /// layers).
-    pub meta: Arc<RepoMeta>,
+    pub meta: Arc<RepoState>,
     /// The views of the layers, oldest first.
     pub layers: Vec<Arc<LayerView>>,
     /// The stored layers among `layers`, oldest first.
@@ -676,6 +767,12 @@ impl Snapshot {
         self.meta.version
     }
 
+    /// How the repository names its objects.
+    #[must_use]
+    pub fn format(&self) -> ObjectFormat {
+        self.meta.format()
+    }
+
     /// What [`build`](Self::build) of `meta` can take from this snapshot.
     ///
     /// Views do not depend on their position: every view whose layer is
@@ -684,7 +781,7 @@ impl Snapshot {
     /// and compaction outputs (which hold only canonical copies, and refer
     /// only to older objects). Both lists are in id order (a layer list is
     /// ordered by its ranges), so one walk pairs them: no hashing.
-    pub(crate) fn reuse(&self, meta: Arc<RepoMeta>) -> Reuse {
+    pub(crate) fn reuse(&self, meta: Arc<RepoState>) -> Reuse {
         let mut views = Vec::with_capacity(meta.layers.len());
         let mut j = 0;
         for m in &meta.layers {
@@ -729,13 +826,18 @@ impl Snapshot {
         // The stored layers so far, for lookups while building.
         let mut stored: Vec<Arc<LayerView>> = Vec::new();
         for (m, lv) in meta.layers.iter().zip(views) {
+            let first = commit_end(&layers);
             let lv = if let Some(lv) = lv {
+                debug_assert_eq!(
+                    lv.commits.first, first,
+                    "a reused layer's commit numbers moved"
+                );
                 lv
             } else {
                 let layer = must(opened.next(), "a layer opened for each one without a view");
                 // Every request waits for this snapshot, and indexing a big
                 // merge output again takes seconds.
-                let fast = LayerView::of_merge(layer.clone(), m)?;
+                let fast = LayerView::of_merge(layer.clone(), m, first)?;
                 let lv = match fast {
                     Some(lv) => lv,
                     None => LayerView::build(
@@ -779,7 +881,7 @@ fn add_to_index(index: &mut InlineIndex, lv: &LayerView) -> Result<()> {
 /// [`Snapshot::reuse`]).
 #[derive(Debug)]
 pub(crate) struct Reuse {
-    meta: Arc<RepoMeta>,
+    meta: Arc<RepoState>,
     /// For each layer of `meta`, the view to reuse (`None`: one to build).
     views: Vec<Option<Arc<LayerView>>>,
 }
@@ -936,7 +1038,7 @@ impl Snapshot {
         Ok(self.chains.get_or_init(|| Arc::new(links)).clone())
     }
 
-    /// Where `d`'s stored entry is, with its delta base and base context.
+    /// Where `d`'s stored entry is, with its delta base.
     pub(crate) fn entry_loc(&self, d: DenseId) -> Result<EntryLoc> {
         let (lv, l) = self.locate(d);
         let r = lv.layer.record(l)?;
@@ -945,12 +1047,10 @@ impl Snapshot {
         } else {
             self.resolve_ref(lv, r.base(), base_kind(lv, l))
         };
-        let ctx = base.and_then(|_| self.resolve_ref(lv, r.ctx(), Kind::Commit));
         Ok(EntryLoc {
             off: r.entry_off(),
             len: r.entry_len(),
             base,
-            ctx,
         })
     }
 
@@ -997,6 +1097,23 @@ impl Snapshot {
     /// The commit graph node of `d`, if `d` is a commit with one.
     pub fn commit(&self, d: DenseId) -> Option<CommitNode<'_>> {
         commit_in(&self.layers, d)
+    }
+
+    /// The walk links of commit `d`, if `d` is a commit with a graph node.
+    pub(crate) fn links_of(&self, d: DenseId) -> Option<CommitLinks<'_>> {
+        let (lv, local) = locate(&self.layers, d)?;
+        lv.commits.links(lv.commits.row(lv.commit_slot(local)?)?)
+    }
+
+    /// The walk links of commit number `c`.
+    pub(crate) fn links(&self, c: CommitNum) -> Option<CommitLinks<'_>> {
+        let (g, row) = graph_of(&self.layers, c)?;
+        g.links(row)
+    }
+
+    /// The number after the last commit.
+    pub(crate) fn commit_end(&self) -> CommitNum {
+        commit_end(&self.layers)
     }
 
     /// Resolve a reference to an object of `kind`, stored in `lv`.
@@ -1066,7 +1183,7 @@ impl Snapshot {
                 return Ok(None);
             }
             let rec = lv.layer.object(l)?;
-            let e = StoredEntry::parse(&rec.entry)?;
+            let e = StoredEntry::parse(lv.layer.format(), &rec.entry)?;
             if e.delta {
                 chain.push(x);
                 return Ok(Some(rec.base));
@@ -1082,7 +1199,9 @@ impl Snapshot {
         while let Some(x) = chain.pop() {
             let (lv, l) = self.locate(x);
             let rec = lv.layer.object(l)?;
-            let out = Arc::new(StoredEntry::parse(&rec.entry)?.decode(Some(&content))?);
+            let out = Arc::new(
+                StoredEntry::parse(lv.layer.format(), &rec.entry)?.decode(Some(&content))?,
+            );
             if chain.len().is_multiple_of(CHAIN_CHECKPOINT) {
                 self.cache.objects.insert(lv.layer.oid(l), out.clone());
             }
@@ -1164,21 +1283,29 @@ mod tests {
     #[test]
     fn merged_commit_graphs_round_trip_through_layers() {
         let g = |tree: Vec<u32>, parents: Vec<u32>, members: Vec<u32>| CommitGraph {
-            generation: vec![1; tree.len()],
+            first: 0,
+            rows: None,
+            walk: tree
+                .iter()
+                .map(|t| WalkRow {
+                    id: t + 100,
+                    generation: 1,
+                    parents: (0, u32::try_from(parents.len()).unwrap()),
+                })
+                .collect(),
             time: vec![-5; tree.len()],
-            parent_range: vec![(0, u32::try_from(parents.len()).unwrap()); tree.len()],
             member_range: vec![(0, u32::try_from(members.len()).unwrap()); tree.len()],
             tree,
             parents,
             members,
         };
-        let (a, b) = (
-            g(vec![7, NO_COMMIT], vec![], vec![1]),
-            g(vec![9], vec![1], vec![2, 3]),
-        );
+        let (a, b) = (g(vec![7], vec![], vec![1]), g(vec![9], vec![0], vec![2, 3]));
         let merged = CommitGraph::concat([&a, &b].into_iter()).unwrap();
         assert_eq!(merged.tree, [7, 9]);
-        assert_eq!(merged.parent_range, [(0, 0), (0, 1)]);
+        let ids: Vec<_> = merged.walk.iter().map(|w| w.id).collect();
+        assert_eq!(ids, [107, 109]);
+        let parents: Vec<_> = merged.walk.iter().map(|w| w.parents).collect();
+        assert_eq!(parents, [(0, 0), (0, 1)]);
         assert_eq!(merged.member_range, [(0, 1), (1, 2)]);
         let file = merged.to_file();
         assert_eq!(CommitGraph::from_file(&file), Some(merged));

@@ -137,3 +137,5 @@ desired-state job does anyway.
   something reading from here.
 - [Push to a remote](../reference/push-to-a-remote.md) — the URL rules, the
   credential shapes, and every outcome status.
+- [Fetch from a remote](../reference/fetch-from-a-remote.md) — the other
+  direction: keep an Enroute repository in step with another host.

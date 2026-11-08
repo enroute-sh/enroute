@@ -179,19 +179,44 @@ impl Incoming {
     /// `expected` bytes; the bytes the stream takes. Nothing is consumed.
     pub(crate) fn inflate(&mut self, at: usize, expected: usize) -> Result<(Vec<u8>, usize)> {
         let mut out = vec![0; expected];
-        // Generous for zlib's worst case; libdeflate needs the whole stream
-        // in one call, so a stream past it is retried with twice the bytes.
+        super::zlib::DECODER.with_borrow_mut(|d| {
+            let r = self.inflate_with(d, at, &mut out);
+            if r.is_err() {
+                d.reset();
+            }
+            let used = r?;
+            let n = d.total_out();
+            ensure!(
+                n == u64::try_from(expected)?,
+                "zlib size mismatch: {n} != {expected}"
+            );
+            Ok((out, used))
+        })
+    }
+
+    /// Feed `d` the stream at `at` until it ends.
+    fn inflate_with(
+        &mut self,
+        d: &mut sirocco::inflate::Decoder,
+        at: usize,
+        out: &mut [u8],
+    ) -> Result<usize> {
+        // Most streams fit in the first window: zlib's worst case.
         let mut want = at
-            .saturating_add(expected)
-            .saturating_add(expected / 8)
+            .saturating_add(out.len())
+            .saturating_add(out.len() / 8)
             .saturating_add(1024);
+        let mut used = 0;
         loop {
             let w = self.fill(want)?;
-            let z = w.get(at..).context("truncated")?;
-            if let Some(used) = crate::sys::zlib_decompress_prefix(z, &mut out) {
-                return Ok((out, used));
+            let end = w.len() < want;
+            let z = w.get(at + used..).context("truncated")?;
+            let p = d.decompress(z, out, end).context("inflate")?;
+            used += p.consumed;
+            if p.done {
+                return Ok(used);
             }
-            ensure!(w.len() >= want, "bad zlib stream or size mismatch");
+            ensure!(!end, "zlib size mismatch: stream longer than {}", out.len());
             want = want.saturating_mul(2);
         }
     }

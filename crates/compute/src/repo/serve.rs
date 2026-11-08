@@ -4,8 +4,9 @@
 //! Planning works on metadata only (commit graph + per-commit segment
 //! bitmaps), so the object count is known before the first byte is sent.
 //! Streaming copies stored pack entries verbatim. Deltas are kept as long as
-//! their base is guaranteed to be available to the client; otherwise the
-//! object is re-encoded as a full entry.
+//! their base is in the pack; otherwise the object is re-encoded as a full
+//! entry, or as a delta against another object of the pack that shared its
+//! base (see [`assemble`]).
 //!
 //! Packs are sent in storage order (layer by layer, each front to back:
 //! commits, trees, blobs), so streaming reads every page once instead of
@@ -13,6 +14,7 @@
 //! name their base by id, and `OFS_DELTA` is only used for a base already
 //! sent.
 
+use std::collections::hash_map::Entry;
 use std::collections::{BinaryHeap, VecDeque};
 use std::sync::Arc;
 
@@ -21,20 +23,24 @@ use foldhash::{HashMap, HashMapExt, HashSet};
 use roaring::RoaringBitmap;
 
 use crate::access::Hidden;
-use crate::git::oid::{Kind, Oid};
+use crate::git::delta;
+use crate::git::oid::{Kind, ObjectFormat, Oid};
 use crate::git::pack::{
     OFS_DELTA, PackHasher, StoredEntry, encode_entry_header, encode_ofs, full_entry,
+    ref_delta_entry,
 };
 use crate::storage::{Access, NotResident};
+use crate::util::ix;
 
 use super::machine::{self, Ticket, Waits};
-use super::view::{DenseId, EntryLoc, Snapshot};
+use super::view::{CommitNum, DenseId, EntryLoc, Snapshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum Filter {
     #[default]
     None,
     BlobNone,
+    /// `blob:limit=n`: blobs of `n` bytes or more are left out.
     BlobLimit(u64),
     /// tree:0 — commits (and tags) only.
     TreeNone,
@@ -55,29 +61,29 @@ impl Filter {
     }
 }
 
+/// A size as git's `git_parse_ulong` reads it: a C number with no sign,
+/// then an optional `k`, `m` or `g`.
 fn parse_size(s: &str) -> Result<u64> {
-    let (num, mul) = [
-        (['k', 'K'], 1u64 << 10),
-        (['m', 'M'], 1 << 20),
-        (['g', 'G'], 1 << 30),
-    ]
-    .into_iter()
-    .find_map(|(suffix, mul)| s.strip_suffix(suffix).map(|n| (n, mul)))
-    .unwrap_or((s, 1));
-    num.parse::<u64>()?
-        .checked_mul(mul)
+    let bad = || anyhow::anyhow!("invalid size {s:?}");
+    let (negative, n, unit) = crate::util::c_number(s).ok_or_else(bad)?;
+    if negative {
+        return Err(bad());
+    }
+    let mul = match unit.to_ascii_lowercase().as_str() {
+        "" => 1u64,
+        "k" => 1 << 10,
+        "m" => 1 << 20,
+        "g" => 1 << 30,
+        _ => return Err(bad()),
+    };
+    n.and_then(|n| n.checked_mul(mul))
         .with_context(|| format!("size {s:?} is too large"))
 }
 
 #[derive(Debug, Clone, Default)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "one flag per protocol capability; fields are used across modules"
-)]
 pub(crate) struct FetchArgs {
     pub wants: Vec<Oid>,
     pub haves: Vec<Oid>,
-    pub thin_pack: bool,
     /// Client accepts `OFS_DELTA` entries.
     pub ofs_delta: bool,
     pub include_tag: bool,
@@ -94,13 +100,24 @@ pub(crate) struct FetchArgs {
 pub(crate) struct Planned {
     pub d: DenseId,
     pub loc: EntryLoc,
+    pub emit: Emit,
+}
+
+/// How a planned object goes into the pack.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Emit {
+    /// Its stored entry, as is.
+    Stored,
+    /// Re-encoded whole.
+    Whole,
+    /// Re-encoded as a delta against an object sent before it.
+    Delta(DenseId),
 }
 
 #[derive(Default)]
 pub(crate) struct Plan {
     /// In send order (storage order).
     pub objects: Vec<Planned>,
-    pub reencode: RoaringBitmap,
     pub shallow: Vec<Oid>,
     pub unshallow: Vec<Oid>,
     /// Rewrite deltas whose base precedes them in the pack as `OFS_DELTA`.
@@ -111,81 +128,75 @@ const UNINTERESTING: u8 = 1;
 const QUEUED: u8 = 2;
 
 /// Commits reachable from `wants` but not from `haves` (generation-ordered
-/// walk), with the `shallow` commits taken as parentless. Returns (send set,
-/// uninteresting set).
-#[expect(clippy::unwrap_used, reason = "every queued commit has flags")]
+/// walk), with the `shallow` commits taken as parentless.
 pub(crate) fn walk(
     snap: &Snapshot,
     wants: &[DenseId],
     haves: &[DenseId],
     shallow: &RoaringBitmap,
-) -> Result<(Vec<DenseId>, RoaringBitmap)> {
-    let mut flags: HashMap<DenseId, u8> = HashMap::new();
-    let mut heap: BinaryHeap<(u32, DenseId)> = BinaryHeap::new();
+) -> Result<Vec<DenseId>> {
+    // The walk often reaches most of history, so flags by commit beat a map.
+    let mut flags = vec![0u8; ix(snap.commit_end())];
+    let mut heap = BinaryHeap::new();
     let mut interesting_queued = 0usize;
-    let generation = |d: DenseId| {
-        snap.commit(d)
-            .map(|c| c.generation)
-            .context("commit missing from graph")
-    };
+    let node = |d: DenseId| snap.links_of(d).context("commit missing from graph");
 
     for &h in haves {
-        if flags.insert(h, UNINTERESTING | QUEUED).is_none() {
-            heap.push((generation(h)?, h));
+        let n = node(h)?;
+        let f = flag(&mut flags, n.num)?;
+        if *f == 0 {
+            *f = UNINTERESTING | QUEUED;
+            heap.push(n);
         }
     }
     for &w in wants {
-        if let std::collections::hash_map::Entry::Vacant(e) = flags.entry(w) {
-            e.insert(QUEUED);
+        let n = node(w)?;
+        let f = flag(&mut flags, n.num)?;
+        if *f == 0 {
+            *f = QUEUED;
             interesting_queued += 1;
-            heap.push((generation(w)?, w));
+            heap.push(n);
         }
     }
     let mut send = Vec::new();
     while interesting_queued > 0 {
-        let Some((_, d)) = heap.pop() else { break };
-        let f = flags.get_mut(&d).unwrap();
+        let Some(n) = heap.pop() else { break };
+        let f = flag(&mut flags, n.num)?;
         *f &= !QUEUED;
         let unint = *f & UNINTERESTING != 0;
         if !unint {
             interesting_queued -= 1;
-            send.push(d);
+            send.push(n.id);
         }
         // As with git's shallow grafts: the client lacks the history past
         // its boundary, so a have there does not cover it.
-        if shallow.contains(d) {
+        if shallow.contains(n.id) {
             continue;
         }
-        let node = snap.commit(d).context("commit missing from graph")?;
-        for &p in node.parents {
-            if mark_parent(&mut flags, p, unint, &mut interesting_queued) {
-                heap.push((generation(p)?, p));
+        for &p in n.parents {
+            if mark_parent(flag(&mut flags, p)?, unint, &mut interesting_queued) {
+                heap.push(snap.links(p).context("commit missing from graph")?);
             }
         }
     }
-    let unint = flags
-        .iter()
-        .filter(|(_, f)| **f & UNINTERESTING != 0)
-        .map(|(d, _)| *d)
-        .collect();
-    Ok((send, unint))
+    Ok(send)
 }
 
-/// Flag the parent `p` of a commit walked as `unint` (uninteresting) or not.
-/// Returns whether `p` is new to the walk and so to be queued.
-fn mark_parent(
-    flags: &mut HashMap<DenseId, u8>,
-    p: DenseId,
-    unint: bool,
-    interesting_queued: &mut usize,
-) -> bool {
-    let Some(pf) = flags.get_mut(&p) else {
-        flags.insert(p, QUEUED | if unint { UNINTERESTING } else { 0 });
+fn flag(flags: &mut [u8], c: CommitNum) -> Result<&mut u8> {
+    flags.get_mut(ix(c)).context("commit outside graph")
+}
+
+/// Flag `pf`, the flags of a parent of a commit walked as `unint`
+/// (uninteresting) or not. Returns whether the parent is new to the walk and
+/// so to be queued.
+fn mark_parent(pf: &mut u8, unint: bool, interesting_queued: &mut usize) -> bool {
+    if *pf == 0 {
+        *pf = QUEUED | if unint { UNINTERESTING } else { 0 };
         if !unint {
             *interesting_queued += 1;
         }
         return true;
-    };
+    }
     if unint && *pf & UNINTERESTING == 0 {
         *pf |= UNINTERESTING;
         if *pf & QUEUED != 0 {
@@ -200,8 +211,6 @@ struct Selected {
     /// (commit, whole tree) in parents-first order; whole-tree commits are
     /// shallow boundaries.
     commits: Vec<(DenseId, bool)>,
-    send_set: RoaringBitmap,
-    unint: RoaringBitmap,
     shallow: Vec<Oid>,
     unshallow: Vec<Oid>,
     shallow_mode: bool,
@@ -231,21 +240,16 @@ fn select_commits(snap: &Snapshot, args: &FetchArgs, want_commits: &[DenseId]) -
         };
         let (commits, shallow, unshallow) = deepen.select(want_commits, &have_commits)?;
         return Ok(Selected {
-            send_set: commits.iter().map(|&(d, _)| d).collect(),
             commits,
-            unint: RoaringBitmap::new(),
             shallow,
             unshallow,
             shallow_mode,
         });
     }
-    let (mut send, unint) = walk(snap, want_commits, &have_commits, &client_shallow)?;
-    let send_set = send.iter().copied().collect();
+    let mut send = walk(snap, want_commits, &have_commits, &client_shallow)?;
     send.reverse(); // walk emits children first
     Ok(Selected {
         commits: send.into_iter().map(|d| (d, false)).collect(),
-        send_set,
-        unint,
         shallow: Vec::new(),
         unshallow: Vec::new(),
         shallow_mode,
@@ -279,8 +283,9 @@ impl Deepen<'_> {
     fn select(&self, want_commits: &[DenseId], have_commits: &[DenseId]) -> Result<DeepenOut> {
         let (snap, args, depth) = (self.snap, self.args, self.depth);
         let (mut shallow, mut unshallow) = (Vec::new(), Vec::new());
-        // (commit, depth); a commit at depth >= `depth` with parents becomes
-        // a shallow boundary.
+        // (commit, depth); a commit at depth >= `depth` becomes a shallow
+        // boundary. As in git, that holds for a root too: the client then
+        // records it as shallow, though nothing lies past it.
         let mut seen: HashMap<DenseId, u32> = HashMap::new();
         let mut q = VecDeque::new();
         self.seed(want_commits, have_commits, &mut seen, &mut q)?;
@@ -299,7 +304,7 @@ impl Deepen<'_> {
                 dep >= depth
             };
             let boundary = at_limit && !node.parents.is_empty();
-            if is_client_shallow && !at_limit && !node.parents.is_empty() {
+            if is_client_shallow && !at_limit {
                 unshallow.push(snap.oid(d));
             }
             // Absolute depth is measured from the wants, so walk through
@@ -307,7 +312,7 @@ impl Deepen<'_> {
             if !client_has {
                 visited.push((d, boundary));
             }
-            if boundary && !is_client_shallow && !client_has {
+            if at_limit && !is_client_shallow && !client_has {
                 shallow.push(snap.oid(d));
             }
             if boundary || at_limit {
@@ -316,7 +321,7 @@ impl Deepen<'_> {
             // In relative mode, walked new commits only descend into shallow
             // territory through the client's boundary commits.
             let descend = !args.deepen_relative || dep > 0 || is_client_shallow;
-            self.queue_parents(node.parents, dep, descend, &mut seen, &mut q);
+            self.queue_parents(node.parents, dep, descend, &mut seen, &mut q)?;
         }
         visited.sort_by_key(|(d, _)| snap.commit(*d).map_or(0, |c| c.generation));
         Ok((visited, shallow, unshallow))
@@ -342,7 +347,7 @@ impl Deepen<'_> {
         // (v0 clients don't in their first stateless request).
         let mut known = have_commits.to_vec();
         known.extend(self.client_shallow.iter());
-        let (send, _) = walk(self.snap, want_commits, &known, self.client_shallow)?;
+        let send = walk(self.snap, want_commits, &known, self.client_shallow)?;
         for d in send.into_iter().chain(self.client_shallow.iter()) {
             enqueue(seen, q, d, 0);
         }
@@ -352,13 +357,14 @@ impl Deepen<'_> {
     /// Queue the parents of a commit at depth `dep` not seen yet.
     fn queue_parents(
         &self,
-        parents: &[DenseId],
+        parents: &[CommitNum],
         dep: u32,
         descend: bool,
         seen: &mut HashMap<DenseId, u32>,
         q: &mut VecDeque<DenseId>,
-    ) {
+    ) -> Result<()> {
         for &p in parents {
+            let p = self.snap.links(p).context("commit missing")?.id;
             if seen.contains_key(&p) {
                 continue;
             }
@@ -373,6 +379,7 @@ impl Deepen<'_> {
             seen.insert(p, p_dep);
             q.push_back(p);
         }
+        Ok(())
     }
 }
 
@@ -468,14 +475,13 @@ fn assemble(
         match filter {
             Filter::None => false,
             Filter::BlobNone => snap.kind(d) == Kind::Blob,
-            Filter::BlobLimit(n) => snap.kind(d) == Kind::Blob && snap.size(d) > n,
+            // As in git, a blob of exactly `n` bytes is left out too.
+            Filter::BlobLimit(n) => snap.kind(d) == Kind::Blob && snap.size(d) >= n,
             Filter::TreeNone => matches!(snap.kind(d), Kind::Blob | Kind::Tree),
         }
     };
     let Selected {
         commits,
-        send_set,
-        unint,
         shallow,
         unshallow,
         shallow_mode,
@@ -511,28 +517,34 @@ fn assemble(
     // Id order is table order and storage order: one sequential pass over
     // the records, and entries sent with each delta's base before it.
     let mut objects = Vec::with_capacity(usize::try_from(in_pack.len()).unwrap_or_default());
-    // Delta base availability.
-    let mut reencode = RoaringBitmap::new();
+    // No thin deltas: git's `index-pack --fix-thin` resolves every delta on
+    // a base it has to add on one thread, which costs the client more than
+    // the bytes they save. Of the objects that share a base outside the
+    // pack, the first goes whole and the others as deltas against it, so
+    // they resolve as one in-pack tree. Shallow and filtered fetches keep
+    // many such objects: replay rebuilds them whole in bulk.
+    let grouped = |kind: Kind| {
+        !shallow_mode
+            && (filter == Filter::None || (filter == Filter::BlobNone && kind == Kind::Tree))
+    };
+    let mut first_on_base: HashMap<DenseId, DenseId> = HashMap::new();
     for d in &in_pack {
         let loc = snap.entry_loc(d)?;
-        let missing = loc.base.is_some_and(|b| !in_pack.contains(b));
-        if missing {
-            let kind = snap.kind(d);
-            let thin_ok = args.thin_pack
-                && !shallow_mode
-                && (filter == Filter::None || (filter == Filter::BlobNone && kind == Kind::Tree));
-            let ctx_ok = loc
-                .ctx
-                .is_some_and(|c| send_set.contains(c) || unint.contains(c));
-            if !(thin_ok && ctx_ok) {
-                reencode.insert(d);
-            }
-        }
-        objects.push(Planned { d, loc });
+        let emit = match loc.base.filter(|&b| !in_pack.contains(b)) {
+            None => Emit::Stored,
+            Some(b) if grouped(snap.kind(d)) => match first_on_base.entry(b) {
+                Entry::Vacant(e) => {
+                    e.insert(d);
+                    Emit::Whole
+                }
+                Entry::Occupied(e) => Emit::Delta(*e.get()),
+            },
+            Some(_) => Emit::Whole,
+        };
+        objects.push(Planned { d, loc, emit });
     }
     Ok(Plan {
         objects,
-        reencode,
         shallow,
         unshallow,
         ofs_delta: args.ofs_delta,
@@ -558,6 +570,20 @@ fn full_entry_cached(snap: &Snapshot, d: DenseId) -> Result<Arc<Vec<u8>>> {
     Ok(e)
 }
 
+/// The entry of `d` as a delta against `base` (returned with it), or whole
+/// if that is not smaller. Not cached: the base depends on what else the
+/// fetch sends.
+fn delta_entry(snap: &Snapshot, d: DenseId, base: DenseId) -> Result<Encoded> {
+    let (target, from) = (snap.read(d)?, snap.read(base)?);
+    Ok(match delta::encode(&from, &target, target.len()) {
+        Some(dl) => (Arc::new(ref_delta_entry(&snap.oid(base), &dl)), Some(base)),
+        None => (Arc::new(full_entry(snap.kind(d), &target)), None),
+    })
+}
+
+/// A re-encoded entry, with its delta base if it is a delta.
+type Encoded = (Arc<Vec<u8>>, Option<DenseId>);
+
 /// Entry bytes past the one being written whose loads are kept in flight.
 const AHEAD_BYTES: u64 = 32 << 20;
 
@@ -572,11 +598,12 @@ pub(crate) async fn write_pack(snap: Arc<Snapshot>, plan: Plan, sink: Sink) -> R
 /// The pack being written.
 struct Out {
     sink: Sink,
+    format: ObjectFormat,
     hasher: PackHasher,
     buf: Vec<u8>,
     pos: u64,
     /// Pack offset of each object written so far (for `OFS_DELTA`). Stored
-    /// deltas name their base by object id (`REF_DELTA`, 20 bytes); a base
+    /// deltas name their base by object id (`REF_DELTA`, 20 or 32 bytes); a base
     /// earlier in this pack can be named by its distance instead (1-4
     /// bytes), which is what git's own packs do.
     offsets: Option<HashMap<DenseId, u64>>,
@@ -613,7 +640,7 @@ impl Out {
         let start = self.buf.len();
         match base.and_then(|b| self.offsets.as_ref()?.get(&b).copied()) {
             Some(off) => {
-                let e = StoredEntry::parse(entry)?;
+                let e = StoredEntry::parse(self.format, entry)?;
                 ensure!(e.delta, "delta base on a full entry");
                 encode_entry_header(OFS_DELTA, e.size, &mut self.buf);
                 encode_ofs(self.pos - off, &mut self.buf);
@@ -651,12 +678,14 @@ pub(crate) struct PackWriter {
     pending: HashMap<Ticket, usize>,
     held: Vec<(usize, Vec<crate::storage::Pinned>)>,
     /// Re-encoded entries not written yet.
-    encoded: HashMap<DenseId, Arc<Vec<u8>>>,
+    encoded: HashMap<DenseId, Encoded>,
 }
 
 impl PackWriter {
     pub(crate) fn new(snap: Arc<Snapshot>, mut plan: Plan, sink: Sink) -> Result<PackWriter> {
+        let format = snap.format();
         let (hasher, header) = PackHasher::header(
+            format,
             u32::try_from(plan.objects.len()).context("too many objects for a pack")?,
         );
         // A large pack streams most of the layers: read it as a scan so it
@@ -670,10 +699,15 @@ impl PackWriter {
         // rebuild them all in one replay of their delta chains, and send them
         // first (stored deltas after them can then name them by offset).
         let mut replay = None;
-        if plan.reencode.len() >= super::replay::replay_min() {
-            replay = Some(super::replay::Replay::new(&snap, &plan.reencode)?);
-            let reencode = std::mem::take(&mut plan.reencode);
-            plan.objects.retain(|p| !reencode.contains(p.d));
+        let whole: RoaringBitmap = plan
+            .objects
+            .iter()
+            .filter(|p| p.emit == Emit::Whole)
+            .map(|p| p.d)
+            .collect();
+        if whole.len() >= super::replay::replay_min() {
+            replay = Some(super::replay::Replay::new(&snap, &whole)?);
+            plan.objects.retain(|p| p.emit != Emit::Whole);
         }
         let header_len = u64::try_from(header.len())?;
         let offsets = plan
@@ -682,6 +716,7 @@ impl PackWriter {
         Ok(PackWriter {
             out: Out {
                 sink,
+                format,
                 hasher,
                 buf: Vec::with_capacity(1 << 16),
                 pos: header_len,
@@ -709,24 +744,24 @@ impl PackWriter {
             return Ok(());
         }
         let mut need = Vec::new();
-        while let Some(Planned { d, loc }) = self.plan.objects.get(self.ahead) {
+        while let Some(&Planned { d, loc, emit }) = self.plan.objects.get(self.ahead) {
             if self.ahead != self.next && self.ahead_bytes >= AHEAD_BYTES {
                 break;
             }
-            let charge = if self.plan.reencode.contains(*d) {
-                let chain = self.snap.missing(*d)?;
-                let bytes = chain.iter().map(NotResident::len).sum();
-                need.extend(chain);
-                bytes
-            } else {
+            let charge = if emit == Emit::Stored {
                 need.extend(
                     self.snap
-                        .locate(*d)
+                        .locate(d)
                         .0
                         .layer
                         .entries_missing(loc.off, loc.off + u64::from(loc.len)),
                 );
                 u64::from(loc.len)
+            } else {
+                let chain = self.chains_missing(d, emit)?;
+                let bytes = chain.iter().map(NotResident::len).sum();
+                need.extend(chain);
+                bytes
             };
             self.ahead_bytes += charge;
             self.charges.push_back(charge);
@@ -750,12 +785,12 @@ impl PackWriter {
             .iter()
             .skip(self.next)
             .take(end.saturating_sub(self.next));
-        for Planned { d, .. } in window {
-            if self.plan.reencode.contains(*d)
-                && !self.encoded.contains_key(d)
-                && self.snap.missing(*d)?.is_empty()
+        for &Planned { d, emit, .. } in window {
+            if emit != Emit::Stored
+                && !self.encoded.contains_key(&d)
+                && self.chains_missing(d, emit)?.is_empty()
             {
-                todo.push(*d);
+                todo.push((d, emit));
             }
         }
         let snap = &self.snap;
@@ -769,18 +804,31 @@ impl PackWriter {
         Ok(())
     }
 
+    /// The not-local parts of the chains that re-encoding `d` reads.
+    fn chains_missing(&self, d: DenseId, emit: Emit) -> Result<Vec<NotResident>> {
+        let mut need = self.snap.missing(d)?;
+        if let Emit::Delta(base) = emit {
+            need.extend(self.snap.missing(base)?);
+        }
+        Ok(need)
+    }
+
     fn finish(&mut self) -> Result<()> {
         self.out.flush()?;
-        let trailer = std::mem::take(&mut self.out.hasher).finish();
+        let trailer = self.out.hasher.finish();
         (self.out.sink)(&trailer)
     }
 }
 
 /// Re-encode `block`, skipping objects whose chains are not local now.
-fn encode_block(snap: &Snapshot, block: &[DenseId]) -> Result<Vec<(DenseId, Arc<Vec<u8>>)>> {
+fn encode_block(snap: &Snapshot, block: &[(DenseId, Emit)]) -> Result<Vec<(DenseId, Encoded)>> {
     let mut out = Vec::new();
-    for &d in block {
-        match full_entry_cached(snap, d) {
+    for &(d, emit) in block {
+        let entry = match emit {
+            Emit::Delta(base) => delta_entry(snap, d, base),
+            _ => full_entry_cached(snap, d).map(|e| (e, None)),
+        };
+        match entry {
             Ok(e) => out.push((d, e)),
             Err(e) if NotResident::find(&e).is_some() => {}
             Err(e) => return Err(e),
@@ -799,14 +847,14 @@ enum Progress {
 }
 
 impl PackWriter {
-    /// Write the re-encoded entry of `d`, once its chain is local.
-    fn write_reencoded(&mut self, d: DenseId, waits: &mut Waits) -> Result<Progress> {
+    /// Write the re-encoded entry of `d`, once its chains are local.
+    fn write_reencoded(&mut self, d: DenseId, emit: Emit, waits: &mut Waits) -> Result<Progress> {
         if !self.encoded.contains_key(&d) {
             self.encode()?;
         }
-        let Some(e) = self.encoded.remove(&d) else {
-            // Not local (yet, or any more): wait for its chain.
-            let need = self.snap.missing(d)?;
+        let Some((e, base)) = self.encoded.remove(&d) else {
+            // Not local (yet, or any more): wait for its chains.
+            let need = self.chains_missing(d, emit)?;
             if need.is_empty() {
                 return Ok(Progress::Retry);
             }
@@ -814,7 +862,7 @@ impl PackWriter {
             self.pending.insert(t, self.next + 1);
             return Ok(Progress::Parked);
         };
-        self.out.full(d, &e)?;
+        self.out.stored(d, base, &e)?;
         Ok(Progress::Written)
     }
 
@@ -857,14 +905,14 @@ impl machine::Machine for PackWriter {
         }
         loop {
             self.read_ahead(waits)?;
-            let Some(&Planned { d, loc }) = self.plan.objects.get(self.next) else {
+            let Some(&Planned { d, loc, emit }) = self.plan.objects.get(self.next) else {
                 self.finish()?;
                 return Ok(Some(()));
             };
-            let progress = if self.plan.reencode.contains(d) {
-                self.write_reencoded(d, waits)?
-            } else {
+            let progress = if emit == Emit::Stored {
                 self.write_stored(d, loc, waits)?
+            } else {
+                self.write_reencoded(d, emit, waits)?
             };
             match progress {
                 Progress::Written => {}

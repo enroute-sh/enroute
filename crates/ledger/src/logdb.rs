@@ -1,14 +1,14 @@
 //! The ledger node's local log store: one [raft-engine] instance shared by
-//! every replicated log on the node (one raft group each, under its log id),
+//! every replicated log on the node (one raft-engine group each, under its log id),
 //! and the node's identity (its own region, key-value pairs only).
 //!
 //! raft-engine is `TiKV`'s log store for many raft groups: one append-only
 //! sequence of files with group commit, an in-memory index of entry
 //! positions per group, crash recovery, and garbage collection of old files
 //! (purging, which may ask for groups holding them back to be compacted).
-//! Values are raft-rs's prost messages (see `consensus::codec`); our own
-//! records (snapshot data) are protobuf inside them, the identity plain
-//! bytes.
+//! Values are protobuf messages (see `consensus::codec`): raft-rs's for the
+//! root log, the ledger's own for the repository logs; the identity is
+//! plain bytes.
 //!
 //! The consensus engine owns the store: everything else holds it weakly, so
 //! it closes (releasing its directory lock) once consensus has stopped.
@@ -115,7 +115,7 @@ pub(crate) fn is_log(region: u64) -> bool {
 const IDENTITY: u64 = 2;
 const STORE_ID_KEY: &[u8] = b"store_id";
 
-/// This store's id, created with the store: the node's Raft id. A node
+/// This store's id, created with the store: the node's id in the ledger. A node
 /// whose store is lost comes back as a new node, so it can never vote in
 /// logs it no longer remembers.
 pub(crate) fn store_id(db: &LogDb) -> Result<u64> {

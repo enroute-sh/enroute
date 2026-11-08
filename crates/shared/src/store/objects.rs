@@ -1,7 +1,7 @@
-//! The object store, as the node uses it: one handle with a cap on
-//! concurrent requests (held until a read's body is consumed), small metadata objects (repository state, the node
-//! registry) with conditional writes, and access to the raw store for the
-//! bulk transfers of layer files.
+//! The object store, as the node uses it: handles whose requests share the
+//! node's slot pool ([`IoLimiter`]), small metadata objects (repository
+//! state, the cluster's membership) with conditional writes, and access to the
+//! store for the bulk transfers of layer files.
 
 use std::fmt;
 use std::path::Path;
@@ -9,18 +9,13 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use futures::StreamExt;
-use object_store::limit::LimitStore;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload, path::Path as StorePath};
 
+use super::io::{ClassStore, IoClass, IoLimiter};
 use super::local::StoreFiles;
 
 /// The version of an object, for compare-and-swap ([`Objects::put_if`]).
 pub type ObjectVersion = object_store::UpdateVersion;
-
-/// Maximum concurrent object-store requests per node. Unbounded fan-out
-/// (a burst of uploads or deletes) opens hundreds of TLS connections at once
-/// and runs into connect timeouts.
-const STORE_CONCURRENCY: usize = 64;
 
 /// Where the objects live: a store, and its directory if it is on this
 /// machine.
@@ -41,8 +36,8 @@ impl Store {
     /// The store in the local directory `root`, which is created if it does
     /// not exist.
     ///
-    /// Its own store, not `object_store`'s, because the leases and the
-    /// registry need compare-and-swap.
+    /// Its own store, not `object_store`'s, because conditional writes (the
+    /// cluster object, sweep records, trash markers) need compare-and-swap.
     ///
     /// # Errors
     ///
@@ -62,19 +57,40 @@ impl Store {
         &self.store
     }
 
-    /// A node's handle on this store.
+    /// A handle on this store, with a slot pool of its own at the default
+    /// shares, for tools and tests.
     #[must_use]
     pub fn objects(&self) -> Arc<Objects> {
+        self.objects_in(&IoLimiter::with_defaults(), None)
+    }
+
+    /// A handle on this store whose requests take slots from `io`, in class
+    /// `pinned` or else the class of the task that makes them.
+    ///
+    /// Unbounded fan-out (a burst of uploads or deletes) opens hundreds of
+    /// TLS connections at once and runs into connect timeouts.
+    #[must_use]
+    pub fn objects_in(&self, io: &Arc<IoLimiter>, pinned: Option<IoClass>) -> Arc<Objects> {
         Arc::new(Objects {
-            store: Arc::new(LimitStore::new(self.store.clone(), STORE_CONCURRENCY)),
+            store: Arc::new(ClassStore {
+                inner: self.store.clone(),
+                io: io.clone(),
+                pinned,
+            }),
+            raw: self.store.clone(),
+            io: io.clone(),
+            pinned,
             files: self.files.clone(),
         })
     }
 }
 
-/// A node's handle on a store, with its cap on concurrent requests.
+/// A node's handle on a store, whose requests take slots from its pool.
 pub struct Objects {
     store: Arc<dyn ObjectStore>,
+    raw: Arc<dyn ObjectStore>,
+    io: Arc<IoLimiter>,
+    pinned: Option<IoClass>,
     files: Option<Arc<StoreFiles>>,
 }
 
@@ -93,23 +109,21 @@ impl Objects {
         self.files.as_ref()?.path(key)
     }
 
-    /// The store, under the node's cap on concurrent requests, for bulk
-    /// transfers.
+    /// The store, under the node's slot pool, for bulk transfers.
     #[must_use]
     pub fn inner(&self) -> &Arc<dyn ObjectStore> {
         &self.store
     }
 
-    /// Read the object `path` and its version, if it exists.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the store request fails.
-    pub async fn get_versioned(&self, path: &str) -> Result<Option<(bytes::Bytes, ObjectVersion)>> {
-        Ok(self
-            .get_timed(path)
-            .await?
-            .map(|(data, version, _)| (data, version)))
+    /// The store, with its requests in the caller's class wherever they are
+    /// made: for writers driven from a blocking thread.
+    #[must_use]
+    pub fn in_current_class(&self) -> Arc<dyn ObjectStore> {
+        Arc::new(ClassStore {
+            inner: self.raw.clone(),
+            io: self.io.clone(),
+            pinned: Some(self.pinned.unwrap_or_else(IoClass::current)),
+        })
     }
 
     /// Read the object `path`, its version and when the object store says
@@ -185,27 +199,6 @@ impl Objects {
         Ok(self.get_timed(path).await?.map(|(data, ..)| data))
     }
 
-    /// Names of the objects directly under `prefix` with their last
-    /// modification times.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the store request fails.
-    pub(crate) async fn list_modified(
-        &self,
-        prefix: &str,
-    ) -> Result<Vec<(String, std::time::SystemTime)>> {
-        let listed = self
-            .store
-            .list_with_delimiter(Some(&StorePath::from(prefix)))
-            .await?;
-        Ok(listed
-            .objects
-            .into_iter()
-            .filter_map(|m| Some((m.location.filename()?.to_string(), m.last_modified.into())))
-            .collect())
-    }
-
     /// Paths of the objects under `prefix`, at any depth.
     ///
     /// # Errors
@@ -220,12 +213,21 @@ impl Objects {
         Ok(out)
     }
 
+    /// Whether the store holds no object at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store request fails.
+    pub(crate) async fn is_empty(&self) -> Result<bool> {
+        Ok(self.store.list(None).next().await.transpose()?.is_none())
+    }
+
     /// Write the object `path`, replacing it if it exists.
     ///
     /// # Errors
     ///
     /// Returns an error if the store request fails.
-    pub(crate) async fn put_object(&self, path: &str, data: bytes::Bytes) -> Result<()> {
+    pub async fn put_object(&self, path: &str, data: bytes::Bytes) -> Result<()> {
         self.store
             .put(&StorePath::from(path), PutPayload::from(data))
             .await?;

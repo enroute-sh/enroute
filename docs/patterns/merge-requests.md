@@ -168,5 +168,5 @@ fallen behind rebases it and pushes again.
   front of the ref move.
 - [Protected branches](protected-branches.md) — the rule that makes this the
   only way onto the trunk.
-- [The contract](../reference/the-contract.md#refs-and-objects) — `UpdateRefs`, its
+- [The contract](../reference/the-contract.md#updaterefs) — `UpdateRefs`, its
   outcomes, and `IsAncestor`.

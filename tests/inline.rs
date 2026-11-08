@@ -28,7 +28,7 @@ fn pending_layers(server: &Server, repo: &str) -> usize {
 
 /// Inline layers travel in the log, so a push survives an object store outage.
 ///
-/// Every node serves it, through the loss of the leader and the maintainer;
+/// Every node serves it, through the loss of the sequencer and the maintainer;
 /// another node flushes it once the store is back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn inline_layers_replicate_through_the_log() {
@@ -40,8 +40,8 @@ async fn inline_layers_replicate_through_the_log() {
     ));
     let mut servers: Vec<Option<Server>> = cluster(root.path(), &store, 3, |_, c| {
         c.compute.merge_factor = 0;
+        c.compute.flush_interval = Duration::from_millis(200);
         c.store = enroute::node::Store::new(outage.clone());
-        c.compute.maintenance_lease = Duration::from_secs(2);
     })
     .await
     .into_iter()
@@ -130,7 +130,7 @@ async fn inline_layers_replicate_through_the_log() {
         assert_eq!(git.rev(&src, "main").await, git.rev(&dst, "HEAD").await);
     }
 
-    // The leader dies; the store recovers; a compute node flushes.
+    // The sequencer dies; the store recovers; a compute node flushes.
     let dead = servers[0].take().unwrap();
     dead.node.shutdown().await;
     drop(dead);
@@ -187,6 +187,9 @@ async fn large_layers_are_uploaded_before_commit() {
         outage = Some(common::Outage::wrap(c));
         c.compute.merge_factor = 0;
         c.compute.inline_layer_bytes = 0;
+        // Every layer is uploaded, so a ledger that refuses inline ones
+        // takes each push.
+        c.ledger.max_inline_layer_bytes = 0;
     })
     .await;
     let git = Git::new();
@@ -214,6 +217,47 @@ async fn large_layers_are_uploaded_before_commit() {
     )
     .await;
     assert_eq!(git.rev(&src, "main").await, git.rev(&dst, "HEAD").await);
+}
+
+/// A ledger refuses a push that carries a layer over its inline limit,
+/// whatever the compute is set to, and takes one within it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ledger_refuses_inline_layers_over_its_limit() {
+    let server = Server::start_with(|c| {
+        c.compute.inline_layer_bytes = 1 << 20;
+        c.compute.flush_interval = Duration::from_secs(3600);
+        c.ledger.max_inline_layer_bytes = 16 << 10;
+    })
+    .await;
+    let git = Git::new();
+    let src = git.init("src").await;
+    let url = server.repo_url("limit");
+    git.commit_file(&src, "f", "small\n", "c0").await;
+    git.run(&src, &["push", "-q", &url, "main"]).await;
+    assert_eq!(
+        pending_layers(&server, "limit"),
+        1,
+        "the small layer is inline"
+    );
+    git.commit_file(&src, "f", &text(0, 4000), "c1").await;
+    let (ok, _, stderr) = git.try_run(&src, &["push", "-q", &url, "main"]).await;
+    assert!(!ok, "an inline layer over the limit went through");
+    assert!(stderr.contains("at most 16384 bytes"), "{stderr}");
+    assert_eq!(pending_layers(&server, "limit"), 1);
+}
+
+/// A ledger whose limit is 0 refuses every push that carries its layer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ledger_without_inline_layers_refuses_them() {
+    let server = Server::start_with(|c| c.ledger.max_inline_layer_bytes = 0).await;
+    let git = Git::new();
+    let src = git.init("src").await;
+    let url = server.repo_url("small");
+    git.commit_file(&src, "f", "small\n", "c0").await;
+    let (ok, _, stderr) = git.try_run(&src, &["push", "-q", &url, "main"]).await;
+    assert!(!ok, "an inline layer went through");
+    assert!(stderr.contains("at most 0 bytes"), "{stderr}");
+    assert_eq!(pending_layers(&server, "small"), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

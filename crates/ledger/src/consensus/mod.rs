@@ -1,27 +1,33 @@
-//! Consensus: one replicated log per repository.
+//! Consensus: one replicated log per repository, and the root log.
 //!
 //! Every repository has its own log whose state machine is that
-//! repository's refs and layer manifest, hosted by its voters for as long
-//! as it exists. Which repositories exist, and a checkpoint of each one's
-//! state, are in the object store (see [`crate::Ledger`]). All logs on a
-//! node share one log store (`logdb`) and one event loop (see
-//! `engine`), so many logs cost no more fsyncs or RPCs than one. Idle
-//! logs go quiet (no ticks, no heartbeats).
+//! repository's refs and layer manifest, on (up to) three replicas, one of
+//! them its sequencer (see `repo`, and the [`shardlog`] module's model of the
+//! protocol). Which repositories exist, in which incarnation, where their
+//! logs are, and who the members are is the root log's state machine
+//! ([`root`]), a raft-rs group (`TiKV`'s port of etcd/raft) hosted by every
+//! node; its leader hands logs to new sequencers when theirs fail (see
+//! `control`). All logs on a node share one log store (`logdb`) and one
+//! event loop (see `engine`), so many logs cost no more fsyncs or RPCs
+//! than one, and an idle log costs nothing.
 //!
-//! The consensus core is raft-rs (`TiKV`'s port of etcd/raft). A node's Raft
-//! id is its store id (`logdb::store_id`), and nodes find each
-//! other through the node registry ([`enroute_shared::registry`]). Every
-//! repository's voters are the ledger's members: a log's leader changes
-//! them to match when the members change (see `engine`).
+//! A node's id is its store id (`logdb::store_id`), and nodes find each
+//! other through the node registry ([`crate::registry`]).
 
 mod apply;
 mod codec;
+mod control;
 mod engine;
-mod logstore;
+mod repo;
+pub(crate) mod root;
+mod root_store;
+pub mod shardlog;
 mod stats;
 mod transport;
 
-pub use engine::{Engine, Hosted, Stats};
+pub(crate) use engine::Located;
+pub use engine::{Engine, Hosted, NotSequencer, Stats};
+pub use transport::Addresses;
 
 /// The id of incarnation `epoch` of `repo`'s log: a hash, so nodes agree on
 /// it without coordination (never 0).

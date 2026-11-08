@@ -1,5 +1,5 @@
 //! Background maintenance of layer manifests (LSM-style), run by the compute
-//! holding the repository's maintenance lease.
+//! that maintains the repository.
 //!
 //! - **Flush.** Inline layers (the memtable: their files are in the log)
 //!   move to the object store. A contiguous run of them is merged into one
@@ -10,7 +10,7 @@
 //!   once it holds [`FLUSH_BYTES`] or `flush_max_layers`.
 //! - **Compaction.** Stored layers accumulate as pushes land. Runs of
 //!   layers of about one size are merged into bigger ones, so layer sizes
-//!   grow geometrically (see [`pick`]).
+//!   grow geometrically (see [`policy::pick`]).
 //!   Merging copies stored pack entries verbatim (no recompression), drops
 //!   duplicate objects, and rewrites the commit graph and segments with
 //!   fresh layer-local refs.
@@ -28,14 +28,17 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
-use enroute_shared::state::{Command, Commit, LayerMeta, RepoMeta};
+use enroute_shared::proto::PendingRepo;
+use enroute_shared::state::{Command, Commit, LayerMeta};
+use enroute_shared::store::IoClass;
 
 use crate::compute::ComputeConfig;
+use crate::meta::RepoState;
 use crate::repo::merge::{Merged, WINDOW, merge_layers};
 use crate::repo::view::LayerView;
 use crate::storage::{Sealed, new_layer_id, stored_meta};
 
-use super::Maintainer;
+use super::{Maintainer, policy};
 
 /// Flushes of one repository in flight on a node at most. Under heavy
 /// writes inline layers arrive faster than one flush at a time (merge,
@@ -55,15 +58,24 @@ const MAX_COMPACTIONS: usize = 2;
 /// after a change of policy, or of `merge_factor`.
 const MAX_NODE_COMPACTIONS: usize = 4;
 
-/// Layers below this size are in the smallest size class: merging tiny
-/// flushes by exact size buys nothing. Small, because a layer of this class
-/// is rewritten each time new layers of the class merge into it.
-const MIN_CLASS_BYTES: u64 = 64 << 10;
+/// Pending repositories with the versions the ledger gave them, shared
+/// between the tick and its callers.
+type Repos = Arc<HashMap<String, u64>>;
 
 /// This node's maintenance: what it has in flight per repository, and a
 /// wake-up for the next tick.
 #[derive(Default)]
 pub(super) struct Maintenance {
+    /// The repositories that the ledger says may need this node's
+    /// maintenance, with their versions: as last asked, and as the last
+    /// tick saw them. A tick visits those whose state changed, that became
+    /// pending or got a new version since, or whose recheck is due, so its
+    /// cost follows the work, not the number of pending repositories.
+    /// Settled from a state at least as new as its version, a repository
+    /// needs no maintenance until its layers change.
+    pending: parking_lot::Mutex<(Repos, Repos)>,
+    /// Repositories found settled, for the ledger, with their versions.
+    settled: parking_lot::Mutex<HashMap<String, u64>>,
     repos: parking_lot::Mutex<HashMap<String, InFlight>>,
     /// Wakes maintenance before its next tick (a flush finished, and more
     /// may be due).
@@ -72,8 +84,7 @@ pub(super) struct Maintenance {
 
 #[derive(Default)]
 struct InFlight {
-    /// When this node first saw each inline layer, by first id (flush age;
-    /// on every replica, so a new maintainer knows them too).
+    /// When this node first saw each inline layer, by first id (flush age).
     seen: BTreeMap<u32, Instant>,
     /// The id ranges of inline runs being flushed (several may be, on
     /// disjoint layers).
@@ -81,6 +92,37 @@ struct InFlight {
     /// The id ranges of stored runs being compacted. They are disjoint from
     /// each other and from flushes, so no swap invalidates another.
     compactions: Vec<Range<u64>>,
+    /// When to look at the repository again without a change to its state:
+    /// when its oldest inline layer is due to flush, or as soon as a job
+    /// ends.
+    recheck: Option<Instant>,
+}
+
+impl Maintenance {
+    pub(super) fn set_pending(&self, repos: Vec<PendingRepo>) {
+        self.pending.lock().0 = Arc::new(repos.into_iter().map(|r| (r.repo, r.version)).collect());
+    }
+
+    /// The repositories found settled since the last call.
+    pub(super) fn take_settled(&self) -> Vec<PendingRepo> {
+        std::mem::take(&mut *self.settled.lock())
+            .into_iter()
+            .map(|(repo, version)| PendingRepo { repo, version })
+            .collect()
+    }
+
+    /// Settle `repos` again with the next call (telling the ledger failed).
+    pub(super) fn keep_settled(&self, repos: Vec<PendingRepo>) {
+        let mut settled = self.settled.lock();
+        for r in repos {
+            settled.entry(r.repo).or_insert(r.version);
+        }
+    }
+
+    /// Whether `repo` has work here: pending, or in flight.
+    pub(super) fn holds(&self, repo: &str) -> bool {
+        self.pending.lock().0.contains_key(repo) || self.repos.lock().contains_key(repo)
+    }
 }
 
 impl InFlight {
@@ -104,6 +146,8 @@ impl Drop for Job {
             // Flushes and compactions hold disjoint ranges.
             w.flushes.retain(|r| *r != self.ids);
             w.compactions.retain(|r| *r != self.ids);
+            // Its layers are free: more may be due (a failed job, too).
+            w.recheck = Some(Instant::now());
         }
     }
 }
@@ -124,20 +168,47 @@ pub(super) fn spawn(node: &Arc<Maintainer>) {
     );
 }
 
-/// Start the work due for each repository this node follows, if this node
-/// holds (or can take) the repository's maintenance lease: a flush if one
-/// is due, and compactions if some are. They run independently (a flush
+/// Start the work due for each repository pending here: a flush if one is
+/// due, and compactions if some are. They run independently (a flush
 /// never waits for a compaction, which can take minutes), since each takes
 /// layers no other job holds. So several can be in flight (up to
 /// [`MAX_FLUSHES`] and [`MAX_COMPACTIONS`]).
 fn tick(node: &Arc<Maintainer>) {
     let now = Instant::now();
-    let names: HashSet<String> = node.states.names().into_iter().collect();
-    let mut due: Vec<(Arc<RepoMeta>, Job, Range<usize>)> = Vec::new();
+    let changed = node.states.take_changed();
+    let (pending, before) = {
+        let mut p = node.in_flight.pending.lock();
+        let pending = p.0.clone();
+        (pending.clone(), std::mem::replace(&mut p.1, pending))
+    };
+    let mut due: Vec<(Arc<RepoState>, Job, Range<usize>)> = Vec::new();
     {
         let mut repos = node.in_flight.repos.lock();
+        let mut visit: HashSet<String> = changed
+            .into_iter()
+            .filter(|r| pending.contains_key(r))
+            .collect();
+        if !Arc::ptr_eq(&pending, &before) {
+            // Jobs on a repository no longer pending here still run to the end.
+            repos.retain(|r, w| pending.contains_key(r) || !w.is_idle());
+            // A change seen while it was not pending here was skipped; a new
+            // version may be settled from the state seen.
+            visit.extend(
+                pending
+                    .iter()
+                    .filter(|(r, v)| before.get(*r) != Some(*v))
+                    .map(|(r, _)| r.clone()),
+            );
+        }
+        visit.extend(
+            repos
+                .iter()
+                .filter(|(_, w)| w.recheck.is_some_and(|t| t <= now))
+                .map(|(r, _)| r.clone()),
+        );
         let mut compactions: usize = repos.values().map(|w| w.compactions.len()).sum();
-        for repo in &names {
+        for repo in &visit {
+            // Not followed yet: its first state is a change.
             let Some(meta) = node.states.get(repo) else {
                 continue;
             };
@@ -161,26 +232,33 @@ fn tick(node: &Arc<Maintainer>) {
                 compactions += 1;
                 due.push((meta.clone(), job(ids), run));
             }
+            w.recheck = if room == 0
+                && w.compactions.len() < MAX_COMPACTIONS
+                && merge_due(&meta, &node.config)
+            {
+                // Waits for room on this node: no event says when.
+                Some(now)
+            } else {
+                flush_deadline(w, &node.config)
+            };
+            if w.is_idle()
+                && settled(&meta, &node.config)
+                && let Some(&version) = pending.get(repo)
+                && meta.version >= version
+            {
+                node.in_flight.settled.lock().insert(repo.clone(), version);
+            }
         }
-        repos.retain(|r, w| names.contains(r) || !w.is_idle());
     }
     for (meta, job, run) in due {
-        tokio::spawn(run_job(node.clone(), meta, job, run));
+        tokio::spawn(IoClass::Background.scope(run_job(node.clone(), meta, job, run)));
     }
 }
 
 /// Run one flush or compaction of `meta`, then wake maintenance if a flush
 /// freed inline layers.
-async fn run_job(node: Arc<Maintainer>, meta: Arc<RepoMeta>, job: Job, run: Range<usize>) {
+async fn run_job(node: Arc<Maintainer>, meta: Arc<RepoState>, job: Job, run: Range<usize>) {
     let repo = job.repo.clone();
-    match node.leases.hold(&repo).await {
-        Ok(true) => {}
-        Ok(false) => return,
-        Err(e) => {
-            tracing::warn!(repo, "taking the maintenance lease: {e:#}");
-            return;
-        }
-    }
     match replace_run(&node, &repo, &meta, run).await {
         Err(e) => tracing::warn!(repo, "layer maintenance failed (will retry): {e:#}"),
         Ok(Some(version)) => {
@@ -198,22 +276,31 @@ async fn run_job(node: Arc<Maintainer>, meta: Arc<RepoMeta>, job: Job, run: Rang
     }
 }
 
-/// The disjoint runs of stored layers, of `sizes`, that are due to merge,
-/// oldest first: none if compaction is off.
-fn compaction(sizes: &[u64], config: &ComputeConfig) -> Vec<Range<usize>> {
-    // A merge of one layer would only rewrite it, again and again.
-    if config.merge_factor < 2 {
-        return Vec::new();
+/// Whether some stored layers of `meta` are due to merge.
+fn merge_due(meta: &RepoState, config: &ComputeConfig) -> bool {
+    !policy::due(&policy::stored_sizes(&meta.layers), config.merge_factor).is_empty()
+}
+
+/// When the oldest inline layer that no flush holds is due to flush by
+/// age (None: there is none, or the flushes are at their cap). A flush
+/// that its size makes due starts on the change that made it so.
+fn flush_deadline(w: &InFlight, config: &ComputeConfig) -> Option<Instant> {
+    // At the cap, the end of a flush is the recheck.
+    if w.flushes.len() >= MAX_FLUSHES {
+        return None;
     }
-    pick(sizes, config.merge_factor, MIN_CLASS_BYTES)
+    w.seen
+        .iter()
+        .filter(|(id, _)| !w.flushes.iter().any(|r| r.contains(&u64::from(**id))))
+        .map(|(_, t)| *t + config.flush_interval)
+        .min()
 }
 
 /// Whether maintenance has nothing left to do on `meta`: every layer is
 /// stored, and no run is due to merge.
 #[must_use]
-pub fn settled(meta: &RepoMeta, config: &ComputeConfig) -> bool {
-    let sizes = stored_sizes(&meta.layers);
-    sizes.len() == meta.layers.len() && compaction(&sizes, config).is_empty()
+pub fn settled(meta: &RepoState, config: &ComputeConfig) -> bool {
+    policy::settled(&meta.layers, config.merge_factor)
 }
 
 /// The runs of stored layers of `meta` due to merge that no compaction in
@@ -221,7 +308,7 @@ pub fn settled(meta: &RepoMeta, config: &ComputeConfig) -> bool {
 /// [`MAX_COMPACTIONS`] allows.
 fn next_compactions(
     w: &InFlight,
-    meta: &RepoMeta,
+    meta: &RepoState,
     room: usize,
     config: &ComputeConfig,
 ) -> Vec<(Range<usize>, Range<u64>)> {
@@ -229,7 +316,7 @@ fn next_compactions(
     if room == 0 {
         return Vec::new();
     }
-    let mut runs = compaction(&stored_sizes(&meta.layers), config);
+    let mut runs = policy::due(&policy::stored_sizes(&meta.layers), config.merge_factor);
     // The newest run goes first: big old merges must not take every slot
     // while small layers pile up.
     if let Some(newest) = runs.pop() {
@@ -250,7 +337,7 @@ fn next_compactions(
     clippy::indexing_slicing,
     reason = "runs are non-empty ranges of meta.layers"
 )]
-fn id_range(meta: &RepoMeta, run: &Range<usize>) -> Range<u64> {
+fn id_range(meta: &RepoState, run: &Range<usize>) -> Range<u64> {
     let layers = &meta.layers[run.clone()];
     u64::from(layers[0].first_id)..layers[layers.len() - 1].end_id()
 }
@@ -263,7 +350,7 @@ fn overlaps(a: &Range<u64>, b: &Range<u64>) -> bool {
 /// if this node may flush more of the repository now.
 fn next_flush(
     w: &InFlight,
-    meta: &RepoMeta,
+    meta: &RepoState,
     now: Instant,
     config: &ComputeConfig,
 ) -> Option<(Range<usize>, Range<u64>)> {
@@ -277,7 +364,7 @@ fn next_flush(
 
 /// The first of `runs` due to flush at `now`, with its layers' id range.
 fn due_run(
-    meta: &RepoMeta,
+    meta: &RepoState,
     seen: &BTreeMap<u32, Instant>,
     runs: Vec<Range<usize>>,
     now: Instant,
@@ -316,64 +403,6 @@ fn inline_runs<'a>(layers: impl IntoIterator<Item = (&'a LayerMeta, bool)>) -> V
     runs
 }
 
-/// Choose which layers to merge: disjoint runs of at least `factor`
-/// adjacent layers of about one size, oldest first.
-///
-/// This is a log-structured merge policy over a list that must stay in id
-/// order, as Lucene's `LogMergePolicy` is for segments in document order.
-/// From the oldest layer on, a stretch reaches to the last layer within
-/// `factor` of the largest one left (sizes under `floor` count as `floor`),
-/// and its layers merge `factor` at a time, or more, up to `factor` times
-/// the largest one, when a backlog has built up. Smaller layers between them
-/// join their merges, so none is left behind. A merge makes its output about
-/// `factor` times bigger than its inputs. So each byte is rewritten about
-/// once per size class (log base `factor` of the repository size over
-/// `floor`), and a repository has fewer than `factor` stored layers per
-/// size class. `factor` is at least 2.
-#[expect(clippy::indexing_slicing, reason = "indexes are within `sizes`")]
-fn pick(sizes: &[u64], factor: usize, floor: u64) -> Vec<Range<usize>> {
-    let wide = u64::try_from(factor).unwrap_or(u64::MAX);
-    let size = |i: usize| sizes[i].max(floor);
-    let n = sizes.len();
-    let mut runs = Vec::new();
-    let mut start = 0;
-    while start < n {
-        let largest = (start..n).map(size).max().unwrap_or(floor);
-        let end = (start..n)
-            .rev()
-            .find(|&i| size(i).saturating_mul(wide) >= largest)
-            .map_or(n, |i| i + 1);
-        // A backlog merges in wide runs: one merge per `factor` layers would
-        // drain only `factor - 1` layers per merge. The byte cap keeps each
-        // merge short.
-        let cap = largest.saturating_mul(wide);
-        let mut i = start;
-        while i < end {
-            let (mut j, mut bytes) = (i, 0u64);
-            while j < end && (j - i < factor || bytes.saturating_add(sizes[j]) <= cap) {
-                bytes = bytes.saturating_add(sizes[j]);
-                j += 1;
-            }
-            if j - i >= factor {
-                runs.push(i..j);
-            }
-            i = j;
-        }
-        start = end;
-    }
-    runs
-}
-
-/// Sizes of the stored prefix of a manifest: what compaction may merge
-/// (inline layers are flushed first).
-fn stored_sizes(layers: &[LayerMeta]) -> Vec<u64> {
-    layers
-        .iter()
-        .take_while(|l| l.is_stored())
-        .map(|l| l.bytes)
-        .collect()
-}
-
 /// Publish merged layer `m` of `name`, under a new id of upload generation
 /// `generation`.
 async fn publish_merged(
@@ -399,7 +428,7 @@ async fn publish_merged(
 async fn replace_run(
     node: &Maintainer,
     name: &str,
-    meta: &RepoMeta,
+    meta: &RepoState,
     run: Range<usize>,
 ) -> Result<Option<u64>> {
     #[expect(
@@ -485,63 +514,4 @@ async fn replace_run(
         "replaced layers"
     );
     Ok(Some(res.repo_version))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn size_classes_merge_factor_at_a_time() {
-        // Too few of a size class: nothing.
-        assert_eq!(pick(&[100, 1, 1, 1], 4, 1), Vec::<Range<usize>>::new());
-        // Four small layers on top of a big one: only they merge.
-        assert_eq!(pick(&[1000, 10, 10, 10, 10], 4, 1), vec![1..5]);
-        // Under the floor, sizes do not matter, and a backlog merges at
-        // once up to `factor` times the class size.
-        assert_eq!(pick(&[5, 1, 9, 2, 1, 1, 7, 3], 4, 10), vec![0..8]);
-        assert_eq!(pick(&[9; 10], 4, 10), vec![0..4, 4..8]);
-        assert_eq!(pick(&[1; 100], 4, 10), vec![0..40, 40..80, 80..100]);
-        // A smaller layer between two of a class joins their merge.
-        assert_eq!(pick(&[100, 1, 100, 100, 100, 10], 4, 1), vec![0..4]);
-        // Classes merge independently, oldest first.
-        assert_eq!(
-            pick(&[1000, 1000, 1000, 1000, 10, 10, 10, 10], 4, 1),
-            vec![0..4, 4..8]
-        );
-    }
-
-    /// Merge `sizes` until nothing is due; returns the bytes written.
-    fn compact(sizes: &mut Vec<u64>, factor: usize, floor: u64) -> u64 {
-        let mut written = 0;
-        let mut runs = pick(sizes, factor, floor);
-        while !runs.is_empty() {
-            for r in runs.into_iter().rev() {
-                let merged: u64 = sizes[r.clone()].iter().sum();
-                written += merged;
-                sizes.splice(r, [merged]);
-            }
-            runs = pick(sizes, factor, floor);
-        }
-        written
-    }
-
-    #[test]
-    fn write_amplification_and_layer_count_are_logarithmic() {
-        // A hot repository: flushes of 10 bytes, up to 10 million bytes.
-        let (factor, floor) = (4, 10);
-        let mut sizes: Vec<u64> = Vec::new();
-        let (mut written, mut flushed) = (0u64, 0u64);
-        for _ in 0..1_000_000u64 {
-            sizes.push(10);
-            flushed += 10;
-            written += compact(&mut sizes, factor, floor);
-            // log4(10M / 10) = 10 size classes, fewer than 4 layers each.
-            assert!(sizes.len() <= 3 * 11, "{} layers", sizes.len());
-        }
-        assert!(
-            written <= 11 * flushed,
-            "write amplification {written}/{flushed}"
-        );
-    }
 }

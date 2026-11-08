@@ -30,8 +30,8 @@ message RepoKey {
 // new side of a delete — the field is unset, rather than the all-zero oid git
 // writes on the wire or an empty string.
 message ObjectId {
-  // Lowercase hex, 40 characters. Every repository is SHA-1: nothing here
-  // negotiates a hash algorithm, and this widens when something does.
+  // Lowercase hex: 40 characters in a SHA-1 repository, 64 in a SHA-256 one
+  // (see `ObjectFormat`). An id of the other format names nothing there.
   //
   // Hex rather than raw bytes because a caller holds an id as hex already,
   // having read it from a listing — raw bytes would buy a smaller message at

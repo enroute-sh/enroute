@@ -21,11 +21,11 @@
 //!                    then the SHA-256 of every chunk of the file before
 //!                    the index region
 //! footer             section offsets, counts, crc32 of the index region
-//!                    and footer, "ENRLAYR1"
+//!                    and footer, the object format, "ENRLAYR2"
 //! ```
 //!
 //! The chunk hashes let a reader verify any chunk on its own: bytes read by
-//! range from the object store, and chunks of a local copy after a restart.
+//! range from the object store, and chunks of a linked local copy.
 //!
 //! Inside a layer every object has a *local index*: its position in the
 //! object table, which is also the order of the entries. Cross-object
@@ -53,7 +53,7 @@ use sha2::Digest;
 use zerocopy::little_endian::{I64, U32, U64};
 use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout, Unaligned};
 
-use crate::git::oid::{Kind, OID_LEN, Oid};
+use crate::git::oid::{Kind, ObjectFormat, Oid};
 use crate::storage::files::{self, FileWriter};
 use crate::storage::pool::{Access, Chunk, PagedFile, must, to_u64, to_usize};
 use crate::storage::spill::{OidIndex, TempTable, Workspace};
@@ -63,26 +63,69 @@ use crate::storage::tiered::{ChunkHashes, NotResident, Pinned};
 mod lookup;
 
 const CHUNK_HASH: usize = 32;
-const END_MAGIC: &[u8; 8] = b"ENRLAYR1";
-const RECORD: usize = size_of::<TableRecord>(); // 52
-const OID_ENTRY: usize = size_of::<OidEntry>(); // 24
+/// The end of a layer. Version 1 layers, from before SHA-256, are not read.
+const END_MAGIC: &[u8; 8] = b"ENRLAYR2";
 
 pub(super) use crate::git::cast::ix as widen;
 
-/// The offset of table record `local`.
-fn record_off(local: u32) -> u64 {
-    u64::from(local) * to_u64(RECORD)
+/// How a footer names an object format.
+fn format_code(format: ObjectFormat) -> u32 {
+    match format {
+        ObjectFormat::Sha1 => 1,
+        ObjectFormat::Sha256 => 2,
+    }
 }
 
-/// Oid index entries on each index page. No entry crosses a page, so a
-/// lookup reads one page for an oid and its local index.
-const PAGE_ENTRIES: u32 = 170;
-const _: () = assert!(INDEX_PAGE / OID_ENTRY == 170);
+/// Where a layer's fixed-size items are, which depends on how long its ids
+/// are. Every id in a layer is of its repository's format.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Geometry {
+    format: ObjectFormat,
+    /// A table record: an id and a [`RecordTail`].
+    record: usize,
+    /// An oid index entry: an id and a local index.
+    pub(super) entry: usize,
+    /// Oid index entries on each index page. No entry crosses a page, so a
+    /// lookup reads one page for an oid and its local index.
+    pub(super) page_entries: u32,
+}
 
-/// The offset of oid index entry `i`.
-fn oid_entry_off(i: u32) -> u64 {
-    u64::from(i / PAGE_ENTRIES) * to_u64(INDEX_PAGE)
-        + u64::from(i % PAGE_ENTRIES) * to_u64(OID_ENTRY)
+impl Geometry {
+    const fn of(format: ObjectFormat) -> Geometry {
+        let oid = format.len();
+        let entry = oid + size_of::<U32>();
+        Geometry {
+            format,
+            record: oid + size_of::<RecordTail>(),
+            entry,
+            #[expect(
+                clippy::as_conversions,
+                clippy::cast_possible_truncation,
+                reason = "a page holds a few hundred entries (no From in a const fn)"
+            )]
+            page_entries: (INDEX_PAGE / entry) as u32,
+        }
+    }
+
+    pub(super) fn format(&self) -> ObjectFormat {
+        self.format
+    }
+
+    /// The length of an id.
+    fn oid(&self) -> usize {
+        self.format.len()
+    }
+
+    /// The offset of table record `local`.
+    fn record_off(&self, local: u32) -> u64 {
+        u64::from(local) * to_u64(self.record)
+    }
+
+    /// The offset of oid index entry `i`.
+    fn oid_entry_off(&self, i: u32) -> u64 {
+        u64::from(i / self.page_entries) * to_u64(INDEX_PAGE)
+            + u64::from(i % self.page_entries) * to_u64(self.entry)
+    }
 }
 
 /// One value per object kind. Indexing by [`Kind`] cannot go out of range.
@@ -131,6 +174,8 @@ struct Footer {
     kind_runs: U32,
     id_runs: U32,
     id_span: U32,
+    /// The format of every id in the layer (see [`format_code`]).
+    object_format: U32,
 }
 
 /// The end of a layer file.
@@ -251,6 +296,7 @@ pub(crate) struct NewCommit {
 /// memory. Small layers (the common push) never touch the filesystem until
 /// written.
 pub(crate) struct LayerBuilder {
+    geometry: Geometry,
     objects: TempTable<ObjRec>,
     /// Serialized commits (see `add_commit`), in insertion order.
     commits: TempTable<u8>,
@@ -300,14 +346,6 @@ struct ObjRec {
 
 const NO_ID: u32 = u32::MAX;
 
-/// An oid index entry, as stored.
-#[derive(Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
-#[repr(C)]
-struct OidEntry {
-    oid: Oid,
-    local: U32,
-}
-
 /// An oid index entry with its kind, while the index is sorted.
 #[derive(Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
@@ -327,10 +365,11 @@ struct Run {
 }
 
 impl LayerBuilder {
-    /// A builder; callers add each oid once (it keeps no per-object state
-    /// in memory to check).
-    pub(crate) fn new(ws: &Workspace) -> Self {
+    /// A builder of a layer of `format` ids; callers add each oid once (it
+    /// keeps no per-object state in memory to check).
+    pub(crate) fn new(ws: &Workspace, format: ObjectFormat) -> Self {
         LayerBuilder {
+            geometry: Geometry::of(format),
             objects: ws.table(),
             commits: ws.table(),
             commit_count: 0,
@@ -486,7 +525,7 @@ impl LayerBuilder {
     /// Estimated serialized size, to decide between memory and a file.
     pub(crate) fn approx_size(&self) -> u64 {
         self.spill_len.iter().sum::<u64>()
-            + to_u64(self.objects.len()) * to_u64(RECORD + OID_ENTRY + 40)
+            + to_u64(self.objects.len()) * to_u64(self.geometry.record + self.geometry.entry + 40)
     }
 
     /// Serialize the layer.
@@ -515,7 +554,7 @@ impl LayerBuilder {
         let mut table = self.write_table(&mut w, &order, &mut refs, &lane_off)?;
         drop(order);
         let oids_off = w.pos;
-        let samples = write_oids(&mut w, &mut table.by_oid)?;
+        let samples = write_oids(self.geometry, &mut w, &mut table.by_oid)?;
 
         // Encode the commit section first so the external table is complete.
         let commit_buf = self.encode_commits(&mut refs)?;
@@ -556,6 +595,7 @@ impl LayerBuilder {
             kind_runs: u32::try_from(table.kind_runs.len())?.into(),
             id_runs: u32::try_from(table.id_runs.len())?.into(),
             id_span: id_span.into(),
+            object_format: format_code(self.geometry.format).into(),
         };
         let mut crc = must(w.tail.take(), "tail crc");
         crc.update(footer.as_bytes());
@@ -660,8 +700,14 @@ impl LayerBuilder {
             } else {
                 Ref::NONE
             };
-            let rec = TableRecord {
-                oid: o.oid,
+            ensure!(
+                o.oid.format() == self.geometry.format,
+                "{} id {} in a {} layer",
+                o.oid.format(),
+                o.oid,
+                self.geometry.format
+            );
+            let rec = RecordTail {
                 off: (must(lane_off.get(self.lane(kind)), "lane") + o.off).into(),
                 len: o.len.into(),
                 size: o.size.into(),
@@ -670,7 +716,7 @@ impl LayerBuilder {
                 depth: o.depth,
                 _pad: [0; 3],
             };
-            w.write_all(rec.as_bytes())?;
+            write_item(w, o.oid.as_bytes(), rec.as_bytes())?;
         }
         Ok(t)
     }
@@ -713,7 +759,11 @@ impl LayerBuilder {
 
 /// The oid index: `by_oid` sorted by (kind, oid), with each page padded
 /// to [`INDEX_PAGE`]. Returns every `SAMPLE`th oid of each kind.
-fn write_oids<W: Write>(w: &mut CrcWriter<W>, by_oid: &mut TempTable<KindOid>) -> Result<Vec<u8>> {
+fn write_oids<W: Write>(
+    g: Geometry,
+    w: &mut CrcWriter<W>,
+    by_oid: &mut TempTable<KindOid>,
+) -> Result<Vec<u8>> {
     by_oid.sort_by_key(|e| (e.kind, e.oid));
     let mut samples = Vec::new();
     let (mut kind, mut nth) = (0u8, 0u32);
@@ -725,16 +775,27 @@ fn write_oids<W: Write>(w: &mut CrcWriter<W>, by_oid: &mut TempTable<KindOid>) -
             samples.extend_from_slice(e.oid.as_bytes());
         }
         nth += 1;
-        let entry = OidEntry {
-            oid: e.oid,
-            local: e.local.into(),
-        };
-        w.write_all(entry.as_bytes())?;
-        if i.is_multiple_of(PAGE_ENTRIES) {
-            w.write_all(&[0; INDEX_PAGE % OID_ENTRY])?;
+        write_item(w, e.oid.as_bytes(), U32::new(e.local).as_bytes())?;
+        if i.is_multiple_of(g.page_entries) {
+            w.write_all(must(
+                [0; INDEX_PAGE].get(..INDEX_PAGE % g.entry),
+                "page padding",
+            ))?;
         }
     }
     Ok(samples)
+}
+
+/// Write an item of `id` then `rest` (a record or an index entry) in one
+/// call: each call to `w` hashes what it is given.
+fn write_item<W: Write>(w: &mut CrcWriter<W>, id: &[u8], rest: &[u8]) -> Result<()> {
+    let mut b = [0u8; enroute_shared::oid::MAX_OID_LEN + size_of::<RecordTail>()];
+    let n = id.len() + rest.len();
+    let (head, tail) = must(b.split_at_mut_checked(id.len()), "item buffer");
+    head.copy_from_slice(id);
+    must(tail.get_mut(..rest.len()), "item buffer").copy_from_slice(rest);
+    w.write_all(must(b.get(..n), "item buffer"))?;
+    Ok(())
 }
 
 /// What the index region and footer need from the object table.
@@ -894,6 +955,8 @@ impl Written {
 /// A read-only layer, read through the buffer pool.
 pub struct Layer {
     pub id: String,
+    /// The length of its ids, and where its items are.
+    pub(super) geometry: Geometry,
     /// The whole file, in large pages: entry data is read in long runs.
     file: Arc<PagedFile>,
     /// The object table, oid index and external oids, in small pages: they
@@ -938,6 +1001,7 @@ impl std::fmt::Debug for Layer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Layer")
             .field("id", &self.id)
+            .field("format", &self.geometry.format)
             .field("objects", &self.total)
             .field("commits", &self.commit_count)
             .finish_non_exhaustive()
@@ -962,12 +1026,19 @@ pub struct ObjectRecord {
     pub depth: u8,
 }
 
-/// An object table record, as stored: the object's id, where its entry
-/// is, its uncompressed size and its delta metadata.
-#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
-#[repr(C)]
+/// An object table record: the object's id, where its entry is, its
+/// uncompressed size and its delta metadata. Stored as the id's bytes and
+/// then a [`RecordTail`].
+#[derive(Clone, Copy, Debug)]
 pub struct TableRecord {
     pub oid: Oid,
+    tail: RecordTail,
+}
+
+/// A table record after its id, as stored.
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable, KnownLayout, Unaligned)]
+#[repr(C)]
+struct RecordTail {
     off: U64,
     len: U32,
     size: U64,
@@ -978,34 +1049,43 @@ pub struct TableRecord {
 }
 
 impl TableRecord {
+    /// The record stored in `b`, one record long, of a `g` layer.
+    fn read(g: Geometry, b: &[u8]) -> TableRecord {
+        let (oid, tail) = must(b.split_at_checked(g.oid()), "record size");
+        TableRecord {
+            oid: Oid::from_slice(g.format, oid),
+            tail: must(RecordTail::read_from_bytes(tail).ok(), "record size"),
+        }
+    }
+
     /// The entry's offset in the file.
     pub(crate) fn entry_off(&self) -> u64 {
-        self.off.get()
+        self.tail.off.get()
     }
 
     /// The entry's stored length.
     pub(crate) fn entry_len(&self) -> u32 {
-        self.len.get()
+        self.tail.len.get()
     }
 
     /// The object's uncompressed size.
     pub fn size(&self) -> u64 {
-        self.size.get()
+        self.tail.size.get()
     }
 
     /// Delta base.
     pub fn base(&self) -> Ref {
-        Ref(self.base.get())
+        Ref(self.tail.base.get())
     }
 
     /// The commit the base was chosen in the context of.
     pub fn ctx(&self) -> Ref {
-        Ref(self.ctx.get())
+        Ref(self.tail.ctx.get())
     }
 
     /// Delta chain depth (0 = full).
     pub fn depth(&self) -> u8 {
-        self.depth
+        self.tail.depth
     }
 }
 
@@ -1048,6 +1128,12 @@ impl Layer {
         let n = file.len();
         let (index_end, tail) = Tail::read(&file)?;
         ensure!(&tail.magic == END_MAGIC, "bad layer magic");
+        let code = tail.footer.object_format.get();
+        let format = ObjectFormat::ALL
+            .into_iter()
+            .find(|&f| format_code(f) == code)
+            .with_context(|| format!("unknown layer object format {code}"))?;
+        let geometry = Geometry::of(format);
         let f = &tail.footer;
         let counts = PerKind(f.counts.map(U32::get));
         let mut starts = PerKind::default();
@@ -1075,6 +1161,7 @@ impl Layer {
         let commits_len = f.commits_len.get();
         let mut layer = Layer {
             id,
+            geometry,
             table_off,
             commits_off,
             counts,
@@ -1099,10 +1186,10 @@ impl Layer {
         let nsamples: usize = counts.0.iter().map(|&c| widen(c.div_ceil(SAMPLE))).sum();
         let bloom = Bloom::new(u64::from(total));
         let runs = widen(f.kind_runs.get()) + widen(f.id_runs.get());
-        let index_len = nsamples * OID_LEN + runs * size_of::<Run>() + bloom.bits.len() * 8;
+        let index_len = nsamples * geometry.oid() + runs * size_of::<Run>() + bloom.bits.len() * 8;
         ensure!(
-            table_off + record_off(total) <= oids_off
-                && oids_off + oid_entry_off(total) <= ext_off
+            table_off + geometry.record_off(total) <= oids_off
+                && oids_off + geometry.oid_entry_off(total) <= ext_off
                 && commits_off + commits_len <= index_off
                 && index_off + to_u64(index_len) <= index_end,
             "layer sections out of bounds"
@@ -1189,13 +1276,12 @@ impl Layer {
             hashes: Arc::new(hashes.to_vec()),
         })?;
         for k in Kind::ALL {
-            let len = widen(self.counts[k].div_ceil(SAMPLE)) * OID_LEN;
+            let g = self.geometry;
+            let len = widen(self.counts[k].div_ceil(SAMPLE)) * g.oid();
             let (samples, after) = rest.split_at_checked(len).context("bad oid samples")?;
             self.samples[k] = samples
-                .as_chunks::<OID_LEN>()
-                .0
-                .iter()
-                .map(|o| Oid(*o))
+                .chunks_exact(g.oid())
+                .map(|o| Oid::from_slice(g.format, o))
                 .collect();
             rest = after;
         }
@@ -1280,6 +1366,21 @@ impl Layer {
         (kind, before + (local - start))
     }
 
+    /// The locals of the objects of `kind`, in rank order.
+    pub(crate) fn locals_of(&self, kind: Kind) -> impl Iterator<Item = u32> + '_ {
+        let ends = self
+            .kind_runs
+            .iter()
+            .skip(1)
+            .map(|r| r.0)
+            .chain([self.total]);
+        self.kind_runs
+            .iter()
+            .zip(ends)
+            .filter(move |(r, _)| r.1 == kind)
+            .flat_map(|(r, end)| r.0..end)
+    }
+
     /// The kind of the object at `local`. Panics when `local` is out of
     /// range (see `oid`).
     pub(crate) fn kind_of(&self, local: u32) -> Kind {
@@ -1288,10 +1389,16 @@ impl Layer {
 
     /// The table record of `local`.
     pub fn record(&self, local: u32) -> Result<TableRecord> {
+        let g = self.geometry;
         self.table
-            .with_bytes(record_off(local), RECORD, Access::Hot, |b| {
-                must(TableRecord::read_from_bytes(b).ok(), "record size")
+            .with_bytes(g.record_off(local), g.record, Access::Hot, |b| {
+                TableRecord::read(g, b)
             })
+    }
+
+    /// The format of the layer's ids.
+    pub(crate) fn format(&self) -> ObjectFormat {
+        self.geometry.format
     }
 
     /// The value of `r`; panics on its error. The accessors that return no
@@ -1311,8 +1418,11 @@ impl Layer {
     }
 
     pub(crate) fn try_oid(&self, local: u32) -> Result<Oid> {
+        let g = self.geometry;
         self.table
-            .with_bytes(record_off(local), OID_LEN, Access::Hot, Oid::from_slice)
+            .with_bytes(g.record_off(local), g.oid(), Access::Hot, |b| {
+                Oid::from_slice(g.format, b)
+            })
     }
 
     /// The object at `local`, with its stored entry.
@@ -1378,10 +1488,11 @@ impl Layer {
     /// External oid `i`. Panics on an I/O error (see `oid`).
     pub(crate) fn ext_oid(&self, i: u32) -> Oid {
         assert!(i < self.ext_count);
-        let off = u64::from(i) * to_u64(OID_LEN);
+        let g = self.geometry;
+        let off = u64::from(i) * to_u64(g.oid());
         self.or_panic(
             self.ext
-                .with_bytes(off, OID_LEN, Access::Hot, Oid::from_slice),
+                .with_bytes(off, g.oid(), Access::Hot, |b| Oid::from_slice(g.format, b)),
         )
     }
 
@@ -1397,27 +1508,38 @@ impl Layer {
     /// Call `f` with every record, in table order, reading the table
     /// sequentially (outside the pool: a one-off scan).
     pub(crate) fn for_each_record(&self, mut f: impl FnMut(u32, &TableRecord)) -> Result<()> {
-        const BATCH: u32 = 4096;
-        let mut buf = vec![0u8; widen(self.total.min(BATCH)) * RECORD];
-        let mut l = 0u32;
-        while l < self.total {
-            let k = (self.total - l).min(BATCH);
-            let (bytes, _) = must(buf.split_at_mut_checked(widen(k) * RECORD), "batch buffer");
-            self.file
-                .read_direct(self.table_off + record_off(l), bytes)?;
-            let records = must(<[TableRecord]>::ref_from_bytes(bytes).ok(), "whole records");
-            for (i, r) in (l..).zip(records) {
-                f(i, r);
-            }
-            l += k;
-        }
-        Ok(())
+        let g = self.geometry;
+        self.for_each_raw(|l, r| f(l, &TableRecord::read(g, r)))
     }
 
     /// Call `f(local, oid)` for every object in table order (see
     /// [`for_each_record`](Self::for_each_record)).
     pub(crate) fn for_each_oid(&self, mut f: impl FnMut(u32, &Oid)) -> Result<()> {
-        self.for_each_record(|l, r| f(l, &r.oid))
+        let g = self.geometry;
+        self.for_each_raw(|l, r| f(l, &Oid::from_slice(g.format, r)))
+    }
+
+    /// Call `f` with every record's bytes, in table order, reading the
+    /// table sequentially (outside the pool: a one-off scan).
+    fn for_each_raw(&self, mut f: impl FnMut(u32, &[u8])) -> Result<()> {
+        const BATCH: u32 = 4096;
+        let g = self.geometry;
+        let mut buf = vec![0u8; widen(self.total.min(BATCH)) * g.record];
+        let mut l = 0u32;
+        while l < self.total {
+            let k = (self.total - l).min(BATCH);
+            let (bytes, _) = must(
+                buf.split_at_mut_checked(widen(k) * g.record),
+                "batch buffer",
+            );
+            self.file
+                .read_direct(self.table_off + g.record_off(l), bytes)?;
+            for (i, r) in (l..).zip(bytes.chunks_exact(g.record)) {
+                f(i, r);
+            }
+            l += k;
+        }
+        Ok(())
     }
 
     /// A merged layer's commit graph (see [`LayerBuilder::set_graph`]):
@@ -1530,7 +1652,7 @@ impl Bloom {
             d2,
             d3,
             ..,
-        ] = oid.0;
+        ] = *oid.prefix();
         [
             [a0, a1, a2, a3],
             [b0, b1, b2, b3],
@@ -1551,11 +1673,20 @@ impl Bloom {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::git::oid::hash_object;
+    use crate::git::oid::{hash_object, hash_object_in};
     use crate::git::pack::full_entry;
 
     #[test]
     fn write_and_read() {
+        for format in ObjectFormat::ALL {
+            write_and_read_in(format);
+        }
+    }
+
+    /// A layer of `format` ids, with enough blobs that its oid index takes
+    /// several pages, reads back what was written.
+    fn write_and_read_in(format: ObjectFormat) {
+        let hash_object = |k, d: &[u8]| hash_object_in(format, k, d);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("l");
         let blob = b"hello".to_vec();
@@ -1570,12 +1701,22 @@ pub(super) mod tests {
             format!("tree {tree_oid}\nauthor a <a> 1 +0000\ncommitter a <a> 5 +0000\n\nm\n")
                 .into_bytes();
         let commit_oid = hash_object(Kind::Commit, &commit);
-        let mut b = LayerBuilder::new(&Workspace::at(dir.path()));
-        for (k, d, o) in [
+        let mut b = LayerBuilder::new(&Workspace::at(dir.path()), format);
+        let more: Vec<(Vec<u8>, Oid)> = (0..400u32)
+            .map(|i| {
+                let d = format!("blob {i}").into_bytes();
+                let o = hash_object(Kind::Blob, &d);
+                (d, o)
+            })
+            .collect();
+        let objects = [
             (Kind::Blob, &blob, blob_oid),
             (Kind::Tree, &tree, tree_oid),
             (Kind::Commit, &commit, commit_oid),
-        ] {
+        ]
+        .into_iter()
+        .chain(more.iter().map(|(d, o)| (Kind::Blob, d, *o)));
+        for (k, d, o) in objects {
             b.add(NewObject {
                 oid: o,
                 kind: k,
@@ -1588,7 +1729,7 @@ pub(super) mod tests {
             })
             .unwrap();
         }
-        let ext = Oid([7; 20]);
+        let ext = Oid::repeat(format, 7);
         b.add_commit(&NewCommit {
             oid: commit_oid,
             tree: tree_oid,
@@ -1600,8 +1741,18 @@ pub(super) mod tests {
         b.write_to(std::fs::File::create(&path).unwrap()).unwrap();
         let pool = crate::storage::pool::BufferPool::new(1 << 20);
         let l = Layer::from_file("x".into(), files::open(&pool, &path).unwrap()).unwrap();
-        assert_eq!(l.len(), 3);
+        assert_eq!(l.format(), format);
+        assert_eq!(l.len(), 403);
         assert_eq!(l.find(&blob_oid), Some(2));
+        for (_, o) in &more {
+            assert_eq!(l.kind_of(l.find(o).unwrap()), Kind::Blob);
+        }
+        assert_eq!(l.find(&Oid::repeat(format, 9)), None);
+        let other = ObjectFormat::ALL
+            .into_iter()
+            .find(|&f| f != format)
+            .unwrap();
+        assert_eq!(l.find(&Oid::repeat(other, 9)), None);
         assert_eq!(l.kind_of(l.find(&tree_oid).unwrap()), Kind::Tree);
         let cs = l.commits().unwrap();
         assert_eq!(cs.len(), 1);
@@ -1615,10 +1766,10 @@ pub(super) mod tests {
             &full_entry(Kind::Blob, &blob)[..]
         );
         // A pushed layer: ids follow local indexes from its range's start.
-        assert_eq!(l.id_span(), 3);
+        assert_eq!(l.id_span(), 403);
         assert_eq!(l.id_of(10, 2), 12);
         assert_eq!(l.local_of(10, 12), Some(2));
-        assert_eq!(l.local_of(10, 13), None);
+        assert_eq!(l.local_of(10, 413), None);
         assert_eq!(l.local_of(10, 9), None);
     }
 
@@ -1637,7 +1788,7 @@ pub(super) mod tests {
             })
             .collect();
         let entry = full_entry(Kind::Blob, &data);
-        let mut b = LayerBuilder::new(&Workspace::at(dir.path()));
+        let mut b = LayerBuilder::new(&Workspace::at(dir.path()), ObjectFormat::Sha1);
         b.add(blob(hash_object(Kind::Blob, &data), &entry, None))
             .unwrap();
         let mut file = Vec::new();
@@ -1682,7 +1833,7 @@ pub(super) mod tests {
     fn merged_layers_map_ids() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("l");
-        let mut b = LayerBuilder::new(&Workspace::at(dir.path()));
+        let mut b = LayerBuilder::new(&Workspace::at(dir.path()), ObjectFormat::Sha1);
         b.set_ids(100..110);
         let mut ids = Vec::new();
         for (i, (kind, id)) in [

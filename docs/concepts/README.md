@@ -10,7 +10,7 @@ an endpoint.
 
 | Page | Covers |
 | --- | --- |
-| [Data model](model.md) | Repository keys, refs, and objects |
-| [Clients and interfaces](two-callers.md) | Git, gRPC, hooks, and network boundaries |
-| [Hooks](hooks.md) | Application policy decisions and hook limits |
-| [Storage](storage.md) | Ledger and compute nodes, layers, and durability |
+| [Data model](model.md) | What your application holds, what Enroute holds, and the key that joins them |
+| [Clients and interfaces](two-callers.md) | Git, the API, and hooks, and which one a feature uses |
+| [Hooks](hooks.md) | A push step by step, and what each hook decides |
+| [Storage](storage.md) | A push and a clone through the storage engine, and what survives what |

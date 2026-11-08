@@ -56,6 +56,7 @@ anyhow.workspace = true
 
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tracing-appender.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 # `reqwest-rustls`: an OTLP collector is usually `https://`.
@@ -71,11 +72,15 @@ rustix = { workspace = true, features = ["thread"] }
 [dev-dependencies]
 async-trait.workspace = true
 bytes.workspace = true
+ed25519-dalek.workspace = true
 futures.workspace = true
+# The in-memory exporter, which a test reads its spans from.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 parking_lot.workspace = true
 reqwest = { workspace = true, features = ["stream"] }
 tempfile.workspace = true
 test-support = { path = "dev/test-support" }
+tonic-prost.workspace = true
 tower = { workspace = true, features = ["util"] }
 
 [workspace]
@@ -92,7 +97,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 publish = false
 license = "Apache-2.0"
@@ -102,6 +107,15 @@ license = "Apache-2.0"
 [profile.dev]
 incremental = false
 debug = "line-tables-only"
+
+# The ledger's shard log model checks (tests/shardlog_model.rs) explore
+# millions of states: optimized, they take seconds in a debug build's test run
+# instead of many minutes.
+[profile.dev.package.enroute-ledger]
+opt-level = 3
+
+[profile.dev.package.stateright]
+opt-level = 3
 
 # What ships. Fat LTO across the whole graph prunes the dependency code nothing
 # reaches, and one codegen unit lets it: the default sixteen give the optimizer
@@ -145,10 +159,10 @@ enroute-compute = { path = "crates/compute" }
 
 # git protocol primitives
 gix-packetline = { version = "0.24", features = ["blocking-io"] }
-# Parsing and writing commits, trees and tags. Ids still hash with `sha1dc`
-# in `git::oid`.
-gix-object = { version = "0.66", features = ["sha1"] }
-gix-hash = { version = "0.28", features = ["sha1"] }
+# Parsing and writing commits, trees and tags, of both object formats. Ids
+# hash in `git::oid` (SHA-1 with `sha1dc`).
+gix-object = { version = "0.66", features = ["sha1", "sha256"] }
+gix-hash = { version = "0.28", features = ["sha1", "sha256"] }
 gix-actor = "0.44"
 gix-date = "0.18"
 # Git's `check_refname_format`.
@@ -156,11 +170,9 @@ gix-validate = "0.13"
 # plain (hardware-accelerated) SHA-1 for hashing data we serve; object ids get
 # the collision-detecting one, `sha1dc`
 sha1 = "0.11"
-flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
-# Whole-buffer deflate, faster than zlib-rs on pack entries; flate2 stays for
-# streams whose compressed length is unknown.
-libdeflate-sys = "1.26"
-libdeflater = "1.26"
+# Deflate and inflate in safe Rust; inflate reports where a stream ends,
+# which walking a pack needs.
+sirocco = "0.3"
 # a fast, randomly seeded hasher for hot maps keyed by pushed content
 foldhash = "0.2"
 
@@ -186,6 +198,8 @@ tonic-prost-build = "0.14"
 protox = "0.9"
 futures = "0.3"
 roaring = "0.11"
+# Persistent maps: a state copy shares its refs.
+rpds = "1"
 
 # http server
 axum = { version = "0.8", features = ["macros"] }
@@ -221,6 +235,8 @@ yaml-rust2 = { version = "0.12", default-features = false }
 rayon = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# console lines written from a thread of their own, off the async workers.
+tracing-appender = "0.2"
 # distributed tracing export (OTLP over HTTP). The batch span processor runs
 # on its own dedicated thread regardless of the app's async runtime, so the
 # exporter needs the *blocking* reqwest client — a `reqwest-client` (async)
@@ -238,6 +254,8 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = [
     "trace",
 ] }
 tracing-opentelemetry = { version = "0.33", default-features = false }
+# `http::HeaderMap` as a carrier of trace context.
+opentelemetry-http = { version = "0.32", default-features = false }
 http = "1"
 
 # Configuration a deployment writes, and xtask's manifest reading.
@@ -261,6 +279,9 @@ rustix = { version = "1", features = ["fs", "process"] }
 mimalloc = "0.1"
 parking_lot = "0.12"
 quick_cache = "0.7"
+# Internal-port tokens (enroute-ledger::token): EdDSA only, on aws-lc-rs, which
+# rustls already brings.
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
 sha1dc = "0.1.5"
 slog = "2"
 zerocopy = { version = "0.8", features = ["derive"] }
@@ -289,6 +310,7 @@ clap = { version = "4", features = ["derive", "env"] }
 walkdir = "2"
 proptest = "1"
 proptest-state-machine = "0.8"
+stateright = "0.31"
 uuid = { version = "1", features = ["v4"] }
 
 # auth: Basic-auth header decoding, and the digests the hook signatures cover.

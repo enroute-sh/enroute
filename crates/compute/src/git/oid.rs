@@ -1,7 +1,7 @@
 //! Object ids, object kinds and object hashing. [`Oid`] is shared with the
 //! ledger, which never hashes an object, so kinds and hashing live here.
 
-pub(crate) use enroute_shared::oid::{OID_LEN, Oid};
+pub(crate) use enroute_shared::oid::{ObjectFormat, Oid};
 
 /// Object kinds. The discriminants match git's pack type codes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -56,28 +56,54 @@ impl Kind {
     }
 }
 
-/// Hash an object the way git does (`"<kind> <len>\0<data>"`), with
-/// SHA-1 collision detection (sha1dc). Content addressing is only sound
-/// if two different objects can't share an id, so objects that carry a
-/// known collision attack are rejected, as git does.
-pub(crate) fn try_hash_object(kind: Kind, data: &[u8]) -> anyhow::Result<Oid> {
-    let mut h = sha1dc::Hasher::new();
-    h.update(kind.name().as_bytes());
-    h.update(b" ");
-    h.update(data.len().to_string().as_bytes());
-    h.update(&[0u8]);
-    h.update(data);
-    let d = h.finalize().map_err(|e| {
-        anyhow::anyhow!(
-            "SHA-1 collision attack detected in {} object: {e}",
-            kind.name()
-        )
-    })?;
-    Ok(Oid(d.into()))
+/// Hash an object the way git does (`"<kind> <len>\0<data>"`), in the
+/// repository's `format`. SHA-1 hashes with collision detection (sha1dc):
+/// content addressing is only sound if two different objects can't share
+/// an id, so objects that carry a known collision attack are rejected, as
+/// git does.
+pub(crate) fn try_hash_object(
+    format: ObjectFormat,
+    kind: Kind,
+    data: &[u8],
+) -> anyhow::Result<Oid> {
+    let len = data.len().to_string();
+    let header = [kind.name().as_bytes(), b" ", len.as_bytes(), &[0u8]];
+    match format {
+        ObjectFormat::Sha1 => {
+            let mut h = sha1dc::Hasher::new();
+            for part in header {
+                h.update(part);
+            }
+            h.update(data);
+            let d = h.finalize().map_err(|e| {
+                anyhow::anyhow!(
+                    "SHA-1 collision attack detected in {} object: {e}",
+                    kind.name()
+                )
+            })?;
+            Ok(Oid::sha1(d.into()))
+        }
+        ObjectFormat::Sha256 => {
+            use sha2::Digest;
+            let mut h = sha2::Sha256::new();
+            for part in header {
+                h.update(part);
+            }
+            h.update(data);
+            Ok(Oid::sha256(h.finalize().into()))
+        }
+    }
 }
 
-/// [`try_hash_object`], for tests: they hash only objects that they make.
+/// [`try_hash_object`] of a SHA-1 repository, for tests: they hash only
+/// objects that they make.
 #[cfg(test)]
 pub(crate) fn hash_object(kind: Kind, data: &[u8]) -> Oid {
-    try_hash_object(kind, data).expect("collision attack in locally generated object")
+    hash_object_in(ObjectFormat::Sha1, kind, data)
+}
+
+/// [`try_hash_object`], for tests.
+#[cfg(test)]
+pub(crate) fn hash_object_in(format: ObjectFormat, kind: Kind, data: &[u8]) -> Oid {
+    try_hash_object(format, kind, data).expect("collision attack in locally generated object")
 }

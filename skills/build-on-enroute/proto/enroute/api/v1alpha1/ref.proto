@@ -19,7 +19,7 @@ service RefService {
   rpc ListRefs(ListRefsRequest) returns (ListRefsResponse);
 
   // Move refs onto objects the repository already stores. Each update lands
-  // or is refused on its own: the call is not all-or-nothing.
+  // or is refused on its own, unless `atomic` asks for all of them or none.
   //
   // No `pre-receive`: that hook is how an application decides what a *git
   // client* may land, and the caller here is the application. What it cannot
@@ -70,9 +70,9 @@ message ListRefsResponse {
 //
 // An unset `old_object_id` asks for a create, and is refused with
 // REASON_ALREADY_EXISTS if the ref is already there — it does not waive the
-// check, it changes what is checked. An unset `new_object_id` deletes, and
-// there an unset `old_object_id` waives the check: the ref goes whatever it
-// holds.
+// check, it changes what is checked. An unset `new_object_id` deletes, which
+// needs `old_object_id`: as in a git push, no update moves a ref it has not
+// seen. A delete without it fails the call with INVALID_ARGUMENT.
 message RefUpdate {
   string refname = 1;
   common.v1alpha1.ObjectId old_object_id = 2;
@@ -81,8 +81,11 @@ message RefUpdate {
 
 message UpdateRefsRequest {
   common.v1alpha1.RepoKey repo = 1;
-  // Each applied on its own. Outcomes come back in this order.
+  // Outcomes come back in this order.
   repeated RefUpdate updates = 2;
+  // All or none, as `git push --atomic`: one refused update refuses the
+  // rest with REASON_ATOMIC_FAILURE, and no ref moves.
+  bool atomic = 3;
 }
 
 message IsAncestorRequest {
@@ -112,8 +115,8 @@ message RefUpdateOutcome {
 
   message Rejection {
     Reason reason = 1;
-    // Set only for REASON_POLICY, which is the one reason whose text is not
-    // derivable from the enum.
+    // Set only for REASON_POLICY and REASON_UNSPECIFIED, the reasons whose
+    // text is not derivable from the enum.
     string message = 2;
 
     enum Reason {
@@ -138,6 +141,13 @@ message RefUpdateOutcome {
       // stores any valid ref, including `refs/notes/*` and whatever an
       // application invents for its own use.
       REASON_INVALID_REFNAME = 7;
+      // Another update in the same atomic call was refused.
+      REASON_ATOMIC_FAILURE = 8;
+      // The call updates this ref more than once, which git refuses too.
+      REASON_REPEATED_REF = 9;
+      // The update deletes the branch `HEAD` points at, which git refuses
+      // too: a clone would check out nothing.
+      REASON_DELETE_CURRENT = 10;
     }
   }
 }

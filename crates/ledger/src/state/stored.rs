@@ -1,7 +1,7 @@
-//! A repository's state in the node's state store ([`crate::state_store`]):
+//! A repository's state in the node's state store ([`crate::state::store`]):
 //! how a [`RepoMeta`] maps onto its keys, the view the state machine
 //! applies commands to ([`Stored`]), and whole states in and out (hosting a
-//! repository, Raft snapshots, checkpoints, new subscribers).
+//! repository, installs on lagging replicas, new subscribers).
 //!
 //! ```text
 //! HEAD          the branch HEAD names
@@ -23,14 +23,15 @@ use std::collections::HashMap;
 use anyhow::{Context, Result, ensure};
 use prost::Message;
 use prost::bytes::Bytes;
-use raft::prelude::ConfState;
 
 use enroute_shared::oid::Oid;
-use enroute_shared::proto::{Record, RepoSummary};
-use enroute_shared::state::{Change, Command, DEFAULT_HEAD, LayerMeta, Outcome, RepoMeta, command};
+use enroute_shared::proto::RepoSummary;
+use enroute_shared::state::{DEFAULT_HEAD, LayerMeta, RepoMeta};
 
-use crate::state_machine::{State, count};
-use crate::state_store::{Counters, Entry, LogId, Root, Round, StateStore};
+use crate::proto::{Effect, Record};
+
+use crate::state::machine::{State, count};
+use crate::state::store::{Counters, Entry, LogId, Root, Round, StateStore};
 
 /// A layer in the object store.
 const STORED: u8 = 0;
@@ -64,38 +65,25 @@ fn decode_layer(v: &[u8]) -> Result<(LayerMeta, u8, u64)> {
     Ok((l, kind, u64::from_le_bytes(*index)))
 }
 
-/// The root of incarnation `epoch` of `repo` (with membership `conf`) at
-/// log index `index` of `term`.
-pub(crate) fn root(repo: &str, epoch: u64, conf: &ConfState, index: u64, term: u64) -> Root {
+/// The root of incarnation `epoch` of `repo` at log position `index` of
+/// `term`.
+pub(crate) fn root(repo: &str, epoch: u64, index: u64, term: u64) -> Root {
     Root {
         applied_index: index,
         applied_term: term,
         repo: repo.to_string(),
         epoch,
-        voters: conf.voters.clone(),
-        learners: conf.learners.clone(),
         ..Default::default()
     }
 }
 
 impl Root {
-    /// Its membership.
-    pub(crate) fn conf(&self) -> ConfState {
-        ConfState {
-            voters: self.voters.clone(),
-            learners: self.learners.clone(),
-            ..Default::default()
-        }
-    }
-
     /// Its identity with whole state `meta`, as of its applied index.
     pub(crate) fn record(self, meta: RepoMeta) -> Record {
         Record {
             repo: self.repo,
             epoch: self.epoch,
             index: self.applied_index,
-            voters: self.voters,
-            learners: self.learners,
             meta: Some(meta),
         }
     }
@@ -113,6 +101,8 @@ impl Counters {
             epoch: meta.epoch,
             deleted: meta.deleted,
             keep_head: meta.keep_head,
+            chain: meta.chain,
+            format: meta.format(),
         }
     }
 
@@ -121,7 +111,8 @@ impl Counters {
         (meta.version, meta.upload_gen, meta.next_id) =
             (self.version, self.upload_gen, self.next_id);
         (meta.last_push_ms, meta.epoch) = (self.last_push_ms, self.epoch);
-        (meta.deleted, meta.keep_head) = (self.deleted, self.keep_head);
+        (meta.deleted, meta.keep_head, meta.chain) = (self.deleted, self.keep_head, self.chain);
+        meta.set_object_format(self.format.into());
     }
 }
 
@@ -148,6 +139,7 @@ pub(crate) fn summary(
         epoch,
         deleted: c.deleted,
         version: c.version,
+        object_format: enroute_shared::proto::ObjectFormat::from(c.format).into(),
         ..Default::default()
     };
     if !c.deleted {
@@ -156,31 +148,28 @@ pub(crate) fn summary(
     Ok(s)
 }
 
-/// `log`'s membership is now `conf`.
-pub(crate) fn set_conf(round: &mut Round<'_>, log: LogId, conf: &ConfState) -> Result<()> {
-    let root = round.root_mut(log)?;
-    (root.voters, root.learners) = (conf.voters.clone(), conf.learners.clone());
-    Ok(())
+/// `log`'s manifest, without inline layers' bytes.
+pub(crate) fn layers(round: &Round<'_>, log: LogId) -> Result<Vec<LayerMeta>> {
+    round
+        .layers(log)?
+        .iter()
+        .map(|v| decode_layer(v).map(|(l, _, _)| l))
+        .collect()
 }
 
 /// Apply log entry `index` (of `term`) to `log`'s state in `round`: its
-/// command (None: not a command), and the entry as applied. The command's
-/// outcome and change.
+/// effect (None: not one). Whether the effect applied (None: there was
+/// none).
 pub(crate) fn apply(
     round: &mut Round<'_>,
     log: LogId,
     index: u64,
     term: u64,
-    cmd: Option<&Command>,
-) -> Result<Option<(Outcome, Option<Change>)>> {
-    let done = match cmd {
-        Some(cmd) => Some(crate::state_machine::apply(
-            &mut Stored::new(round, log, index),
-            index + 1,
-            cmd,
-        )?),
-        None => None,
-    };
+    effect: Option<&Effect>,
+) -> Result<Option<bool>> {
+    let done = effect
+        .map(|e| crate::state::machine::apply_effect(&mut Stored::new(round, log, index), e))
+        .transpose()?;
     let root = round.root_mut(log)?;
     (root.applied_index, root.applied_term) = (index, term);
     Ok(done)
@@ -202,23 +191,24 @@ impl<'r, 's> Stored<'r, 's> {
 
 /// A ref's stored value: its object id, and when it was set (0: unknown).
 fn ref_value(oid: Oid, updated_ms: u64) -> Vec<u8> {
-    let mut v = oid.0.to_vec();
+    let mut v = oid.as_bytes().to_vec();
     if updated_ms > 0 {
         v.extend_from_slice(&updated_ms.to_le_bytes());
     }
     v
 }
 
-/// The object id and update time in a ref's stored value.
+/// The object id and update time in a ref's stored value. Its length says
+/// which: a SHA-1 id is 20 bytes and a SHA-256 one 32, each with or without
+/// 8 bytes of time after it.
 fn parse_ref(name: &str, v: &[u8]) -> Result<(Oid, u64)> {
     let bad = || anyhow::anyhow!("ref {name} is not an object id");
-    let (oid, time) = v.split_at_checked(20).ok_or_else(bad)?;
-    let updated_ms = match <[u8; 8]>::try_from(time) {
-        Ok(t) => u64::from_le_bytes(t),
-        Err(_) if time.is_empty() => 0,
-        Err(_) => return Err(bad()),
-    };
-    Ok((Oid::from_slice(oid), updated_ms))
+    if let Some(oid) = Oid::from_bytes(v) {
+        return Ok((oid, 0));
+    }
+    let (id, time) = v.split_last_chunk().ok_or_else(bad)?;
+    let oid = Oid::from_bytes(id).ok_or_else(bad)?;
+    Ok((oid, u64::from_le_bytes(*time)))
 }
 
 impl State for Stored<'_, '_> {
@@ -342,12 +332,12 @@ pub(crate) fn entries(meta: &RepoMeta) -> Result<Vec<Entry>> {
 }
 
 /// `log`'s whole state at one point: its root and state, inline layers'
-/// bytes included (those pinned in the log read with `entry`, the command
+/// bytes included (those pinned in the log read with `entry`, the effect
 /// at a log index). None if it has no state.
 pub(crate) fn load(
     store: &StateStore,
     log: LogId,
-    mut entry: impl FnMut(u64) -> Result<Command>,
+    mut entry: impl FnMut(u64) -> Result<Effect>,
 ) -> Result<Option<(Root, RepoMeta)>> {
     let mut meta = RepoMeta {
         head: DEFAULT_HEAD.to_string(),
@@ -381,13 +371,13 @@ pub(crate) fn load(
         return Ok(None);
     };
     // Each entry read once, however many inline layers it carries.
-    let mut commands: HashMap<u64, Command> = HashMap::new();
+    let mut effects: HashMap<u64, Effect> = HashMap::new();
     for (at, index) in pinned {
         let l = meta
             .layers
             .get_mut(at)
             .context("inline layer index out of range")?;
-        let cmd = match commands.entry(index) {
+        let effect = match effects.entry(index) {
             std::collections::hash_map::Entry::Occupied(c) => c.into_mut(),
             std::collections::hash_map::Entry::Vacant(v) => {
                 v.insert(entry(index).with_context(|| {
@@ -395,14 +385,12 @@ pub(crate) fn load(
                 })?)
             }
         };
-        let bytes = match &cmd.kind {
-            Some(command::Kind::Commit(c)) => c
-                .add_layers
-                .iter()
-                .find(|a| a.id == l.id)
-                .and_then(|a| a.data.clone()),
-            _ => None,
-        };
+        let bytes = effect
+            .change
+            .as_ref()
+            .and_then(|c| c.layers.as_ref())
+            .and_then(|e| e.insert.iter().find(|a| a.id == l.id))
+            .and_then(|a| a.data.clone());
         l.data =
             Some(bytes.with_context(|| {
                 format!("log entry {index} does not carry inline layer {}", l.id)
@@ -429,10 +417,13 @@ mod tests {
     /// A ref stored without a time reads as set at an unknown time.
     #[test]
     fn ref_values_carry_their_time() {
-        let oid = Oid([7; 20]);
+        let oid = Oid::sha1([7; 20]);
         assert_eq!(parse_ref("r", &ref_value(oid, 1234)).unwrap(), (oid, 1234));
-        assert_eq!(ref_value(oid, 0), oid.0.to_vec());
-        assert_eq!(parse_ref("r", &oid.0).unwrap(), (oid, 0));
+        assert_eq!(ref_value(oid, 0), oid.as_bytes().to_vec());
+        assert_eq!(parse_ref("r", oid.as_bytes()).unwrap(), (oid, 0));
+        let long = Oid::repeat(enroute_shared::oid::ObjectFormat::Sha256, 9);
+        assert_eq!(parse_ref("r", &ref_value(long, 7)).unwrap(), (long, 7));
+        assert_eq!(parse_ref("r", long.as_bytes()).unwrap(), (long, 0));
         parse_ref("r", &[0; 21]).unwrap_err();
         parse_ref("r", &[0; 19]).unwrap_err();
     }

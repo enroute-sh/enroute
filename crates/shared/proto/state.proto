@@ -1,15 +1,31 @@
-// The contract between Enroute's roles: the replicated state machine (what
-// the log carries, what the ledger keeps, what subscribers follow) and the
-// records kept in the object store.
+// The contract between Enroute's roles: a repository's state, the commands
+// that change it, and the changes subscribers follow. How the ledger logs
+// and keeps them is its own (crates/ledger/proto/log.proto).
 
 syntax = "proto3";
 
 package enroute.internal.v1;
 
-// A git object id: 20 bytes (SHA-1). Encoded as message { bytes id = 1; },
-// decoded straight into enroute_shared::oid::Oid.
+// A git object id: 20 bytes (SHA-1) or 32 (SHA-256), as the repository's
+// ObjectFormat says. Encoded as message { bytes id = 1; }, decoded straight
+// into enroute_shared::oid::Oid.
 message Oid {
   bytes id = 1;
+}
+
+// A release, major.minor: what a binary runs, and what a cluster's
+// behaviour is at (see enroute_shared::version). Patch releases change no
+// format or protocol, so they have no version here.
+message Version {
+  uint32 major = 1;
+  uint32 minor = 2;
+}
+
+// How a repository names its objects, chosen when it is created. Unset
+// (as in every state written before SHA-256) is SHA-1.
+enum ObjectFormat {
+  OBJECT_FORMAT_SHA1 = 0;
+  OBJECT_FORMAT_SHA256 = 1;
 }
 
 // One layer of a repository's manifest.
@@ -164,7 +180,7 @@ message RepoMeta {
   // never will be: the layer sweep may delete it, whatever its clock or
   // how far behind its view of the log.
   uint64 upload_gen = 7;
-  // The incarnation (as in Record.epoch).
+  // The incarnation.
   uint64 epoch = 8;
   // Deleted (see Delete): the state is a tombstone.
   bool deleted = 9;
@@ -178,6 +194,12 @@ message RepoMeta {
   // When each ref was last set (Unix milliseconds, Commit.updated_at_ms).
   // A ref set at an unknown time has no entry.
   map<string, uint64> ref_updated_ms = 12;
+  // The ledger's evaluation chain of the last change applied: opaque to
+  // subscribers.
+  uint64 chain = 13;
+  // The incarnation's object format, fixed when it is created: every ref
+  // and every object id in its layers is of this format.
+  ObjectFormat object_format = 14;
 }
 
 // A change to a repository's state, made by applying a command: what a
@@ -201,6 +223,9 @@ message Change {
   bool deleted = 8;
   // RepoMeta.last_push_ms, if it moved.
   optional uint64 last_push_ms = 9;
+  // The ledger's evaluation chain of the command that made it
+  // (RepoMeta.chain).
+  uint64 chain = 10;
 }
 
 message RefChange {
@@ -211,24 +236,9 @@ message RefChange {
   uint64 updated_at_ms = 3;
 }
 
-// Remove the layers with these ids (consecutive), and insert `insert` in
-// their place, or at the end if none are removed.
+// Remove these layers (consecutive), and insert `insert` in their place,
+// or at the end if none are removed.
 message LayerEdit {
-  repeated string remove = 1;
+  repeated RemovedLayer remove = 1;
   repeated LayerMeta insert = 3;
-}
-
-// A repository's state at a log index of an incarnation: in the object
-// store (repos/<repo>/state and repos/<repo>/epochs/<E>), and in its log's
-// snapshots (so a recovering node knows which log is which).
-message Record {
-  string repo = 1;
-  uint64 epoch = 2;
-  uint64 index = 3;
-  // Its log's voters (store ids) as of `index`: in an incarnation's
-  // initial state, those it started with.
-  repeated uint64 voters = 4;
-  RepoMeta meta = 5;
-  // Its log's learners as of `index` (nodes catching up to become voters).
-  repeated uint64 learners = 6;
 }

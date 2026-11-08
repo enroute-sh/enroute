@@ -4,6 +4,11 @@ This page describes how a compute node stores and reads repository data: the
 layer file format, object ids, the storage service, the buffer pool, and the
 rule that no thread waits on the object store.
 
+**The key idea.** A layer is an immutable file, written once and never
+changed, so any node can cache any part of it without coordination. Reads go
+through a buffer pool over local copies, and a read that needs the object
+store waits as a task, never as a blocked thread.
+
 ## Layers
 
 A layer is an immutable file:
@@ -25,11 +30,11 @@ index region     every 256th oid per kind of the oid index, kind runs, id runs,
                  Bloom filter over all oids, then the SHA-256 of every chunk of
                  the file before the index region
 footer           section offsets, per-kind counts, run counts, the number of ids
-                 the layer covers, crc32 of the index region and footer,
-                 "ENRLAYR1"
+                 the layer covers, the object format (1 SHA-1, 2 SHA-256),
+                 crc32 of the index region and footer, "ENRLAYR2"
 ```
 
-Enroute reads only version 1. The chunk hashes check everything before the index
+The chunk hashes check everything before the index
 region, and the crc32 checks the rest.
 
 - **One order.** The local index of an object is its position in the object
@@ -56,8 +61,9 @@ region, and the crc32 checks the rest.
   the layer is open, so lookups and table scans never wait for bytes. Only entry reads can. The
   samples and a Bloom filter (about 10 bits per object) stay in memory.
 - **Chunk hashes** verify any chunk on its own. They check bytes read by range
-  from the object store, and chunks of a local copy of unknown state (after a
-  restart), before first use. A chunk that fails is dropped and fetched again.
+  from the object store, chunks loaded before the hashes were known, and the
+  chunks of a linked copy, before first use. A chunk that fails is dropped and
+  fetched again.
 - **Refs inside a layer** are layer-local indexes or indexes into the external
   oid table.
 - **Object ids.** Every object has an id, the same on every node, from the range
@@ -141,14 +147,14 @@ The view of a merged layer comes from its commit graph section (see
 ## Storage service
 
 **Rule.** Whatever is persisted, shared and authoritative goes through the log.
-The log's state is checkpointed to the object store ([Freezing the
-ledger](ledger-and-compute.md#freezing-the-ledger)). Derivable data may be
+The log's state stays on the ledger's disks, which move with their nodes
+([Freezing the ledger](ledger-and-compute.md#freezing-the-ledger)). Derivable data may be
 persisted. Scratch data lives for one operation.
 
 | Class | Examples | Lives in | Rules |
 |---|---|---|---|
 | **Shared** | layer bytes, the layer manifest, refs | the log (with inline layers' bytes); immutable files in the object store, each key written once | Part of shared state only through a log entry. Bytes are written first and referenced second: a crash leaves at most an unreferenced orphan (swept), never a dangling reference. |
-| **Derived** | local layer copies, pool pages, caches, the node catalog | local disk | Rebuildable from shared state; never read by another node; correctness never depends on it. |
+| **Derived** | local layer copies, pool pages, caches | local disk | Rebuildable from shared state; never read by another node; correctness never depends on it. |
 | **Scratch** | spooled request bodies, ingest temp tables, builder spill files | memory or local disk | Lives as long as the operation that made it. |
 
 ### Layering
@@ -191,17 +197,17 @@ copies and deletion work on these names. A file is read in tiers: pool pages,
 then local disk, then the object store. Storage keeps opened layers for reuse,
 with one opener per layer.
 
-**Every local copy is one file and a chunk bitmap**, recorded in the node
-catalog. Opening a
-copy first finds what it is (its length, its chunks, whether it is linked, and
-whether this process wrote it), then opens it once.
+**Every local copy is one sparse file and a chunk bitmap** in memory. Local
+disk does not outlive the process ([Local disk is a
+cache](read-path.md#local-disk-is-a-cache)), so every file on it was written by
+this process. Opening a copy reuses its open source if it has one, else finds
+what it is (its length, whether it is linked, and whether this process wrote it
+whole), then opens it once.
 
 - A copy that this node wrote (a layer it published) has every chunk.
 - A file opened from the object store starts with no chunks. It is served at
   once, and loads fill it in ([Never waiting on the object
   store](#never-waiting-on-the-object-store)).
-- A copy found after a restart has the chunks that the catalog recorded. Each is
-  checked against its hash before first use.
 
 Without a disk budget, the node loads the rest of an incomplete copy in the
 background (`hydrations` in `/status`). With a budget, it loads only what is

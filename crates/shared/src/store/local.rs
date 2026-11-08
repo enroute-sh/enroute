@@ -28,26 +28,31 @@ pub(super) struct LocalStore {
     inner: LocalFileSystem,
     /// Held across every conditional update.
     lock: PathBuf,
+    /// Taken before `lock`: waiters for the `flock` would otherwise fill the
+    /// blocking pool, and its holder could not finish its write.
+    local: tokio::sync::Mutex<()>,
 }
 
 impl LocalStore {
     pub(super) fn new(root: &std::path::Path) -> anyhow::Result<LocalStore> {
         Ok(LocalStore {
-            // The ledger truncates its log once a layer or checkpoint is in
-            // the store, so a write must survive a power loss before it returns.
+            // The ledger truncates its log once a layer is in the store, so
+            // a write must survive a power loss before it returns.
             inner: LocalFileSystem::new_with_prefix(root)?.with_fsync(true),
             lock: root.join(".cas.lock"),
+            local: tokio::sync::Mutex::new(()),
         })
     }
 
     /// Take the store's update lock (blocking until it is free).
-    async fn locked(&self) -> Result<std::fs::File> {
+    async fn locked(&self) -> Result<(tokio::sync::MutexGuard<'_, ()>, std::fs::File)> {
+        let local = self.local.lock().await;
         let path = self.lock.clone();
         let generic = |e: std::io::Error| Error::Generic {
             store: "LocalStore",
             source: Box::new(e),
         };
-        tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
+        let file = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
             let f = std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(false)
@@ -61,7 +66,8 @@ impl LocalStore {
             store: "LocalStore",
             source: Box::new(e),
         })?
-        .map_err(generic)
+        .map_err(generic)?;
+        Ok((local, file))
     }
 }
 
@@ -210,5 +216,38 @@ mod tests {
             s.put_opts(&Path::from("b"), "1".into(), update(&v2)).await,
             Err(Error::Precondition { .. })
         ));
+    }
+
+    async fn create_then_update(s: std::sync::Arc<LocalStore>, i: usize) {
+        let p = Path::from(format!("r{i}"));
+        let v = s.put(&p, "1".into()).await.unwrap();
+        let opts = PutOptions {
+            mode: PutMode::Update(UpdateVersion {
+                e_tag: v.e_tag,
+                version: v.version,
+            }),
+            ..Default::default()
+        };
+        s.put_opts(&p, "2".into(), opts).await.unwrap();
+    }
+
+    /// More concurrent updates than blocking threads still finish.
+    #[test]
+    fn updates_beyond_the_blocking_pool_finish() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .max_blocking_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let s = std::sync::Arc::new(LocalStore::new(dir.path()).unwrap());
+        rt.block_on(async {
+            let updates = (0..32).map(|i| tokio::spawn(create_then_update(s.clone(), i)));
+            let all = futures::future::try_join_all(updates);
+            tokio::time::timeout(std::time::Duration::from_secs(30), all)
+                .await
+                .unwrap()
+                .unwrap();
+        });
     }
 }

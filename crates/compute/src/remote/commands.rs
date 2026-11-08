@@ -4,10 +4,11 @@
 //! A spec becomes a command or an outcome: a ref the remote already holds at
 //! the value asked for is answered here, and never reaches the wire.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 
-use crate::git::oid::Oid;
+use crate::git::oid::{ObjectFormat, Oid};
 use crate::git::refname;
+use crate::meta::Map;
 
 use super::advertise::Advertisement;
 use super::{Error, PushStatus, RefOutcome, RefSpec};
@@ -26,7 +27,7 @@ pub(super) struct Command {
 
 impl Command {
     pub(super) fn deletes(&self) -> bool {
-        self.new == Oid::ZERO
+        self.new.is_zero()
     }
 }
 
@@ -46,8 +47,9 @@ pub(super) enum Step {
 /// A refspec that names no ref, names one twice, or names something git
 /// would not accept as a refname.
 pub(super) fn plan(
+    format: ObjectFormat,
     specs: &[RefSpec],
-    local: &BTreeMap<String, Oid>,
+    local: &Map<Oid>,
     advertisement: &Advertisement,
 ) -> Result<Vec<Step>, Error> {
     let mut destinations: HashSet<&str> = HashSet::new();
@@ -60,7 +62,7 @@ pub(super) fn plan(
                 "{destination} is named by more than one refspec"
             )));
         }
-        steps.push(step(spec, destination, local, advertisement));
+        steps.push(step(format, spec, destination, local, advertisement));
     }
     Ok(steps)
 }
@@ -88,20 +90,22 @@ fn destination(spec: &RefSpec) -> Result<&str, Error> {
     Ok(destination)
 }
 
+/// The step of `spec`, whose ids are of `format`.
 fn step(
+    format: ObjectFormat,
     spec: &RefSpec,
     destination: &str,
-    local: &BTreeMap<String, Oid>,
+    local: &Map<Oid>,
     advertisement: &Advertisement,
 ) -> Step {
     let old = advertisement
         .refs
         .get(destination)
         .copied()
-        .unwrap_or(Oid::ZERO);
+        .unwrap_or(format.zero());
 
     let new = if spec.source.is_empty() {
-        Oid::ZERO
+        format.zero()
     } else {
         match local.get(&spec.source) {
             Some(oid) => *oid,
@@ -109,7 +113,7 @@ fn step(
                 return Step::Done(RefOutcome {
                     destination: destination.to_owned(),
                     old_id: old,
-                    new_id: Oid::ZERO,
+                    new_id: format.zero(),
                     status: PushStatus::Rejected(format!(
                         "{} is not a ref this repository holds",
                         spec.source
@@ -162,7 +166,7 @@ mod tests {
         }
     }
 
-    fn local(refs: &[(&str, Oid)]) -> BTreeMap<String, Oid> {
+    fn local(refs: &[(&str, Oid)]) -> Map<Oid> {
         refs.iter()
             .map(|(name, oid)| ((*name).to_owned(), *oid))
             .collect()
@@ -173,7 +177,13 @@ mod tests {
         let here = local(&[("refs/heads/main", oid('a'))]);
         let there = advertisement(&[("refs/heads/main", oid('a'))]);
 
-        let steps = plan(&[spec("refs/heads/main", "")], &here, &there).expect("planned");
+        let steps = plan(
+            ObjectFormat::Sha1,
+            &[spec("refs/heads/main", "")],
+            &here,
+            &there,
+        )
+        .expect("planned");
         assert!(matches!(
             steps.first(),
             Some(Step::Done(RefOutcome {
@@ -186,6 +196,7 @@ mod tests {
     #[test]
     fn a_ref_this_repository_does_not_hold_is_refused_here() {
         let steps = plan(
+            ObjectFormat::Sha1,
             &[spec("refs/heads/gone", "")],
             &local(&[]),
             &advertisement(&[]),
@@ -203,7 +214,13 @@ mod tests {
     #[test]
     fn an_empty_source_deletes_the_destination() {
         let there = advertisement(&[("refs/heads/wip", oid('b'))]);
-        let steps = plan(&[spec("", "refs/heads/wip")], &local(&[]), &there).expect("planned");
+        let steps = plan(
+            ObjectFormat::Sha1,
+            &[spec("", "refs/heads/wip")],
+            &local(&[]),
+            &there,
+        )
+        .expect("planned");
 
         let Some(Step::Send(command)) = steps.first() else {
             panic!("a command")
@@ -215,6 +232,7 @@ mod tests {
     #[test]
     fn deleting_a_ref_the_remote_does_not_have_is_already_done() {
         let steps = plan(
+            ObjectFormat::Sha1,
             &[spec("", "refs/heads/wip")],
             &local(&[]),
             &advertisement(&[]),
@@ -233,6 +251,7 @@ mod tests {
     fn a_source_is_pushed_under_the_destination_name() {
         let here = local(&[("refs/heads/main", oid('a'))]);
         let steps = plan(
+            ObjectFormat::Sha1,
             &[spec("refs/heads/main", "refs/heads/trunk")],
             &here,
             &advertisement(&[]),
@@ -249,9 +268,22 @@ mod tests {
 
     #[test]
     fn refuses_a_refspec_that_is_not_fully_qualified() {
-        plan(&[spec("main", "")], &local(&[]), &advertisement(&[])).unwrap_err();
-        plan(&[spec("", "")], &local(&[]), &advertisement(&[])).unwrap_err();
         plan(
+            ObjectFormat::Sha1,
+            &[spec("main", "")],
+            &local(&[]),
+            &advertisement(&[]),
+        )
+        .unwrap_err();
+        plan(
+            ObjectFormat::Sha1,
+            &[spec("", "")],
+            &local(&[]),
+            &advertisement(&[]),
+        )
+        .unwrap_err();
+        plan(
+            ObjectFormat::Sha1,
             &[spec("", "refs/heads/a..b")],
             &local(&[]),
             &advertisement(&[]),
@@ -266,6 +298,6 @@ mod tests {
             spec("refs/heads/main", "refs/heads/trunk"),
             spec("refs/heads/wip", "refs/heads/trunk"),
         ];
-        plan(&specs, &here, &advertisement(&[])).unwrap_err();
+        plan(ObjectFormat::Sha1, &specs, &here, &advertisement(&[])).unwrap_err();
     }
 }

@@ -14,7 +14,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::git::delta;
 use crate::git::io::{self, ReadAt};
-use crate::git::oid::{Kind, Oid, try_hash_object};
+use crate::git::oid::{Kind, ObjectFormat, Oid, try_hash_object};
 use crate::git::pack::{EntryBase, PackReader, encode_entry_header};
 use crate::git::zlib;
 use crate::storage::{OidIndex, TempTable, Workspace};
@@ -73,6 +73,7 @@ pub(crate) type Visitor<'a> = dyn Fn(&Oid, Kind, &[u8]) -> Result<()> + Sync + '
 /// [`OidIndex`], so indexing a huge pack needs memory for the content
 /// cache, not for every object.
 pub(crate) struct PackIndex {
+    format: ObjectFormat,
     data: Arc<dyn ReadAt>,
     entries: TempTable<EntryRec>,
     ref_bases: TempTable<Oid>,
@@ -87,6 +88,7 @@ pub(crate) struct PackIndex {
 /// A pack after the sequential pass ([`PackIndex::scan`]): entry
 /// boundaries known, full objects hashed, deltas still to resolve.
 pub(crate) struct Scanned {
+    format: ObjectFormat,
     entries: TempTable<EntryRec>,
     ref_bases: TempTable<Oid>,
     oids: TempTable<Oid>,
@@ -119,7 +121,9 @@ impl PackIndex {
         let count = reader.count();
         ensure!(count < REF_BASE, "pack has too many objects");
         let count = ix(count);
+        let format = reader.format();
         let mut idx = Scanned {
+            format,
             entries: TempTable::new(ws),
             ref_bases: TempTable::new(ws),
             oids: TempTable::filled(ws, count, Oid::ZERO),
@@ -158,7 +162,7 @@ impl PackIndex {
             });
             if base == NO_BASE {
                 let kind = Kind::from_code(e.type_code).context("bad object type")?;
-                let oid = try_hash_object(kind, &e.content)?;
+                let oid = try_hash_object(format, kind, &e.content)?;
                 idx.oids.set(ix(i), oid);
                 idx.kinds.set(ix(i), kind.code());
                 visit(&oid, kind, &e.content)?;
@@ -189,6 +193,7 @@ impl Scanned {
         ws: &Workspace,
     ) -> Result<PackIndex> {
         let Scanned {
+            format,
             entries,
             ref_bases,
             oids,
@@ -196,6 +201,7 @@ impl Scanned {
             remaining,
         } = self;
         let mut idx = PackIndex {
+            format,
             data,
             entries,
             ref_bases,
@@ -281,6 +287,11 @@ impl PackIndex {
     /// which reading entries rebuilds each delta chain only once.
     pub(crate) fn walk_order(&self) -> impl Iterator<Item = u32> + '_ {
         self.order.iter()
+    }
+
+    /// The format of the pack's ids.
+    pub(crate) fn format(&self) -> ObjectFormat {
+        self.format
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -382,14 +393,14 @@ mod tests {
             full_entry(Kind::Blob, &base),
             ref_delta_entry(&base_oid, &d),
         ];
-        let pack = crate::git::pack::pack_of(&entries);
+        let pack = crate::git::pack::pack_of(ObjectFormat::Sha1, &entries);
         let cache = crate::util::byte_cache(1 << 20);
         let none = |_: &Oid| Ok(None);
         let tmp = tempfile::tempdir().unwrap();
         let src = Arc::new(io::Owned(pack));
         let ws = Workspace::at(tmp.path());
         let idx = PackIndex::scan(
-            PackReader::new(&mut Incoming::of(src.clone())).unwrap(),
+            PackReader::new(&mut Incoming::of(src.clone()), ObjectFormat::Sha1, u64::MAX).unwrap(),
             &|_, _, _| Ok(()),
             &ws,
         )
@@ -451,7 +462,7 @@ mod tests {
             end += u64::try_from(e.len()).unwrap();
             entries.push(e);
         }
-        let pack = crate::git::pack::pack_of(&entries);
+        let pack = crate::git::pack::pack_of(ObjectFormat::Sha1, &entries);
 
         let base = Arc::new(versions[0].clone());
         let thin = |o: &Oid| Ok((*o == oid(0)).then(|| (Kind::Blob, base.clone())));
@@ -463,7 +474,8 @@ mod tests {
             let ws = Workspace::at(tmp.path());
             let src = Arc::new(io::Owned(pack.clone()));
             let idx = PackIndex::scan(
-                PackReader::new(&mut Incoming::of(src.clone())).unwrap(),
+                PackReader::new(&mut Incoming::of(src.clone()), ObjectFormat::Sha1, u64::MAX)
+                    .unwrap(),
                 &|_, _, _| Ok(()),
                 &ws,
             )

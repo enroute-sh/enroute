@@ -9,9 +9,9 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use axum::http::HeaderMap;
-use enroute_shared::state::RepoMeta;
 
 use crate::hooks::PushContext;
+use crate::meta::RepoState;
 
 /// What a request does to the repository.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,7 +147,7 @@ pub(crate) async fn hidden_refs(
     ctx: &PushContext,
     repo: &str,
     access: Access,
-    meta: &RepoMeta,
+    meta: &RepoState,
 ) -> Result<Hidden> {
     let Some(visibility) = visibility else {
         return Ok(Hidden::default());
@@ -196,15 +196,15 @@ mod tests {
         }
     }
 
-    fn meta(head: &str, refs: &[&str]) -> RepoMeta {
-        RepoMeta {
+    fn meta(head: &str, refs: &[&str]) -> RepoState {
+        RepoState {
             head: head.into(),
             refs: refs.iter().map(|r| ((*r).to_string(), Oid::ZERO)).collect(),
             ..Default::default()
         }
     }
 
-    async fn hidden(keep: &[&'static str], meta: &RepoMeta) -> Vec<String> {
+    async fn hidden(keep: &[&'static str], meta: &RepoState) -> Vec<String> {
         let vis = Keep(keep.to_vec());
         let h = hidden_refs(Some(&vis), &PushContext::default(), "r", Access::Read, meta)
             .await

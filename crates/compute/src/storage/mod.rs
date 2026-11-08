@@ -3,7 +3,6 @@
 //! Everything the engine may use is re-exported here; the modules are
 //! private.
 
-mod catalog;
 mod files;
 mod handles;
 mod key;

@@ -113,7 +113,7 @@ and nothing compiles. Give it the endpoint URL:
 docker run --rm -d --name enroute \
   -p 8080:8080 -p 50051:50051 -v enroute-dev:/data \
   --add-host=host.docker.internal:host-gateway \
-  ghcr.io/enroute-sh/enroute:0.3.0 dev --dir /data --host 0.0.0.0 \
+  ghcr.io/enroute-sh/enroute:0.4.0 dev --dir /data --host 0.0.0.0 \
   --hooks http://host.docker.internal:3000/api/enroute/hooks
 ```
 
@@ -141,7 +141,7 @@ That is correct on a laptop and wrong in a deployment, where the port must be
 reachable only by the user's application. Tell the user this, so they do not
 ship the local shape.
 
-**Checkpoint.** The `enroute dev` banner, or `docker logs enroute`, shows the four hooks and a `keyid`. Do not continue until it does.
+**Checkpoint.** The `enroute dev` banner, or `docker logs enroute`, shows the four hooks and a `signing key id`. Do not continue until it does.
 `references/troubleshooting.md` covers the failures.
 
 ## Phase 3: write the client

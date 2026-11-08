@@ -152,7 +152,15 @@ impl HookClient {
             post = post.header(name, value);
         }
 
-        let response = post.body(body).send().await?.error_for_status()?;
+        // The hook's spans can then join the push's trace.
+        let mut traced = HeaderMap::new();
+        enroute_shared::trace_context::inject(&mut traced);
+        let response = post
+            .headers(traced)
+            .body(body)
+            .send()
+            .await?
+            .error_for_status()?;
         Ok(pb::HookResponse::decode(response.bytes().await?)?)
     }
 
@@ -288,7 +296,7 @@ impl PushHooks for HookClient {
     #[tracing::instrument(
         name = "enroute::hooks::pre_receive",
         err,
-        skip(self, ctx, commands),
+        skip(self, ctx, commands, options),
         fields(actor = %ctx.actor, commands = commands.len())
     )]
     async fn pre_receive(
@@ -296,6 +304,7 @@ impl PushHooks for HookClient {
         ctx: &PushContext,
         repo: &str,
         commands: &[HookCommand],
+        options: &[String],
     ) -> anyhow::Result<Vec<RefJudgement>> {
         let call = pb::HookRequest {
             call: Some(pb::hook_request::Call::PreReceive(pb::PreReceiveRequest {
@@ -303,6 +312,7 @@ impl PushHooks for HookClient {
                 actor: ctx.actor.clone(),
                 commands: commands.iter().map(wire_command).collect(),
                 context: ctx.context.clone(),
+                push_options: options.to_vec(),
             })),
         };
 
@@ -319,7 +329,7 @@ impl PushHooks for HookClient {
     // Enroute only logs an error from here, because the refs have moved.
     #[tracing::instrument(
         name = "enroute::hooks::post_receive",
-        skip(self, ctx, commands),
+        skip(self, ctx, commands, options),
         fields(actor = %ctx.actor, commands = commands.len())
     )]
     async fn post_receive(
@@ -327,6 +337,7 @@ impl PushHooks for HookClient {
         ctx: &PushContext,
         repo: &str,
         commands: &[HookCommand],
+        options: &[String],
     ) -> anyhow::Result<Vec<String>> {
         if !self.enabled.contains(&Hook::PostReceive) {
             return Ok(Vec::new());
@@ -338,6 +349,7 @@ impl PushHooks for HookClient {
                     actor: ctx.actor.clone(),
                     commands: commands.iter().map(wire_command).collect(),
                     context: ctx.context.clone(),
+                    push_options: options.to_vec(),
                 },
             )),
         };

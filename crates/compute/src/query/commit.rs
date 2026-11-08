@@ -1,8 +1,8 @@
 //! Commits made on the server from a set of file changes.
 //!
 //! The new objects become a layer as a push's do: a small one goes inline
-//! through the log, a larger one to the object store first. No hooks run, as
-//! for [`update_refs`](super::update_refs).
+//! through the log, a larger one to the object store first. No hooks run,
+//! because the caller is the application.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -14,8 +14,11 @@ use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use enroute_shared::state::{Commit, RefUpdate};
 
 use crate::compute::Compute;
-use crate::git::object::{EntryMode, TreeEntry, tree_entries, write_commit, write_tree};
-use crate::git::oid::{Kind, Oid, try_hash_object};
+use crate::git::fsck;
+use crate::git::object::{
+    EntryMode, TreeEntry, references, tree_entries, write_commit, write_tree,
+};
+use crate::git::oid::{Kind, ObjectFormat, Oid, try_hash_object};
 use crate::git::pack::{full_entry, pack_of};
 use crate::git::refname;
 use crate::repo::view::Snapshot;
@@ -130,7 +133,7 @@ pub(crate) async fn create_commit(
     if commit.message.contains('\0') {
         return Err(Error::Invalid("the message holds a NUL byte".into()));
     }
-    let edits = edits(&commit.changes)?;
+    let edits = edits(&commit.changes, compute.config.max_object_bytes)?;
     for attempt in 0..COMMIT_ATTEMPTS {
         if attempt > 0 {
             snap = snapshot(compute, repo).await?;
@@ -200,8 +203,9 @@ struct Edit<'a> {
     edit: &'a PathEdit,
 }
 
-/// Check every change, and split its path.
-fn edits(changes: &[PathChange]) -> Result<Vec<Edit<'_>>, Error> {
+/// Check every change, and split its path. A file over `max_object` bytes
+/// is refused here, as a push would be.
+fn edits(changes: &[PathChange], max_object: u64) -> Result<Vec<Edit<'_>>, Error> {
     if changes.is_empty() {
         return Err(Error::Invalid("no changes".into()));
     }
@@ -223,11 +227,20 @@ fn edits(changes: &[PathChange]) -> Result<Vec<Edit<'_>>, Error> {
                     ..
                 }
             );
+            if let PathEdit::Put { content, .. } = &change.edit
+                && u64::try_from(content.len()).unwrap_or(u64::MAX) > max_object
+            {
+                return Err(Error::Invalid(format!(
+                    "{:?} is {} bytes, over the limit of {max_object} bytes",
+                    change.path,
+                    content.len()
+                )));
+            }
             // `git fsck` refuses it: git would follow it out of the tree.
             if symlink
                 && path
                     .last()
-                    .is_some_and(|name| name.eq_ignore_ascii_case(".gitmodules"))
+                    .is_some_and(|name| fsck::is_dotgitmodules(name.as_bytes()))
             {
                 return Err(Error::Invalid(
                     "a .gitmodules may not be a symbolic link".into(),
@@ -249,7 +262,7 @@ fn split_path(path: &str) -> Result<Vec<&str>, Error> {
             || *part == "."
             || *part == ".."
             || part.contains(['\0', '\\'])
-            || is_dotgit(part)
+            || fsck::is_dotgit(part.as_bytes())
     };
     if path.is_empty() || parts.iter().any(bad) {
         return Err(Error::Invalid(format!(
@@ -258,23 +271,6 @@ fn split_path(path: &str) -> Result<Vec<&str>, Error> {
         )));
     }
     Ok(parts)
-}
-
-/// Whether git reads `name` as `.git`, as `is_ntfs_dotgit` and `is_hfs_dotgit` do.
-///
-/// That is in any case, with what HFS+ ignores anywhere and what NTFS drops at
-/// the end.
-fn is_dotgit(name: &str) -> bool {
-    let ignored = |c: &char| {
-        matches!(
-            c,
-            '\u{200c}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{206a}'..='\u{206f}' | '\u{feff}'
-        )
-    };
-    let kept: String = name.chars().filter(|c| !ignored(c)).collect();
-    let kept = kept.to_ascii_lowercase();
-    let kept = kept.trim_end_matches([' ', '.']);
-    kept == ".git" || kept == "git~1"
 }
 
 /// The objects of a commit, and the ids that matter.
@@ -356,7 +352,7 @@ async fn load_trees(
         let mut next: HashMap<Oid, Vec<&[&str]>> = HashMap::new();
         for (tree, paths) in level {
             let data = trees.get(&tree).context("tree not read")?;
-            descend(data, &paths, &mut next);
+            descend(snap.format(), data, &paths, &mut next);
         }
         level = next;
     }
@@ -366,6 +362,7 @@ async fn load_trees(
 /// Add to `next` the subtrees that `paths` pass through below the tree
 /// `data`, each with the path left under it.
 fn descend<'a>(
+    format: ObjectFormat,
     data: &Arc<Vec<u8>>,
     paths: &[&'a [&'a str]],
     next: &mut HashMap<Oid, Vec<&'a [&'a str]>>,
@@ -377,7 +374,7 @@ fn descend<'a>(
         if rest.is_empty() {
             continue;
         }
-        let sub = tree_entries(data)
+        let sub = tree_entries(format, data)
             .filter_map(Result::ok)
             .find(|e| e.name == first.as_bytes() && e.kind() == Some(Kind::Tree));
         if let Some(sub) = sub {
@@ -403,9 +400,13 @@ struct Builder<'a> {
 }
 
 impl Builder<'_> {
-    /// Hash an object, and keep it if the repository does not hold it.
-    fn add(&mut self, kind: Kind, data: Bytes) -> anyhow::Result<Oid> {
-        let oid = try_hash_object(kind, &data)?;
+    /// Check an object as a push checks it, hash it, and keep it if the
+    /// repository does not hold it.
+    fn add(&mut self, kind: Kind, data: Bytes) -> Result<Oid, Error> {
+        let format = self.snap.format();
+        references(format, kind, &data)
+            .map_err(|e| Error::Invalid(format!("git would refuse the {}: {e:#}", kind.name())))?;
+        let oid = try_hash_object(format, kind, &data)?;
         if self.snap.lookup_kind(&oid, kind).is_none() && self.added.insert(oid) {
             self.objects.push((kind, data));
         }
@@ -422,7 +423,7 @@ impl Builder<'_> {
         let mut entries: BTreeMap<Vec<u8>, (EntryMode, Oid)> = BTreeMap::new();
         if let Some(tree) = tree {
             let data = self.trees.get(&tree).context("tree not loaded")?;
-            for entry in tree_entries(data) {
+            for entry in tree_entries(self.snap.format(), data) {
                 let entry = entry?;
                 entries.insert(entry.name.to_vec(), (entry.mode, entry.oid));
             }
@@ -502,10 +503,17 @@ async fn publish(
             .map(|(kind, data)| full_entry(*kind, data))
             .collect();
         let pack: Arc<dyn crate::git::io::ReadAt> =
-            Arc::new(crate::git::io::Owned(pack_of(&entries)));
+            Arc::new(crate::git::io::Owned(pack_of(snap.format(), &entries)));
         let ws = compute.storage.workspace();
-        let ingested =
-            crate::repo::ingest::ingest_stored(snap.clone(), pack, ws, Vec::new(), None).await?;
+        let ingested = crate::repo::ingest::ingest_stored(
+            snap.clone(),
+            pack,
+            ws,
+            Vec::new(),
+            None,
+            compute.config.max_object_bytes,
+        )
+        .await?;
         ingested.layer
     };
     let commit = Commit {
@@ -587,9 +595,16 @@ mod tests {
                 mode,
             },
         };
-        edits(&[]).unwrap_err();
-        edits(&[put("a", FileMode::Regular), put("a", FileMode::Executable)]).unwrap_err();
-        edits(&[put("x/.gitmodules", FileMode::Symlink)]).unwrap_err();
-        edits(&[put(".gitmodules", FileMode::Regular)]).unwrap();
+        edits(&[], u64::MAX).unwrap_err();
+        edits(
+            &[put("a", FileMode::Regular), put("a", FileMode::Executable)],
+            u64::MAX,
+        )
+        .unwrap_err();
+        edits(&[put("x/.gitmodules", FileMode::Symlink)], u64::MAX).unwrap_err();
+        edits(&[put("x/GITMOD~1", FileMode::Symlink)], u64::MAX).unwrap_err();
+        edits(&[put(".gitmodules", FileMode::Regular)], u64::MAX).unwrap();
+        edits(&[put("a", FileMode::Regular)], 1).unwrap();
+        edits(&[put("a", FileMode::Regular)], 0).unwrap_err();
     }
 }

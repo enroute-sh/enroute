@@ -1,8 +1,8 @@
 //! The layer sweep: deleting layer files in the object store that nothing
 //! names and nothing ever will (layers a flush or compaction replaced,
 //! outputs of lost races, files of crashed or abandoned publishes), found by
-//! listing the repository's layers. It runs on the compute holding the
-//! repository's maintenance lease, every `sweep_interval`.
+//! listing the repository's layers. It runs on the compute that maintains
+//! the repository, every `sweep_interval`.
 //!
 //! A file is deleted only if all of these hold:
 //!
@@ -13,19 +13,18 @@
 //!   window of that state (`gen + UPLOAD_GEN_WINDOW < upload_gen`), so the
 //!   state machine refuses any commit adding it. A layer that left the
 //!   manifest cannot come back under its name either: ids are never reused.
-//! - **The state object does not name it.** That is the checkpoint an
-//!   operator recovers from, up to a minute behind the log (longer while
-//!   checkpoints fail).
 //! - **It has gone unnamed for `sweep_retention`, by the object store's
 //!   clock**, so readers of an older state (a compute serving an older
-//!   snapshot, a long query reading the object store) can finish. Getting
-//!   this wrong fails a read; it never loses a referenced file.
+//!   snapshot, a long query reading the object store) can finish, and a
+//!   ledger restored from volume snapshots no older than that finds every
+//!   file its states name. Getting this wrong fails a read (or such a
+//!   restore); it never loses a file the live state names.
 //!
 //! The sweep advances the upload generation (a log entry) only when a file
 //! nothing names is still in the window, so a repository with nothing to
 //! delete costs no log entries.
 //!
-//! **The sweep record**, `repos/<repo>/sweep` (JSON), keeps the files seen
+//! **The sweep record**, `data/repos/<repo>/sweep` (JSON), keeps the files seen
 //! unnamed and since when. No node's clock is involved: a file's time is
 //! the object store's last-modified time of the record write that first
 //! listed it, which is only known after that write, so a new entry has
@@ -33,26 +32,29 @@
 //! as it reads it. That same time is the next sweep's "now". Both err late
 //! (a file was seen before the write that lists it, and "now" is the last
 //! write, not the present), which only delays deletions. The record is
-//! replaced by compare-and-swap, so overlapping sweeps (a lease changing
-//! hands) cannot undo each other's progress; losing it only delays
+//! replaced by compare-and-swap, so overlapping sweeps (a repository changing
+//! maintainers) cannot undo each other's progress; losing it only delays
 //! deletions too.
 //!
 //! **Deleted incarnations** are reclaimed from their trash markers
-//! ([`Trash`]), which no compute follows: once the state object shows the
-//! deletion (deleted, or a later incarnation), a file whose generation is
+//! ([`Trash`]), which no compute follows. The ledger writes one only once
+//! the incarnation's tombstone is committed, so a file whose generation is
 //! at most the marker's is named by nothing and never will be (a later
-//! incarnation starts its generations past its window), so it goes after
-//! the retention, timed in the marker as in a sweep record. The marker
-//! goes once no such file is left.
+//! incarnation starts its generations past its window): it goes after the
+//! retention, timed in the marker as in a sweep record. The marker goes
+//! once no such file is left.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use enroute_shared::repo_state::{TRASH_PREFIX, Trash, Unnamed, parse_trash_path};
-use enroute_shared::state::{Command, RepoMeta, UPLOAD_GEN_WINDOW, layer_gen};
+use enroute_shared::repo_state::{TRASH_PREFIX, Trash, Unnamed, data_path, parse_trash_path};
+
+use enroute_shared::state::{Command, UPLOAD_GEN_WINDOW, layer_gen};
 use enroute_shared::store::ObjectVersion;
+
+use crate::meta::RepoState;
 
 use super::Maintainer;
 
@@ -62,13 +64,13 @@ const DELETE_BATCH: usize = 200;
 const DELETE_PAUSE: Duration = Duration::from_millis(200);
 
 fn record_path(repo: &str) -> String {
-    format!("repos/{repo}/sweep")
+    format!("{}/sweep", data_path(repo))
 }
 
 /// One sweep's decision, from what it saw: `record` as read, written last
 /// at `last_write` (None: there was no record); the layer files `listed`;
-/// the files `named` by the live manifest (read after listing) and the
-/// state object; and the live state's `upload_gen`. Updates `record` and
+/// the files `named` by the live manifest (read after listing); and the
+/// live state's `upload_gen`. Updates `record` and
 /// returns the files to delete.
 fn decide(
     record: &mut Unnamed,
@@ -129,7 +131,7 @@ async fn delete_batched(node: &Maintainer, repo: &str, ids: &[String]) -> Result
 async fn advance_if_waiting(
     node: &Maintainer,
     repo: &str,
-    m: &RepoMeta,
+    m: &RepoState,
     listed: &[String],
 ) -> Result<bool> {
     let named: HashSet<&str> = m.layers.iter().map(|l| l.id.as_str()).collect();
@@ -180,8 +182,7 @@ async fn sweep(node: &Maintainer, repo: &str) -> Result<usize> {
         return Ok(0);
     };
     let snap = live.snapshot();
-    let mut named: HashSet<String> = snap.meta.layers.iter().map(|l| l.id.clone()).collect();
-    named.extend(node.storage.checkpointed_layers(repo).await?);
+    let named: HashSet<String> = snap.meta.layers.iter().map(|l| l.id.clone()).collect();
     let delete = decide(
         &mut record,
         last_write,
@@ -228,7 +229,7 @@ async fn write_record(
 }
 
 /// Reclaim the layer files of every deleted incarnation (see the module
-/// documentation) whose repository's lease this node holds or can take.
+/// documentation) whose repository this node maintains.
 /// Returns how many files it deleted.
 async fn reclaim(node: &Maintainer) -> Result<usize> {
     let mut deleted = 0;
@@ -236,7 +237,7 @@ async fn reclaim(node: &Maintainer) -> Result<usize> {
         let Some((repo, epoch)) = parse_trash_path(&path) else {
             continue;
         };
-        if !node.leases.hold(repo).await? {
+        if !node.owners.owns(repo) {
             continue;
         }
         match reclaim_one(node, repo, epoch, &path).await {
@@ -254,12 +255,6 @@ async fn reclaim_one(node: &Maintainer, repo: &str, epoch: u64, path: &str) -> R
         return Ok(0);
     };
     let mut trash: Trash = serde_json::from_slice(&data)?;
-    let Some((state, _)) = enroute_shared::repo_state::latest(&node.objects, repo).await? else {
-        return Ok(0);
-    };
-    if state.epoch < epoch || state.epoch == epoch && !state.meta.is_some_and(|m| m.deleted) {
-        return Ok(0); // the deletion is not in the state object yet
-    }
     let listed: Vec<String> = node
         .storage
         .list_layers(repo)
@@ -308,7 +303,7 @@ async fn sweep_all(node: &Maintainer) {
         .states
         .names()
         .into_iter()
-        .filter(|r| node.leases.holds(r))
+        .filter(|r| node.owners.owns(r))
     {
         if let Err(e) = sweep(node, &repo).await {
             tracing::warn!(repo, "layer sweep failed: {e:#}");
@@ -392,9 +387,8 @@ mod tests {
         );
     }
 
-    /// A file named again (committed after it was first seen unnamed, or
-    /// named by the state object) leaves the record, and starts over if
-    /// it is unnamed later.
+    /// A file named again (committed after it was first seen unnamed)
+    /// leaves the record, and starts over if it is unnamed later.
     #[test]
     fn named_files_leave_the_record() {
         let f = id(1, 0);

@@ -1,10 +1,11 @@
 # The contract: calling Enroute
 
 The contract is gRPC. The service files under `proto/enroute/api/v1alpha1/`
-define it: `repository.proto`, `ref.proto`, `object.proto`, and `sync.proto`,
-one per service. They import `enroute/common/v1alpha1/common.proto`, which
-holds `RepoKey` and `ObjectId`. A sixth file, `enroute/hook/v1alpha1/hook.proto`,
-holds what the endpoint answers with and declares no service. Copy the whole
+define it: `repository.proto`, `ref.proto`, `commit.proto`, `object.proto`, and
+`sync.proto`, one per service. They import
+`enroute/common/v1alpha1/common.proto`, which holds `RepoKey` and `ObjectId`. A
+seventh file, `enroute/hook/v1alpha1/hook.proto`, holds what the endpoint
+answers with and declares no service. Copy the whole
 `enroute/` tree into the user's project and generate every file in it.
 
 `v1alpha1` is not a typo for `v1`. The suffix tracks the major version of the
@@ -71,6 +72,7 @@ It answers:
 |                     | `DiffCommit`       | A stream of changed paths, as blob id pairs.                   |
 |                     | `FindMergeBases`   | Where two histories last agreed, as a set, in no defined order.     |
 | `SyncService`       | `PushToRemote`     | One outcome per ref sent to another Git server.                |
+|                     | `FetchFromRemote`  | Refs under prefixes made to match another Git server; changed refs only. |
 | `CommitService`     | `CreateCommit`     | The new commit on a branch, made from file changes.            |
 
 ## Rules that catch people out
@@ -105,8 +107,15 @@ that, byte for byte — send the separator, since `acme` also matches `acmex`.
 **A rejection is an outcome, not a failure.** `UpdateRefs` can land some
 updates and refuse others, and the RPC still returns `OK`. Read
 `UpdateRefsResponse.outcomes`, which come back in the order the updates were
-sent. An outcome with no `rejection` landed. The call is not all-or-nothing:
-the other updates in it are unaffected.
+sent. An outcome with no `rejection` landed. By default the call is not
+all-or-nothing: the other updates in it are unaffected. Set `atomic` for all or
+none; then one rejection rejects the rest with `REASON_ATOMIC_FAILURE`.
+
+**`UpdateRefs` follows Git push rules.** It is a push with no pack and no
+hooks. A delete needs `old_object_id` (else `INVALID_ARGUMENT`), each ref may
+be updated once per call (`REASON_REPEATED_REF`), the branch `HEAD` points at
+cannot be deleted (`REASON_DELETE_CURRENT`), and an update that lost a race
+gets `REASON_NON_FAST_FORWARD` with no retry.
 
 **`UpdateRefs` cannot introduce objects.** Every tip it names must already be
 stored in the repository, and a tip under `refs/heads/` must be a commit. Push over Git first, then move the ref. That
@@ -181,11 +190,11 @@ python -m grpc_tools.protoc -I proto \
   proto/enroute/*/v1alpha1/*.proto
 ```
 
-Connect with `grpc.insecure_channel` and send the header as metadata.
+Connect with `grpc.insecure_channel`. No metadata is needed.
 
 **Go.** `protoc-gen-go` and `protoc-gen-go-grpc`. Dial with
-`grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))`
-and attach the header with `metadata.AppendToOutgoingContext`.
+`grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))`.
+No metadata is needed.
 
 **Rust.** `tonic-build` in a `build.rs`, and `tonic` for the client.
 

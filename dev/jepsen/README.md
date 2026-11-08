@@ -3,7 +3,8 @@
 This suite tests what git clients see over smart HTTP: ref updates from
 `git-receive-pack`, and ref reads from `ls-refs` and the ref advertisements.
 [Jepsen tests](../../docs/internals/jepsen.md) describes what it checks. It
-runs every week in CI (`.github/workflows/jepsen.yml`).
+runs every week in CI (`.github/workflows/soak.yml`, with random walks
+of the shard log model).
 
 The suite runs all nodes as local processes on one Linux machine, on
 `127.0.0.1`. It does not use Docker or SSH.
@@ -32,7 +33,7 @@ The suite runs all nodes as local processes on one Linux machine, on
     `iptables` can drop the packets of one node on the loopback interface.
 
     ```sh
-    for i in 1 2 3 4 5; do useradd -M -s /usr/sbin/nologin n$i; done
+    for i in 1 2 3 4 5 6 7; do useradd -M -s /usr/sbin/nologin n$i; done
     ```
 
 ## Run a test
@@ -71,13 +72,14 @@ To see the results in a browser, run `lein run serve` and open
 | Option | Default | Purpose |
 | --- | --- | --- |
 | `--workload` | `w1` | `w1`, `w1-v0`, `w2`, `w3`, or `w4`. See [Workloads](#workloads) |
-| `--topology` | `split` | `split`: 3 ledger nodes and 2 compute nodes. `both`: 3 nodes with both roles |
+| `--topology` | `split` | `split`: 3 ledger nodes and 2 compute nodes. `both`: 3 nodes with both roles. `wide`: 5 ledger nodes and 2 compute nodes |
 | `--nemesis` | none | Faults, separated by commas. See [Faults](#faults) |
 | `--interval` | `10` | Seconds between fault changes |
 | `--quiet` | `30` | Seconds without faults before the final reads |
 | `--rate` | `100` | Client operations per second |
 | `--key-count` | `8` | Keys (branches) in each repository |
 | `--per-key` | `200` | Appends to each key before the test uses a new repository |
+| `--repos` | `1` | Repositories written at once: half the operations go to one, the rest to any of them |
 | `--binary` | `../../target/release/enroute` | The `enroute` binary |
 | `--dir` | `/var/tmp/enroute-jepsen` | Parent of the per-test directories for node data and the bucket |
 | `--lazyfs` | none | Path of the LazyFS binary. Puts each ledger data directory on LazyFS |
@@ -97,7 +99,10 @@ Node `nI` listens on these ports:
 | `18002 + 10 × I` | `node.internal_listen`, and `advertise_url` on ledger nodes |
 
 In the `split` topology, `n1` to `n3` have `role = "ledger"`, and `n4` and `n5`
-have `role = "compute"`. All nodes use one `file://` bucket. The configuration
+have `role = "compute"`. In the `wide` topology, `n1` to `n5` are ledger nodes
+and `n6` and `n7` are compute nodes. Each log has 3 replicas, so only in `wide`
+can a member change move a replica to another node. All nodes use one
+`file://` bucket. The configuration
 has no `[hooks]` table, so pushes and reads are open, and a push creates its
 repository.
 
@@ -190,16 +195,26 @@ compute node.
 | `pause-leader` | Pauses (`SIGSTOP`) the leader of the current repository, then resumes it |
 | `pause-compute` | Pauses one compute node, then resumes it |
 | `kill-compute` | Kills one compute node, then starts it again |
+| `replace-ledger` | A ledger node loses its disk and starts again at the same address, with a new ID. Then the old ID is removed with `enroute members --remove` |
+| `retire-ledger` | Removes a running ledger node, waits until its logs move off it, and stops it. Then it starts on an empty disk and joins as a new node. Needs `wide` |
 
 Each cycle waits `--interval` seconds, starts one or two faults, waits
 `--interval` seconds, and ends them.
+
+The member changes follow the steps in
+[Maintenance](../../docs/operate/maintenance.md), and never use `--force`. If
+the ledger refuses to remove an old ID, for example while a partition holds,
+the suite tries again when the cycle ends and before the final reads.
+`run.sh` names the set of member changes and other ledger faults
+`membership`.
 
 ### Find the leader
 
 `kill-leader` and `pause-leader` ask each ledger node for
 `GET /status/repos/<repo>`, and pick the first of these:
 
-1. The leader that a majority of ledger nodes name, at the highest term.
+1. The leader that a majority of the log's 3 replicas name, at the highest
+   term.
 2. The node that says it leads, at the highest term. This can be a leader
    that a partition deposed.
 3. Any ledger node, if no node hosts the repository.
@@ -224,4 +239,4 @@ Then pass `--lazyfs <path>/lazyfs/build/lazyfs`. `run.sh` uses
 
 - All nodes run on one machine, without Docker. The bucket is a local
   directory, so there is no object store fault.
-- The ledger has 3 nodes.
+- The ledger has 3 or 5 nodes, and the nodes have no `node.zone`.

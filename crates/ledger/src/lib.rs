@@ -1,15 +1,19 @@
 //! The ledger: the nodes that hold the replicated logs. Every repository
-//! has its own log ([`consensus`]); the ledger creates it, decides who
-//! votes in it, and checkpoints it to the object store ([`Ledger`]).
+//! has its own log ([`consensus`]), and one root log says which
+//! repositories exist and who the members are ([`consensus::root`]); the
+//! ledger creates and deletes repositories through it ([`Ledger`]).
 
 #![deny(unsafe_code)]
 
+pub mod cluster;
 pub mod consensus;
 mod ledger;
 mod logdb;
+mod membership;
 mod proto;
-mod state_machine;
-mod state_store;
-mod stored;
+mod state;
+mod token;
+mod watch;
 
 pub use ledger::{Ledger, LedgerConfig};
+pub use token::{Claims, Refused};

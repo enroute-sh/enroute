@@ -63,7 +63,8 @@ check and the protobuf decode.
 
 ### authorize
 
-Enroute asks this once per Git request, before anything is served.
+Enroute asks this once per HTTP request of the Git client, before anything is
+served. One clone or push is several HTTP requests, so it asks several times.
 
 ```
 AuthorizeRequest { repo_path, headers[], access }
@@ -85,7 +86,7 @@ AuthorizeRequest { repo_path, headers[], access }
   `.` or `..` segment, an encoded `/`, a control character, or a path over
   1024 bytes. Such a request is a 404, and it never reaches this call.
 - `headers` holds the request headers as they arrived, so the credential is
-  in there. Git sends Basic by default. Accept `Authorization: Bearer <token>`,
+  in there. Names arrive in lowercase, as `authorization`. Git sends Basic by default. Accept `Authorization: Bearer <token>`,
   and `Basic <base64>` where the password is the token and the username is
   ignored: Git needs *some* username before it sends a password, and each
   client picks its own placeholder.

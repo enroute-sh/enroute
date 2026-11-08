@@ -89,13 +89,14 @@ impl Server {
             }
             None => loopback().await,
         };
+        let (api, git) = (loopback().await, loopback().await);
+        let addr = |l: &TcpListener| l.local_addr().unwrap();
+        let (url, api_at) = (addr(&git), addr(&api));
         let listeners = Listeners {
-            api: loopback().await,
-            git: loopback().await,
+            api: Some(api),
+            git: Some(git),
             internal,
         };
-        let addr = |l: &TcpListener| l.local_addr().unwrap();
-        let (url, api) = (addr(&listeners.git), addr(&listeners.api));
         let internal = addr(&listeners.internal);
         let serving = Enroute::start(config, hooks, Reach::default())
             .await
@@ -103,7 +104,7 @@ impl Server {
             .spawn(listeners);
         Server {
             url: format!("http://{url}"),
-            api: format!("http://{api}"),
+            api: format!("http://{api_at}"),
             internal,
             node: serving.node().clone(),
             _serving: serving,
@@ -157,9 +158,16 @@ impl Git {
     }
 
     pub(crate) async fn init(&self, name: &str) -> PathBuf {
+        self.init_with(name, &[]).await
+    }
+
+    /// [`Git::init`], with more `git init` arguments.
+    pub(crate) async fn init_with(&self, name: &str, args: &[&str]) -> PathBuf {
         let d = self.dir(name);
         std::fs::create_dir_all(&d).unwrap();
-        self.run(&d, &["init", "-q", "-b", "main"]).await;
+        let mut all = vec!["init", "-q", "-b", "main"];
+        all.extend_from_slice(args);
+        self.run(&d, &all).await;
         d
     }
 
@@ -236,10 +244,27 @@ impl Api {
         self.repos
             .create_repository(api::CreateRepositoryRequest {
                 repo: Some(key(repo)),
-                default_branch: String::new(),
+                ..Default::default()
             })
             .await?;
         Ok(())
+    }
+
+    /// Create `repo` naming its objects in `format`.
+    pub(crate) async fn create_repo_in(
+        &mut self,
+        repo: &str,
+        format: api::ObjectFormat,
+    ) -> Result<api::Repository, tonic::Status> {
+        let r = self
+            .repos
+            .create_repository(api::CreateRepositoryRequest {
+                repo: Some(key(repo)),
+                object_format: format.into(),
+                ..Default::default()
+            })
+            .await?;
+        Ok(r.into_inner().repository.unwrap_or_default())
     }
 
     pub(crate) async fn create_commit(
@@ -412,13 +437,11 @@ impl Server {
 
 /// An object store that can be taken down, which fails reads and writes.
 ///
-/// Listing and deleting still work. Writes of state objects alone can fail
-/// too, which stalls checkpoints.
+/// Listing and deleting still work.
 #[derive(Debug)]
 pub(crate) struct Outage {
     inner: Arc<dyn object_store::ObjectStore>,
     down: std::sync::atomic::AtomicBool,
-    states_down: std::sync::atomic::AtomicBool,
 }
 
 impl Outage {
@@ -427,7 +450,6 @@ impl Outage {
         let outage = Arc::new(Outage {
             inner: config.store.inner().clone(),
             down: false.into(),
-            states_down: false.into(),
         });
         config.store = Store::new(outage.clone());
         outage
@@ -435,12 +457,6 @@ impl Outage {
 
     pub(crate) fn set_down(&self, down: bool) {
         self.down.store(down, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    /// Fail writes of state objects (`repos/<repo>/state`).
-    pub(crate) fn set_states_down(&self, down: bool) {
-        self.states_down
-            .store(down, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn check(&self) -> object_store::Result<()> {
@@ -470,14 +486,6 @@ impl object_store::ObjectStore for Outage {
         opts: object_store::PutOptions,
     ) -> object_store::Result<object_store::PutResult> {
         self.check()?;
-        if self.states_down.load(std::sync::atomic::Ordering::SeqCst)
-            && location.filename() == Some("state")
-        {
-            return Err(object_store::Error::Generic {
-                store: "outage",
-                source: "state writes are down".into(),
-            });
-        }
         self.inner.put_opts(location, payload, opts).await
     }
 
@@ -562,6 +570,14 @@ pub(crate) async fn wait_until(mut f: impl FnMut() -> bool, secs: u64) -> bool {
     false
 }
 
+/// The internal URLs of cluster nodes, for a compute-only node.
+pub(crate) fn urls(servers: &[Server]) -> Vec<String> {
+    servers
+        .iter()
+        .map(|s| format!("http://{}", s.internal))
+        .collect()
+}
+
 /// `n` nodes of a cluster that share `store`, with data under `root`/n<i>.
 ///
 /// Each runs both roles unless `f`, which adjusts node i's config, says otherwise.
@@ -582,19 +598,32 @@ pub(crate) async fn cluster(
         f(i, &mut c);
         servers.push(Server::start_on(c, l).await);
     }
+    // Nodes become members once they join after they start, and root
+    // voters once caught up: wait, so every repository the test creates has
+    // them all as replicas and the root keeps a quorum with one node down.
+    let ready = || {
+        (servers.iter()).all(|s| {
+            let c = s.node.consensus().unwrap();
+            c.members().0.len() == n && c.root_voters().len() == n
+        })
+    };
+    assert!(
+        wait_until(ready, 30).await,
+        "not all {n} nodes became members and root voters"
+    );
     servers
 }
 
-/// `repo`'s voters on `server` (sorted; none if not hosted there).
-pub(crate) fn voters(server: &Server, repo: &str) -> Vec<u64> {
+/// `repo`'s replicas as the directory on `server` has them (sorted; none
+/// while they change, or if it has no live incarnation).
+pub(crate) fn replicas(server: &Server, repo: &str) -> Vec<u64> {
     let mut v = server
         .node
         .consensus()
         .unwrap()
-        .record(repo)
-        .ok()
-        .flatten()
-        .map(|r| r.voters)
+        .replicas(repo)
+        .filter(|(_, joint)| joint.is_empty())
+        .map(|(r, _)| r)
         .unwrap_or_default();
     v.sort_unstable();
     v

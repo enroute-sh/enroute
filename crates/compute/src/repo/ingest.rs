@@ -21,7 +21,7 @@ use parking_lot::Mutex;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::git::io::{Incoming, ReadAt};
-use crate::git::oid::{Kind, Oid};
+use crate::git::oid::{Kind, ObjectFormat, Oid};
 use crate::git::pack::PackReader;
 use crate::storage::Sealed;
 use crate::storage::{BitSet, TempTable, Workspace};
@@ -191,10 +191,16 @@ pub(crate) struct Pass1 {
     collected: Collected,
 }
 
-/// The sequential pass over the pack `inc` delivers. It needs no snapshot,
-/// so a push runs it while the pack arrives.
-pub(crate) fn pass1(inc: &mut Incoming, ws: &Workspace) -> Result<Pass1> {
-    let reader = PackReader::new(inc)?;
+/// The sequential pass over the pack `inc` delivers, to a `format`
+/// repository. It needs no snapshot, so a push runs it while the pack
+/// arrives. An object over `max_object` bytes fails it.
+pub(crate) fn pass1(
+    inc: &mut Incoming,
+    format: ObjectFormat,
+    ws: &Workspace,
+    max_object: u64,
+) -> Result<Pass1> {
+    let reader = PackReader::new(inc, format, max_object)?;
     let filter_slots = (ix(reader.count()) * 4)
         .clamp(64, REF_FILTER_SLOTS)
         .next_power_of_two();
@@ -213,10 +219,12 @@ pub(crate) async fn ingest_stored(
     ws: Workspace,
     targets: Vec<Oid>,
     olds: Option<Vec<Oid>>,
+    max_object: u64,
 ) -> Result<Ingested> {
     let scanned = {
         let (pack, ws) = (pack.clone(), ws.clone());
-        blocking(move || pass1(&mut Incoming::of(pack), &ws)).await?
+        let format = snap.format();
+        blocking(move || pass1(&mut Incoming::of(pack), format, &ws, max_object)).await?
     };
     ingest(snap, pack, ws, targets, olds, scanned).await
 }
@@ -399,12 +407,12 @@ mod tests {
             ((unknown, b2), true),
         ];
         let entries: Vec<_> = objects.iter().map(|(k, b)| full_entry(*k, b)).collect();
-        let pack: Arc<dyn ReadAt> = Arc::new(Owned(pack_of(&entries)));
+        let pack: Arc<dyn ReadAt> = Arc::new(Owned(pack_of(ObjectFormat::Sha1, &entries)));
         let empty = repos.handle("empty").snapshot();
         let olds = cases.iter().map(|((old, _), _)| *old).collect();
         let targets = cases.iter().map(|((_, new), _)| *new).collect();
         let ws = repos.storage().workspace();
-        let ing = ingest_stored(empty, pack, ws, targets, Some(olds))
+        let ing = ingest_stored(empty, pack, ws, targets, Some(olds), u64::MAX)
             .await
             .unwrap();
         let want: Vec<bool> = cases.iter().map(|(_, f)| *f).collect();

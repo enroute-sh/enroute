@@ -1,5 +1,4 @@
-//! Compaction: merged layers stay correct, and a replaced layer outlives
-//! the checkpoint that names it.
+//! Compaction: merged layers stay correct.
 
 #![expect(
     clippy::as_conversions,
@@ -13,6 +12,7 @@ mod common;
 use std::time::Duration;
 
 use common::{Git, Server, text};
+use enroute_compute::RepoState;
 use enroute_compute::testing::settled;
 
 /// Compaction merges flushed layers, and every kind of fetch stays correct
@@ -54,7 +54,13 @@ async fn merged_layers_stay_correct() {
     // The layers are all in the smallest size class, so they merge into
     // fewer than `merge_factor`.
     let done = || {
-        let meta = server.node.consensus().unwrap().repo_meta("part").unwrap();
+        let meta: RepoState = server
+            .node
+            .consensus()
+            .unwrap()
+            .repo_meta("part")
+            .unwrap()
+            .into();
         settled(&meta, server.node.compute().unwrap().config()) && meta.layers.len() == 1
     };
     assert!(
@@ -112,125 +118,52 @@ async fn merged_layers_stay_correct() {
     git.run(&pc, &["fsck"]).await;
 }
 
-/// The stored layers `repo`'s state object names.
-fn checkpointed_layers(root: &std::path::Path, repo: &str) -> Vec<String> {
-    let data = std::fs::read(root.join("store").join("repos").join(repo).join("state")).unwrap();
-    let state = enroute_shared::repo_state::Record::from_bytes(&data).unwrap();
-    state
-        .meta()
-        .layers
-        .into_iter()
-        .filter(enroute_shared::proto::LayerMeta::is_stored)
-        .map(|l| l.id)
-        .collect()
+/// Whether the ledger comes to report `repo` as pending (`want`) or not,
+/// within 20 s, asking as the node's compute `compute`.
+async fn becomes_pending(
+    ledger: &enroute_ledger::Ledger,
+    compute: u64,
+    repo: &str,
+    want: bool,
+) -> bool {
+    for _ in 0..400 {
+        // The node's one compute: every repository is its own.
+        let pending = enroute_shared::roles::pending(ledger, compute, Vec::new())
+            .await
+            .unwrap();
+        if pending.repos.iter().any(|r| r.repo == repo) == want {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
 }
 
-fn layer_exists(root: &std::path::Path, repo: &str, id: &str) -> bool {
-    root.join("store")
-        .join("repos")
-        .join(repo)
-        .join("layers")
-        .join(format!("{id}.layer"))
-        .exists()
-}
-
-/// A replaced layer stays while the last checkpoint still names it.
+/// The ledger reports a repository whose layers changed until the compute
+/// settles it, and again once its layers change.
 ///
-/// Here checkpoints stall, so no sweep deletes it; once they resume, the
-/// sweep does.
+/// The merge policy is the compute's alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn replaced_layers_outlive_the_checkpoint_naming_them() {
+async fn settled_repositories_are_pending_again_when_their_layers_change() {
     let root = tempfile::tempdir().unwrap();
     let mut config =
         enroute::node::Config::local(root.path().join("data"), common::local_store(root.path()));
-    let outage = common::Outage::wrap(&mut config);
-    config.ledger.checkpoint_age = Duration::from_millis(200);
-    config.compute.sweep_interval = Duration::from_millis(100);
-    config.compute.sweep_retention = Duration::from_millis(300);
-    config.compute.merge_factor = 2;
-    config.compute.inline_layer_bytes = 0; // each push uploads a layer
+    config.compute.flush_interval = Duration::from_millis(200);
     let server = Server::start_config(config).await;
+    let ledger = server.node.ledger().unwrap();
+    let compute = enroute_compute::compute_id(&root.path().join("data")).unwrap();
     let git = Git::new();
     let src = git.init("src").await;
-    let url = server.repo_url("ckpt");
-    let push = async |i: u64| {
-        git.commit_file(
-            &src,
-            &format!("f{}.txt", i % 3),
-            &text(i, 20),
-            &format!("c{i}"),
-        )
-        .await;
-        git.run(&src, &["push", "-q", &url, "main"]).await;
-    };
-    for i in 0..3 {
-        push(i).await;
-    }
-    // A checkpoint names stored layers; then checkpoints stall.
-    let live = || {
-        server
-            .node
-            .consensus()
-            .unwrap()
-            .repo_meta("ckpt")
-            .unwrap()
-            .layers
-            .iter()
-            .map(|l| l.id.clone())
-            .collect::<Vec<_>>()
-    };
-    assert!(
-        common::wait_until(
-            || {
-                let c = checkpointed_layers(root.path(), "ckpt");
-                !c.is_empty() && c == live()
-            },
-            20
-        )
-        .await
-    );
-    outage.set_states_down(true);
-    let named = checkpointed_layers(root.path(), "ckpt");
-
-    // Compaction replaces every one of them while the checkpoint still names them.
-    for i in 3..8 {
-        push(i).await;
-    }
-    assert!(
-        common::wait_until(|| live().iter().all(|id| !named.contains(id)), 20).await,
-        "compaction did not replace the checkpointed layers"
-    );
-    tokio::time::sleep(Duration::from_secs(2)).await; // many sweeps, well past the retention
-    assert_eq!(
-        checkpointed_layers(root.path(), "ckpt"),
-        named,
-        "a checkpoint was written while stalled"
-    );
-    for id in &named {
+    let url = server.repo_url("settle");
+    for i in 0..2 {
+        common::push_commits(&git, &src, &url, i, 1).await;
         assert!(
-            layer_exists(root.path(), "ckpt", id),
-            "layer {id} was deleted while the checkpoint names it"
+            becomes_pending(ledger, compute, "settle", true).await,
+            "push {i}: never pending"
+        );
+        assert!(
+            becomes_pending(ledger, compute, "settle", false).await,
+            "push {i}: never settled"
         );
     }
-
-    // Checkpoints resume: the next one no longer names them, and they go.
-    outage.set_states_down(false);
-    assert!(
-        common::wait_until(
-            || named
-                .iter()
-                .all(|id| !layer_exists(root.path(), "ckpt", id)),
-            30
-        )
-        .await,
-        "replaced layers were not deleted once the checkpoint moved on"
-    );
-    let dst = git.dir("dst");
-    git.run(
-        git.home.path(),
-        &["clone", "-q", &url, dst.to_str().unwrap()],
-    )
-    .await;
-    git.run(&dst, &["fsck", "--strict"]).await;
-    assert_eq!(git.rev(&src, "main").await, git.rev(&dst, "main").await);
 }

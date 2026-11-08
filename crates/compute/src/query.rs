@@ -1,5 +1,5 @@
-//! Read queries over a repository snapshot, and ref updates and commits
-//! without a push, for an API in front of Enroute.
+//! Read queries over a repository snapshot, and commits made without a
+//! push, for an API in front of Enroute.
 //!
 //! Each function keeps the results, order, limits and truncation flags that
 //! the contract promises. Commit graph walks run on the blocking pool. Object
@@ -13,22 +13,17 @@
 mod commit;
 mod refs;
 
-use std::collections::BTreeMap;
-
 use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use std::fmt;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 
-use enroute_shared::state::{Commit, RefUpdate};
-
 use crate::compute::{Compute, is_not_found};
 use crate::git::object::{Signature, parse_commit, tree_entries};
-use crate::git::oid::{Kind, Oid};
-use crate::git::refname::{self, BadTarget, Mode};
+use crate::git::oid::{Kind, ObjectFormat, Oid};
 use crate::repo::graph::{first_parents, paint_down_to_common, reaches};
-use crate::repo::machine::{peel as read_peeled, read_objects};
+use crate::repo::machine::peel as read_peeled;
 use crate::repo::serve::{FetchArgs, Plan, Sink, plan, write_pack};
 use crate::repo::view::{DenseId, Snapshot};
 
@@ -115,167 +110,6 @@ pub(crate) async fn snapshot(compute: &Compute, repo: &str) -> Result<Arc<Snapsh
         .await?
         .ok_or(Error::NotFound)?
         .snapshot())
-}
-
-/// One ref update: `old` unset creates (or, with `new` unset, deletes
-/// whatever is there), `new` unset deletes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RefMove {
-    /// The full name.
-    pub refname: String,
-    /// The value the ref must have now.
-    pub old: Option<Oid>,
-    /// The value to set.
-    pub new: Option<Oid>,
-}
-
-/// Why a ref update did not land.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RefRejection {
-    /// The ref does not have the expected value.
-    NonFastForward,
-    /// A create found the ref present.
-    AlreadyExists,
-    /// The new tip is not stored, or a branch tip is not a commit.
-    UnknownCommit,
-    /// Git refuses the name.
-    InvalidRefname,
-}
-
-/// What became of one ref update.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RefOutcome {
-    /// The name the update gave.
-    pub refname: String,
-    /// `None` when the update landed.
-    pub rejection: Option<RefRejection>,
-}
-
-/// Rounds of [`update_refs`] before it gives up on refs that other writers
-/// keep moving.
-const UPDATE_ATTEMPTS: usize = 16;
-
-/// Apply `moves`, each on its own, in request order, without a pack or hooks.
-///
-/// Updates of one ref see the updates before them, and every ref lands in one
-/// command. When another writer moves a ref first, only that ref is tried again.
-///
-/// # Errors
-///
-/// [`Error::NotFound`] if the repository is deleted during the call,
-/// [`Error::Contended`] if refs kept moving, else [`Error::Failed`].
-pub(crate) async fn update_refs(
-    compute: &Compute,
-    repo: &str,
-    mut snap: Arc<Snapshot>,
-    moves: &[RefMove],
-) -> Result<Vec<RefOutcome>, Error> {
-    let mut decided: Vec<Option<RefRejection>> = vec![None; moves.len()];
-    let mut pending: HashSet<&str> = moves.iter().map(|m| m.refname.as_str()).collect();
-    for attempt in 0..UPDATE_ATTEMPTS {
-        if pending.is_empty() {
-            break;
-        }
-        if attempt > 0 {
-            snap = snapshot(compute, repo).await?;
-        }
-        // Per name: the value before and after this request's updates.
-        let mut net: BTreeMap<&str, (Option<Oid>, Option<Oid>)> = BTreeMap::new();
-        let mut landed: HashSet<&str> = HashSet::new();
-        for (m, slot) in moves.iter().zip(decided.iter_mut()) {
-            let name = m.refname.as_str();
-            if !pending.contains(name) {
-                continue;
-            }
-            let values = net.entry(name).or_insert_with(|| {
-                let cur = snap.meta.refs.get(name).copied();
-                (cur, cur)
-            });
-            match decide(&snap, m, values.1) {
-                Ok(after) => {
-                    values.1 = after;
-                    landed.insert(name);
-                    *slot = None;
-                }
-                Err(r) => *slot = Some(r),
-            }
-        }
-        let updates: Vec<RefUpdate> = net
-            .iter()
-            .filter(|(name, _)| landed.contains(*name))
-            .map(|(name, (before, after))| RefUpdate {
-                name: (*name).to_string(),
-                old: *before,
-                new: *after,
-            })
-            .collect();
-        if updates.is_empty() {
-            pending.clear();
-            break;
-        }
-        let commit = Commit {
-            updates: updates.clone(),
-            atomic: false,
-            ..Default::default()
-        };
-        // A repository deleted (and maybe created again) since the read is
-        // not found: the refs this request saw are gone.
-        let out = compute
-            .commit(repo, snap.meta.epoch, None, commit)
-            .await?
-            .outcome;
-        if let Some(e) = out.error.as_deref() {
-            return Err(anyhow!("{repo}: {e}").into());
-        }
-        pending = updates
-            .iter()
-            .zip(out.ref_errors())
-            .filter(|(_, e)| e.is_some())
-            .filter_map(|(u, _)| pending.get(u.name.as_str()).copied())
-            .collect();
-    }
-    if !pending.is_empty() {
-        return Err(Error::Contended("the refs"));
-    }
-    Ok(moves
-        .iter()
-        .zip(decided)
-        .map(|(m, rejection)| RefOutcome {
-            refname: m.refname.clone(),
-            rejection,
-        })
-        .collect())
-}
-
-/// The value `m` leaves its ref at, from `cur`, or why it is refused.
-fn decide(snap: &Snapshot, m: &RefMove, cur: Option<Oid>) -> Result<Option<Oid>, RefRejection> {
-    // A zero id is how a caller says "unset".
-    let old = m.old.filter(|o| !o.is_zero());
-    let new = m.new.filter(|o| !o.is_zero());
-    let Some(new) = new else {
-        if !refname::valid(&m.refname, Mode::Delete) {
-            return Err(RefRejection::InvalidRefname);
-        }
-        return match old {
-            Some(o) if cur != Some(o) => Err(RefRejection::NonFastForward),
-            _ => Ok(None),
-        };
-    };
-    let target = refname::check_target(&m.refname, snap.lookup(&new).map(|d| snap.kind(d)));
-    if target == Err(BadTarget::Missing) {
-        return Err(RefRejection::UnknownCommit);
-    }
-    if !refname::valid(&m.refname, Mode::Set) {
-        return Err(RefRejection::InvalidRefname);
-    }
-    let fits = target.is_ok();
-    match old {
-        None if !fits => Err(RefRejection::UnknownCommit),
-        None if cur.is_some() => Err(RefRejection::AlreadyExists),
-        Some(o) if cur != Some(o) => Err(RefRejection::NonFastForward),
-        Some(_) if !fits => Err(RefRejection::UnknownCommit),
-        _ => Ok(Some(new)),
-    }
 }
 
 /// Whether `descendant` is `ancestor` or has it in its history; `false` when
@@ -426,10 +260,7 @@ pub(crate) async fn list_commits(
         return Err(not_a_commit(snap, tip, "a history starts at a commit"));
     }
     let page = walked.get(..limit).unwrap_or(walked.as_slice());
-    let read: HashMap<DenseId, Arc<Vec<u8>>> = read_objects(snap, unique(page.iter().copied()))
-        .await?
-        .into_iter()
-        .collect();
+    let read = snap.load_many(page.iter().copied()).await?;
     let mut commits = Vec::with_capacity(page.len());
     for d in page {
         let data = read.get(d).context("commit not read")?;
@@ -463,7 +294,7 @@ pub(crate) async fn get_object(
     oid: Oid,
 ) -> Result<(Kind, Arc<Vec<u8>>), Error> {
     let d = snap.lookup(&oid).ok_or(Error::Missing(oid))?;
-    Ok((snap.kind(d), read_one(snap, d).await?))
+    Ok((snap.kind(d), snap.load(d).await?))
 }
 
 /// One path a tree listing names.
@@ -531,7 +362,7 @@ async fn root_tree(snap: &Arc<Snapshot>, start: Oid) -> Result<Oid, Error> {
     let d = snap.lookup(&start).ok_or(Error::Missing(start))?;
     match snap.kind(d) {
         Kind::Tree => Ok(start),
-        Kind::Commit => Ok(parse_commit(&read_one(snap, d).await?)?.tree),
+        Kind::Commit => Ok(parse_commit(&snap.load(d).await?)?.tree),
         kind => Err(Error::WrongKind {
             oid: start,
             kind,
@@ -645,7 +476,7 @@ async fn commit_tree(snap: &Arc<Snapshot>, commit: Oid) -> Result<Oid> {
     let d = snap
         .lookup_kind(&commit, Kind::Commit)
         .with_context(|| format!("commit {commit} missing"))?;
-    Ok(parse_commit(&read_one(snap, d).await?)?.tree)
+    Ok(parse_commit(&snap.load(d).await?)?.tree)
 }
 
 /// A tree entry, as diffs and listings use it.
@@ -657,9 +488,10 @@ struct Child {
     name: Vec<u8>,
 }
 
-/// The entries of a tree; none for one that does not parse, as before.
-fn children(data: &[u8]) -> Vec<Child> {
-    tree_entries(data)
+/// The entries of a tree of a `format` repository; none for one that does
+/// not parse, as before.
+fn children(format: ObjectFormat, data: &[u8]) -> Vec<Child> {
+    tree_entries(format, data)
         .map(|e| {
             e.map(|e| Child {
                 oid: e.oid,
@@ -679,22 +511,22 @@ async fn read_trees(
     into: &mut HashMap<Oid, Vec<Child>>,
 ) -> Result<()> {
     for (oid, data) in read_tree_data(snap, oids).await? {
-        into.insert(oid, children(&data));
+        into.insert(oid, children(snap.format(), &data));
     }
     Ok(())
 }
 
 /// The data of the trees `oids`, each once, loading what is not local.
-async fn read_tree_data(snap: &Arc<Snapshot>, oids: &[Oid]) -> Result<Vec<(Oid, Arc<Vec<u8>>)>> {
-    let ds = unique(oids.iter().copied())
-        .into_iter()
+async fn read_tree_data(snap: &Arc<Snapshot>, oids: &[Oid]) -> Result<HashMap<Oid, Arc<Vec<u8>>>> {
+    let ds = oids
+        .iter()
         .map(|o| {
-            snap.lookup_kind(&o, Kind::Tree)
+            snap.lookup_kind(o, Kind::Tree)
                 .with_context(|| format!("tree {o} is missing"))
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(read_objects(snap, ds)
-        .await?
+    let read = snap.load_many(ds).await?;
+    Ok(read
         .into_iter()
         .map(|(d, data)| (snap.oid(d), data))
         .collect())
@@ -863,15 +695,6 @@ fn commit_details(id: Oid, data: &[u8]) -> Result<CommitDetails> {
     })
 }
 
-/// Read one object, loading what is not local.
-async fn read_one(snap: &Arc<Snapshot>, d: DenseId) -> Result<Arc<Vec<u8>>> {
-    read_objects(snap, vec![d])
-        .await?
-        .pop()
-        .map(|(_, data)| data)
-        .context("object not read")
-}
-
 /// `items` without repeats, in order.
 fn unique<T: Copy + Eq + std::hash::Hash>(items: impl IntoIterator<Item = T>) -> Vec<T> {
     let mut seen = HashSet::new();
@@ -923,10 +746,9 @@ impl PushPack {
 /// not from `haves`, as `git send-pack` sends it.
 ///
 /// Haves this repository does not hold are ignored, and tags among them
-/// count for what they point at. With `thin`, deltas can have bases the
-/// remote holds through `haves`; send it only when the remote does not
-/// refuse thin packs (`no-thin`). Deltas name their bases by object id, as
-/// every receiver takes. A push of deletions only sends no pack: that is the
+/// count for what they point at. The pack is never thin: every delta has its
+/// base in the pack. Deltas name their bases by object id, as every
+/// receiver takes. A push of deletions only sends no pack: that is the
 /// caller's choice, as this always plans one.
 ///
 /// # Errors
@@ -936,7 +758,6 @@ pub async fn pack_for_push(
     snap: &Arc<Snapshot>,
     wants: &[Oid],
     haves: &[Oid],
-    thin: bool,
 ) -> Result<PushPack, Error> {
     if let Some(w) = wants.iter().find(|w| snap.lookup(w).is_none()) {
         return Err(Error::Missing(*w));
@@ -951,7 +772,6 @@ pub async fn pack_for_push(
         // A want the remote has needs nothing sent, as with git.
         wants: unique(wants.iter().copied().filter(|w| !have_set.contains(w))),
         haves: have_oids,
-        thin_pack: thin,
         ..Default::default()
     };
     let plan = if args.wants.is_empty() {

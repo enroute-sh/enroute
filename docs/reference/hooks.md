@@ -175,7 +175,7 @@ a letter or digit. Enroute compares keys byte for byte. See
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `hex` | `string` | 40 lowercase hexadecimal characters. |
+| `hex` | `string` | Lowercase hexadecimal: 40 characters in a SHA-1 repository, 64 in a SHA-256 one. |
 
 An object ID is a message rather than a string so that a generated client
 cannot pass a refname where an ID belongs. An optional ID is an unset field,
@@ -438,6 +438,12 @@ answers.
 | `actor` | `string` | Who is pushing, as `Granted.actor` named them. |
 | `commands` | `RefCommand[]` | Every update the push still asks for, in `receive-pack` order. |
 | `context` | `bytes` | `Granted.context`, byte for byte. |
+| `push_options` | `string[]` | What the client passed with `git push -o`, in order. Empty when it sent none. |
+
+`push_options` is how a pusher asks for something along with the push, such as
+`git push -o ci.skip` or a merge request title. Git sends them only to a server
+that advertises `push-options`, which Enroute does. They come from the pusher,
+so treat them as a request, not as a decision.
 
 Whoever reaches this call already has write access. Use `actor` for policy that
 cares *which* writer, not whether.
@@ -607,6 +613,7 @@ the moment it does, rather than by listing refs on a timer.
 | `actor` | `string` | Who pushed, as `Granted.actor` named them. |
 | `commands` | `RefCommand[]` | Every command that landed, and only those. |
 | `context` | `bytes` | `Granted.context`, byte for byte. |
+| `push_options` | `string[]` | What the client passed with `git push -o`, in order. Empty when it sent none. |
 
 `commands` uses the same [`RefCommand`](#refcommand) as `pre_receive`. A push
 whose commands were all refused sends no call at all, rather than a call with an

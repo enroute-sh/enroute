@@ -6,12 +6,18 @@ use std::collections::BinaryHeap;
 use anyhow::{Context, Result};
 use foldhash::{HashMap, HashSet, HashSetExt};
 
-use super::view::{CommitNode, DenseId, Snapshot};
+use super::view::{CommitLinks, CommitNum, DenseId, Snapshot};
 
-/// The graph node of a commit the snapshot holds.
-fn node(snap: &Snapshot, d: DenseId) -> Result<CommitNode<'_>> {
-    snap.commit(d)
+/// The walk links of a commit the snapshot holds.
+fn node(snap: &Snapshot, d: DenseId) -> Result<CommitLinks<'_>> {
+    snap.links_of(d)
         .with_context(|| format!("commit {} has no graph node", snap.oid(d)))
+}
+
+/// The walk links of commit number `c`.
+fn node_num(snap: &Snapshot, c: CommitNum) -> Result<CommitLinks<'_>> {
+    snap.links(c)
+        .with_context(|| format!("commit number {c} has no graph node"))
 }
 
 /// Whether `target` is one of `from` or an ancestor of one.
@@ -20,20 +26,27 @@ pub(crate) fn reaches(
     from: impl IntoIterator<Item = DenseId>,
     target: DenseId,
 ) -> Result<bool> {
-    let mut seen: HashSet<DenseId> = HashSet::new();
-    let mut stack: Vec<DenseId> = from.into_iter().filter(|&d| seen.insert(d)).collect();
-    if stack.contains(&target) {
+    let target = node(snap, target)?;
+    let mut seen: HashSet<CommitNum> = HashSet::new();
+    let mut stack = Vec::new();
+    for d in from {
+        let c = node(snap, d)?.num;
+        if seen.insert(c) {
+            stack.push(c);
+        }
+    }
+    if stack.contains(&target.num) {
         return Ok(true);
     }
     // Generations fall strictly along parent edges, so nothing at or below
     // the target's generation (other than the target) leads to it.
-    let floor = node(snap, target)?.generation;
+    let floor = target.generation;
     while let Some(c) = stack.pop() {
-        for &p in node(snap, c)?.parents {
-            if p == target {
+        for &p in node_num(snap, c)?.parents {
+            if p == target.num {
                 return Ok(true);
             }
-            if seen.insert(p) && node(snap, p)?.generation > floor {
+            if seen.insert(p) && node_num(snap, p)?.generation > floor {
                 stack.push(p);
             }
         }
@@ -59,11 +72,13 @@ pub(crate) fn paint_down_to_common(
     if a == b {
         return Ok((vec![a], false));
     }
-    let mut marks: HashMap<DenseId, u8> = HashMap::from_iter([(a, FROM_A), (b, FROM_B)]);
-    let mut queue: BinaryHeap<(u32, DenseId)> = BinaryHeap::new();
-    let mut queued: HashSet<DenseId> = HashSet::from_iter([a, b]);
-    queue.push((node(snap, a)?.generation, a));
-    queue.push((node(snap, b)?.generation, b));
+    let (na, nb) = (node(snap, a)?, node(snap, b)?);
+    let mut marks: HashMap<CommitNum, u8> =
+        HashMap::from_iter([(na.num, FROM_A), (nb.num, FROM_B)]);
+    let mut queue: BinaryHeap<(u32, CommitNum)> = BinaryHeap::new();
+    let mut queued: HashSet<CommitNum> = HashSet::from_iter([na.num, nb.num]);
+    queue.push((na.generation, na.num));
+    queue.push((nb.generation, nb.num));
     // Queued commits not yet marked stale: the walk ends when none are left.
     let mut live = 2usize;
     let mut found = Vec::new();
@@ -79,11 +94,12 @@ pub(crate) fn paint_down_to_common(
         if taken > budget {
             return Ok((found, true));
         }
+        let node = node_num(snap, c)?;
         if m == FROM_A | FROM_B {
-            found.push(c);
+            found.push(node.id);
             m |= STALE;
         }
-        for &p in node(snap, c)?.parents {
+        for &p in node.parents {
             let pm = marks.entry(p).or_default();
             if *pm & m == m {
                 continue;
@@ -92,7 +108,7 @@ pub(crate) fn paint_down_to_common(
             *pm |= m;
             let stale = *pm & STALE != 0;
             if queued.insert(p) {
-                queue.push((node(snap, p)?.generation, p));
+                queue.push((node_num(snap, p)?.generation, p));
                 live += usize::from(!stale);
             } else if stale && !was_stale {
                 live -= 1;
@@ -105,13 +121,13 @@ pub(crate) fn paint_down_to_common(
 /// `tip`, then its first parent, and so on: at most `limit` commits.
 pub(crate) fn first_parents(snap: &Snapshot, tip: DenseId, limit: usize) -> Result<Vec<DenseId>> {
     let mut page = Vec::new();
-    let mut at = Some(tip);
+    let mut at = Some(node(snap, tip)?);
     while let Some(c) = at {
         if page.len() >= limit {
             break;
         }
-        page.push(c);
-        at = node(snap, c)?.parents.first().copied();
+        page.push(c.id);
+        at = c.parents.first().map(|&p| node_num(snap, p)).transpose()?;
     }
     Ok(page)
 }

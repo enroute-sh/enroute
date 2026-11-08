@@ -12,26 +12,80 @@ service Ledger {
   // creating it.
   rpc Activate(ActivateRequest) returns (ActivateResponse);
   // Order and apply a command in its repository's log; answered with the
-  // outcome once applied.
+  // outcome once applied. Only the log's sequencer takes it: another node
+  // answers `Unavailable`, naming the sequencer it knows in the
+  // `enroute-sequencer` metadata (its internal URL, empty: none), as a
+  // subscription names it too.
   rpc Propose(Command) returns (Outcome);
   // Wait until everything committed to a repository's log before the call
   // has been applied; answered with the repository's version then, which a
   // subscriber waits for its own state to reach.
   rpc ReadBarrier(ReadBarrierRequest) returns (ReadBarrierResponse);
-  // Follow a live repository: its state, then every change to it, in
-  // order. The stream ends when this node stops hosting the incarnation
+  // Follow live repositories, many on one stream (as etcd's `Watch`):
+  // HTTP/2 caps the streams of a connection, and a compute follows
+  // thousands of repositories. Subscribe and cancel on the request
+  // stream; each subscription's updates, then its end, on the response
+  // stream. A subscription gets its repository's state, then every change
+  // to it, in order. It ends when this node stops hosting the incarnation
   // (a newer one superseded it), or when the subscriber falls too far
-  // behind (it then follows again, from a new state).
-  rpc Follow(FollowRequest) returns (stream Update);
+  // behind (it then follows again, from a new state). The whole stream
+  // ends when the node stops.
+  rpc Watch(stream WatchRequest) returns (stream WatchEvent);
   // Delete a repository: its tombstone is committed and its state object
   // marked deleted before the answer, so a create may follow at once.
-  // Deleting a missing or deleted repository succeeds.
+  // Deleting a missing or deleted repository succeeds. Only the log's
+  // sequencer takes it, as `Propose`.
   rpc Delete(DeleteRequest) returns (DeleteResponse);
   // A repository as of everything committed before the call.
   rpc Describe(DescribeRequest) returns (DescribeResponse);
-  // The repositories this node hosts, deleted ones included, in byte
-  // order of their names.
+  // The ledger's repositories as of everything committed before the call,
+  // deleted ones included, in byte order of their names.
   rpc List(ListRequest) returns (ListResponse);
+  // The repositories whose log this node leads that may need maintenance
+  // and that the asking compute maintains: the first of `computes` in each
+  // repository's rendezvous order is `compute`. A repository is pending
+  // from a change to its layers until a compute settles it (`settled`):
+  // the ledger knows nothing of the merge policy, which is the compute's.
+  rpc Pending(PendingRequest) returns (PendingResponse);
+}
+
+// How a node earns the token every other call on the internal port needs
+// (as an `authorization: Bearer` header): it proves it can read the
+// object store and holds a key (ACME's key authorization, RFC 8555 §8.1).
+// Calls of this service need no token.
+service Membership {
+  // Put a single-use nonce in the object store for `public_key`.
+  rpc Challenge(ChallengeRequest) returns (ChallengeResponse);
+  // Answer a challenge; a token for the key, if it is right.
+  rpc Join(JoinRequest) returns (JoinResponse);
+}
+
+message ChallengeRequest {
+  // The node's Ed25519 public key (32 bytes).
+  bytes public_key = 1;
+}
+
+message ChallengeResponse {
+  // The challenge, for `JoinRequest`.
+  string id = 1;
+  // The object that holds the nonce, which the node reads.
+  string object = 2;
+}
+
+message JoinRequest {
+  bytes public_key = 1;
+  string id = 2;
+  // The key's Ed25519 signature of the challenge message:
+  // hex(nonce) "." hex(SHA-256(public_key)).
+  bytes signature = 3;
+}
+
+message JoinResponse {
+  // A JWT (EdDSA) naming the node, signed by the ledger node that
+  // answered.
+  string token = 1;
+  // Seconds until it expires: renew before then (by joining again).
+  uint64 expires_in = 2;
 }
 
 message ActivateRequest {
@@ -43,6 +97,9 @@ message ActivateRequest {
   // this node hosts the repository: a replica that missed a deletion must
   // not make a create answer with the deleted repository.
   optional string head = 3;
+  // With `create`: the object format of a repository this call creates.
+  // SHA-256 needs the ledger's `allow_sha256`.
+  ObjectFormat object_format = 4;
 }
 
 message ActivateResponse {
@@ -58,8 +115,42 @@ message ReadBarrierResponse {
   uint64 version = 1;
 }
 
-message FollowRequest {
-  string repo = 1;
+message WatchRequest {
+  oneof kind {
+    // Follow a live repository. The client chooses the id, unique on this
+    // stream.
+    Subscribe subscribe = 1;
+    // End the subscription with this id.
+    uint64 cancel = 2;
+    // A renewed token (see `Membership`) for the call, which outlives
+    // the one it started with: the stream ends when its token expires
+    // without one.
+    string refresh = 3;
+  }
+}
+
+message Subscribe {
+  uint64 id = 1;
+  string repo = 2;
+}
+
+message WatchEvent {
+  // The subscription.
+  uint64 id = 1;
+  oneof kind {
+    // Its next update.
+    Update update = 2;
+    // It is over: with no error, or with the status it failed with (as
+    // a call would, for example not hosted here). No more events have
+    // this id.
+    Ended ended = 3;
+  }
+}
+
+message Ended {
+  // A gRPC status code; 0 (OK): no error.
+  int32 code = 1;
+  string message = 2;
 }
 
 message Update {
@@ -68,7 +159,14 @@ message Update {
     RepoMeta state = 1;
     // A change to it.
     Change change = 2;
+    // The internal URL of the ledger node that sequences the repository's log,
+    // as the node serving the subscription knows it (empty: none known).
+    // Sent after the state and whenever it changes: a hint of where to send
+    // proposals, which any other node refuses as not the sequencer.
+    string sequencer = 4;
   }
+  // 3 was the sequencer's node id.
+  reserved 3;
 }
 
 message DeleteRequest {
@@ -84,6 +182,39 @@ message DescribeRequest {
 message DescribeResponse {
   // Absent: the repository does not exist (or is deleted).
   RepoSummary repo = 1;
+}
+
+message PendingRequest {
+  // 1 was the live compute nodes as the asking one saw them: the ledger
+  // node now tracks them itself, from these requests.
+  reserved 1;
+  // The asking compute node, which this request shows alive.
+  uint64 compute = 2;
+  // 3 was `merge_factor`: the ledger no longer applies the merge policy.
+  reserved 3;
+  // Repositories that need no maintenance, each as of the version an
+  // earlier answer gave it, settled before this one is made; a later
+  // change to its layers makes it pending again. A node that does not lead
+  // a repository's log ignores it.
+  repeated PendingRepo settled = 4;
+}
+
+message PendingResponse {
+  // 1 was the repositories' names.
+  reserved 1;
+  // In no order.
+  repeated PendingRepo repos = 2;
+  // The compute nodes this ledger node heard ask lately (the asking one
+  // included), sorted: the live ones, which share the repositories'
+  // maintenance in rendezvous order.
+  repeated uint64 computes = 3;
+}
+
+message PendingRepo {
+  string repo = 1;
+  // The repository's version when its layers last changed, or later: a
+  // compute settles it only from a state at least this new.
+  uint64 version = 2;
 }
 
 message ListRequest {
@@ -110,4 +241,6 @@ message RepoSummary {
   uint64 version = 4;
   string head = 5;
   uint64 last_push_ms = 6;
+  ObjectFormat object_format = 7;
 }
+

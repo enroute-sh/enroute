@@ -83,6 +83,38 @@ async fn partial_clone_blobless() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn partial_clone_by_blob_size() {
+    let server = Server::start().await;
+    let git = Git::new();
+    let src = git.init("l-src").await;
+    git.commit_file(&src, "small", "abc", "small").await;
+    git.commit_file(&src, "exact", "abcd", "exact").await;
+    let url = server.repo_url("l");
+    git.run(&src, &["push", "-q", &url, "main"]).await;
+    let dst = git.dir("dst");
+    git.run(
+        git.home.path(),
+        &[
+            "clone",
+            "-q",
+            "--filter=blob:limit=4",
+            "--no-checkout",
+            &url,
+            dst.to_str().unwrap(),
+        ],
+    )
+    .await;
+    // As git serves it: a blob of exactly the limit is left out.
+    let missing = git
+        .run(&dst, &["rev-list", "--objects", "--all", "--missing=print"])
+        .await;
+    let small = git.rev(&src, "HEAD:small").await;
+    let exact = git.rev(&src, "HEAD:exact").await;
+    assert!(missing.contains(&format!("?{exact}")), "{missing}");
+    assert!(!missing.contains(&format!("?{small}")), "{missing}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shallow_clone_and_deepen() {
     let server = Server::start().await;
     let git = Git::new();
@@ -132,6 +164,54 @@ async fn shallow_clone_and_deepen() {
     git.run(&dst, &["fsck", "--strict"]).await;
     let count = git.run(&dst, &["rev-list", "--count", "HEAD"]).await;
     assert_eq!(count.trim(), "11");
+}
+
+/// A depth that lands exactly on the root makes the root a shallow
+/// boundary, as git's does, and deepening past it unshallows it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shallow_boundary_at_the_root() {
+    let server = Server::start().await;
+    let git = Git::new();
+    let (src, url) = seeded(&server, &git, "r", 3).await;
+    let dst = git.dir("dst");
+    git.run(
+        git.home.path(),
+        &["clone", "-q", "--depth=3", &url, dst.to_str().unwrap()],
+    )
+    .await;
+    let root = git
+        .run(&src, &["rev-list", "--max-parents=0", "HEAD"])
+        .await;
+    let shallow = std::fs::read_to_string(dst.join(".git/shallow")).unwrap();
+    assert_eq!(shallow, root);
+    git.run(&dst, &["fetch", "-q", "--deepen=1"]).await;
+    let is = git
+        .run(&dst, &["rev-parse", "--is-shallow-repository"])
+        .await;
+    assert_eq!(is.trim(), "false");
+    git.run(&dst, &["fsck", "--strict"]).await;
+}
+
+/// A push may not delete the branch `HEAD` names, as git's default
+/// `receive.denyDeleteCurrent` refuses it; other branches it may.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn push_cannot_delete_the_branch_head_names() {
+    let server = Server::start().await;
+    let git = Git::new();
+    let (src, url) = seeded(&server, &git, "dc", 2).await;
+    git.run(&src, &["push", "-q", &url, "main:refs/heads/other"])
+        .await;
+    let (ok, _, err) = git.try_run(&src, &["push", &url, ":refs/heads/main"]).await;
+    assert!(!ok);
+    assert!(
+        err.contains("deletion of the current branch prohibited"),
+        "{err}"
+    );
+    git.run(&src, &["push", "-q", &url, ":refs/heads/other"])
+        .await;
+    let refs = git.run(&src, &["ls-remote", &url]).await;
+    assert!(refs.contains("refs/heads/main"), "{refs}");
+    assert!(!refs.contains("refs/heads/other"), "{refs}");
 }
 
 /// A have does not cover the history past the client's shallow boundary, so

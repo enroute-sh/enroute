@@ -1,0 +1,170 @@
+// Between ledger nodes: the root log's Raft traffic, and the replication of
+// every repository's log (see `consensus::repo`), batched per peer (as TiKV
+// batches its Raft messages).
+
+syntax = "proto3";
+
+package enroute.internal.peer.v1;
+
+service Peer {
+  // A batch of frames for many logs; delivered to the engine in order.
+  rpc Deliver(Frames) returns (Delivered);
+}
+
+// The ledger's membership. `Join` and `Members` need no token: a join
+// acts only on what the object store's `cluster/` prefix says, which only
+// ledger nodes may write (see `docs/operate/security.md`).
+service Cluster {
+  // Make node `id` a member at the address and key that `cluster/nodes/<id>`
+  // names, or give a member that address and key. Refused for a removed
+  // node, and for one whose id a live member at another address holds.
+  rpc Join(JoinRequest) returns (JoinResponse);
+  // Remove node `id` for good. Needs a ledger node's own token (the
+  // `members --remove` command signs one with the node's key). Refused
+  // unless `force` if the members left would not have a live majority.
+  rpc Remove(RemoveRequest) returns (RemoveResponse);
+  // The members, the nodes removed, and the members alive, as this node
+  // sees them.
+  rpc Members(MembersRequest) returns (MembersResponse);
+}
+
+message JoinRequest {
+  uint64 id = 1;
+}
+
+message JoinResponse {}
+
+message RemoveRequest {
+  uint64 id = 1;
+  bool force = 2;
+}
+
+message RemoveResponse {}
+
+message MembersRequest {}
+
+message MembersResponse {
+  // Sorted, as are the others.
+  repeated uint64 members = 1;
+  repeated uint64 removed = 2;
+  repeated uint64 alive = 3;
+}
+
+message Frames {
+  repeated Frame frames = 1;
+  // The sender's store id: whom answers go to.
+  uint64 from = 2;
+}
+
+message Frame {
+  // The log (an incarnation of a repository's log, or the root log) the
+  // frame is for; 0 for a ping.
+  uint64 log = 1;
+  oneof kind {
+    // A raft-rs message (eraftpb.Message) for the root log, encoded by
+    // raft-rs.
+    bytes root = 2;
+    // From a repository log's sequencer to a replica.
+    Append append = 3;
+    Install install = 4;
+    // A replica's answer to an append or install.
+    Ack ack = 5;
+    // From the root's leader, changing a log's sequencer.
+    Seal seal = 6;
+    Sealed sealed = 7;
+    // From a sequencer serving reads.
+    Check check = 8;
+    Open open = 9;
+    // Liveness, between every pair of nodes.
+    Ping ping = 10;
+    Ping pong = 11;
+    // From a deposed sequencer to the root's leader.
+    Deposed deposed = 12;
+  }
+}
+
+// Cells to append after position `prev`, whose cell is of `prev_term`.
+message Append {
+  uint64 term = 1;
+  uint64 prev = 2;
+  uint64 prev_term = 3;
+  // The cells from `prev + 1`.
+  repeated Cell cells = 4;
+  // The sequencer's commit point.
+  uint64 commit = 5;
+}
+
+message Cell {
+  uint64 term = 1;
+  // The entry's payload (an encoded Effect; empty for a term's no-op).
+  bytes data = 2;
+}
+
+// The state up to position `index` (of `last_term`), for a replica behind
+// the sequencer's start.
+message Install {
+  uint64 term = 1;
+  uint64 index = 2;
+  uint64 last_term = 3;
+  uint64 commit = 4;
+  // The repository's whole state there (a Record).
+  bytes record = 5;
+}
+
+message Ack {
+  // The term of the append it answers.
+  uint64 term = 1;
+  oneof kind {
+    // The replica's log matches the sequencer's up to here.
+    uint64 appended = 2;
+    // It does not reach or match the append's start; it may match up to
+    // here.
+    uint64 behind = 3;
+    // A higher term is open or sealed: the replica's fence.
+    uint64 fenced = 4;
+  }
+}
+
+// Refuse appends below `term`, and say where the log ends.
+message Seal {
+  uint64 term = 1;
+}
+
+message Sealed {
+  // The term the seal was for.
+  uint64 term = 1;
+  // Where the log ends, and the term of its last cell; unless `fence`
+  // is past `term` (another seal or term came first).
+  uint64 last = 2;
+  uint64 last_term = 3;
+  uint64 fence = 4;
+}
+
+// A sequencer of `term` of `repo`'s log was deposed while the root still
+// names it: a seal of the next term reached the replicas but its
+// appointment never came (its controller lost the root's leadership), so
+// the log needs a new term.
+message Deposed {
+  string repo = 1;
+  uint64 term = 2;
+}
+
+// Is `term` still open?
+message Check {
+  uint64 term = 1;
+  uint64 round = 2;
+}
+
+message Open {
+  uint64 round = 1;
+  bool open = 2;
+}
+
+message Ping {
+  // The sender's boot: random, new every time its engine starts. A node
+  // restarted lost its sequencers' unsynced state, so their terms end
+  // (as Kafka fences a broker by its epoch).
+  uint64 boot = 1;
+}
+
+message Delivered {}

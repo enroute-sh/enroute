@@ -14,7 +14,10 @@ use enroute_api::api::v1alpha1::{
 
 use crate::access::Hidden;
 use crate::contract::wire::{optional_oid, require_oid, wire_oid, wire_system_time};
-use crate::query::{self, RefRejection, RefView};
+use crate::protocol::receive_pack::PushCommand;
+use crate::push::{BadCommand, Refusal};
+use crate::query::{self, RefView};
+use crate::remote;
 
 use super::Api;
 
@@ -57,33 +60,52 @@ impl RefService for Api {
         let request = request.into_inner();
         // A missing repository wins over a malformed update.
         let (key, snap) = self.snapshot(request.repo.as_ref()).await?;
-        let moves = request
+        let format = snap.format();
+        let commands = request
             .updates
-            .iter()
+            .into_iter()
             .map(|update| {
-                Ok(query::RefMove {
-                    refname: update.refname.clone(),
-                    old: optional_oid(update.old_object_id.as_ref())?,
-                    new: optional_oid(update.new_object_id.as_ref())?,
+                let old = optional_oid(update.old_object_id.as_ref())?;
+                let new = optional_oid(update.new_object_id.as_ref())?;
+                if old.is_none() && new.is_none() {
+                    return Err(Status::invalid_argument(format!(
+                        "deleting {} needs its old_object_id",
+                        update.refname
+                    )));
+                }
+                Ok(PushCommand {
+                    name: update.refname,
+                    old: old.unwrap_or(format.zero()),
+                    new: new.unwrap_or(format.zero()),
                 })
             })
             .collect::<Result<Vec<_>, Status>>()?;
-        let outcomes = query::update_refs(&self.compute, key.as_str(), snap, &moves).await?;
+        let landed = self
+            .compute
+            .land_commands(
+                key.as_str(),
+                format,
+                commands,
+                request.atomic,
+                None::<remote::PackStream>,
+            )
+            .await
+            .map_err(|error| super::internal(&error))?
+            .map_err(|why| Status::internal(format!("no pack, yet refused: {why}")))?;
+        // A repository deleted while the call landed is not found, as for any
+        // other call.
+        if landed
+            .iter()
+            .any(|(_, refusal)| matches!(refusal, Some(Refusal::Gone(_))))
+        {
+            return Err(query::Error::NotFound.into());
+        }
         Ok(Response::new(UpdateRefsResponse {
-            outcomes: outcomes
+            outcomes: landed
                 .into_iter()
-                .map(|outcome| RefUpdateOutcome {
-                    refname: outcome.refname,
-                    rejection: outcome.rejection.map(|why| Rejection {
-                        reason: match why {
-                            RefRejection::NonFastForward => Reason::NonFastForward,
-                            RefRejection::AlreadyExists => Reason::AlreadyExists,
-                            RefRejection::UnknownCommit => Reason::MissingObjects,
-                            RefRejection::InvalidRefname => Reason::InvalidRefname,
-                        }
-                        .into(),
-                        message: String::new(),
-                    }),
+                .map(|(command, refusal)| RefUpdateOutcome {
+                    refname: command.name,
+                    rejection: refusal.as_ref().map(rejection),
                 })
                 .collect(),
         }))
@@ -105,5 +127,27 @@ impl RefService for Api {
             .await
             .map_err(query::Error::from)?;
         Ok(Response::new(IsAncestorResponse { is_ancestor }))
+    }
+}
+
+/// A refusal as the API reports it.
+fn rejection(refusal: &Refusal) -> Rejection {
+    let reason = match refusal {
+        Refusal::Bad(BadCommand::Name) => Reason::InvalidRefname,
+        Refusal::Bad(BadCommand::Target(_)) => Reason::MissingObjects,
+        Refusal::Bad(BadCommand::Repeated) => Reason::RepeatedRef,
+        Refusal::Bad(BadCommand::DeleteCurrent) => Reason::DeleteCurrent,
+        Refusal::Exists => Reason::AlreadyExists,
+        Refusal::Stale => Reason::NonFastForward,
+        Refusal::Atomic => Reason::AtomicFailure,
+        Refusal::Gone(_) | Refusal::Said(_) => Reason::Unspecified,
+    };
+    Rejection {
+        reason: reason.into(),
+        message: if reason == Reason::Unspecified {
+            refusal.text().to_string()
+        } else {
+            String::new()
+        },
     }
 }

@@ -105,7 +105,9 @@
   "Fetches every branch of repository `r` with the real git client, then
   checks connectivity."
   [node r]
-  (let [dir (str (System/getProperty "java.io.tmpdir") "/jepsen-fetch-" (System/nanoTime))]
+  ;; A directory of its own: concurrent fetches must not share one.
+  (let [dir (str (java.nio.file.Files/createTempDirectory
+                   "jepsen-fetch-" (make-array java.nio.file.attribute.FileAttribute 0)))]
     (try
       (shell/sh "git" "init" "-q" "--bare" dir)
       ;; git has no request timeout: a paused node would block this thread.

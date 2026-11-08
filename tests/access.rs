@@ -118,6 +118,7 @@ impl PushHooks for Host {
         ctx: &PushContext,
         _repo: &str,
         commands: &[HookCommand],
+        _options: &[String],
     ) -> anyhow::Result<Vec<RefJudgement>> {
         self.pre.lock().unwrap().push(ctx.clone());
         Ok(commands
@@ -134,6 +135,7 @@ impl PushHooks for Host {
         ctx: &PushContext,
         _repo: &str,
         _commands: &[HookCommand],
+        _options: &[String],
     ) -> anyhow::Result<Vec<String>> {
         self.post.lock().unwrap().push(ctx.clone());
         Ok(Vec::new())
@@ -512,7 +514,7 @@ async fn advertisements_keep_their_bytes() {
     let fetch_caps = "multi_ack_detailed side-band-64k thin-pack ofs-delta shallow \
         deepen-relative no-progress include-tag allow-tip-sha1-in-want \
         allow-reachable-sha1-in-want filter object-format=sha1";
-    let push_caps = "report-status delete-refs side-band-64k quiet atomic ofs-delta \
+    let push_caps = "report-status delete-refs side-band-64k quiet atomic ofs-delta push-options \
         object-format=sha1";
 
     let head = format!("{main} HEAD\0{fetch_caps} agent={agent} symref=HEAD:refs/heads/main\n");

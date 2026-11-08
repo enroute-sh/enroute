@@ -1,5 +1,6 @@
 pub(crate) mod cast;
 pub(crate) mod delta;
+pub(crate) mod fsck;
 pub(crate) mod io;
 pub(crate) mod object;
 pub(crate) mod oid;

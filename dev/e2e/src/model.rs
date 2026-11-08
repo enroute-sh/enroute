@@ -21,6 +21,35 @@ pub(crate) enum PathKind {
     Submodule,
 }
 
+/// How the case's repositories name their objects, chosen once per case.
+///
+/// The Enroute repository and the oracle are both created in it, and the
+/// clients' clones follow them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Format {
+    #[default]
+    Sha1,
+    Sha256,
+}
+
+impl Format {
+    /// Git's name for it, as `--object-format` takes it.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Format::Sha1 => "sha1",
+            Format::Sha256 => "sha256",
+        }
+    }
+
+    /// The length of an id in hex.
+    fn hex_len(self) -> usize {
+        match self {
+            Format::Sha1 => 40,
+            Format::Sha256 => 64,
+        }
+    }
+}
+
 /// Which client currently holds the turn: a run of local commits capped off
 /// by `EndTurn`, which pushes and hands the turn to the other client.
 ///
@@ -61,6 +90,8 @@ pub(crate) enum WorkTree {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RefState {
+    /// The object format of the case's repositories.
+    pub(crate) format: Format,
     /// `git daemon` is ground truth for content, so the model only needs
     /// which paths exist and what kind each is.
     ///
@@ -414,12 +445,13 @@ fn tag_name() -> impl Strategy<Value = String> {
     "v[a-z0-9_]{0,10}"
 }
 
-/// A syntactically valid (40 lowercase hex chars) commit oid for a
+/// A syntactically valid commit oid of `format` (lowercase hex) for a
 /// submodule's checked-out commit.
 ///
 /// It never needs to resolve to a real object — see `Transition::SubmoduleAdd`.
-fn submodule_oid() -> impl Strategy<Value = String> {
-    "[0-9a-f]{40}"
+fn submodule_oid(format: Format) -> impl Strategy<Value = String> {
+    proptest::string::string_regex(&format!("[0-9a-f]{{{}}}", format.hex_len()))
+        .expect("a valid regex")
 }
 
 /// Mostly a few bytes from a tiny alphabet, occasionally free random bytes.
@@ -511,7 +543,7 @@ fn paths_of_kind(state: &RefState, kind: PathKind) -> Vec<String> {
 fn stage_op_branches(state: &RefState) -> BoxedStrategy<Transition> {
     let create = (fresh_path(state), file_content())
         .prop_map(|(name, content)| Transition::Create { name, content });
-    let submodule_add = (fresh_path(state), submodule_oid())
+    let submodule_add = (fresh_path(state), submodule_oid(state.format))
         .prop_map(|(path, oid)| Transition::SubmoduleAdd { path, oid });
     let mut branches: Vec<(u32, BoxedStrategy<Transition>)> =
         vec![(3, create.boxed()), (1, submodule_add.boxed())];
@@ -552,7 +584,7 @@ fn stage_op_branches(state: &RefState) -> BoxedStrategy<Transition> {
     if !existing_submodules.is_empty() {
         let submodule_update = (
             proptest::sample::select(existing_submodules.clone()),
-            submodule_oid(),
+            submodule_oid(state.format),
         )
             .prop_map(|(path, oid)| Transition::SubmoduleUpdate { path, oid });
         let submodule_remove =
@@ -571,7 +603,12 @@ impl ReferenceStateMachine for OracleStateMachine {
     type Transition = Transition;
 
     fn init_state() -> BoxedStrategy<Self::State> {
-        Just(RefState::default()).boxed()
+        prop_oneof![Just(Format::Sha1), Just(Format::Sha256)]
+            .prop_map(|format| RefState {
+                format,
+                ..RefState::default()
+            })
+            .boxed()
     }
 
     fn transitions(state: &Self::State) -> BoxedStrategy<Self::Transition> {

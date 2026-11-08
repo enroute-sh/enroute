@@ -113,10 +113,20 @@ impl Stack {
     /// Returns the repository key, which [`key_for`] keeps different from
     /// `name`.
     pub(crate) async fn create(&self, name: &str) -> String {
+        self.create_in(name, crate::model::Format::Sha1).await
+    }
+
+    /// [`Stack::create`], naming the repository's objects in `format`.
+    pub(crate) async fn create_in(&self, name: &str, format: crate::model::Format) -> String {
+        use enroute_api::api::v1alpha1::ObjectFormat;
         let key = key_for(name);
+        let format = match format {
+            crate::model::Format::Sha1 => ObjectFormat::Sha1,
+            crate::model::Format::Sha256 => ObjectFormat::Sha256,
+        };
         self.client()
             .await
-            .create_repository_as(&key, "")
+            .create_repository_in(&key, "", format)
             .await
             .unwrap();
         self.repos.name(name, &key);
@@ -189,7 +199,8 @@ pub(crate) fn serve_until_dropped(
     Servers::stopping(stop)
 }
 
-/// A bare git repository served over smart HTTP by real `git`, to push at.
+/// A bare git repository served over smart HTTP by real `git`, to push at
+/// and fetch from.
 ///
 /// What `git http-backend` does, by hand — real git on the far end being the
 /// point, since a stub would only agree with whatever Enroute sent it.
@@ -198,13 +209,22 @@ pub(crate) async fn spawn_git_remote(dir: &Path) -> (std::net::SocketAddr, Serve
 
     let advertise = dir.to_path_buf();
     let receive = dir.to_path_buf();
+    let upload = dir.to_path_buf();
     let router = axum::Router::new()
         .route(
             "/info/refs",
-            axum::routing::get(move || {
-                let dir = advertise.clone();
-                async move { advertise_refs(&dir).await }
-            }),
+            axum::routing::get(
+                move |query: axum::extract::RawQuery, headers: axum::http::HeaderMap| {
+                    let dir = advertise.clone();
+                    async move {
+                        if query.0.as_deref() == Some("service=git-upload-pack") {
+                            upload_pack_capabilities(&dir, &headers).await
+                        } else {
+                            advertise_refs(&dir).await
+                        }
+                    }
+                },
+            ),
         )
         .route(
             "/git-receive-pack",
@@ -212,6 +232,15 @@ pub(crate) async fn spawn_git_remote(dir: &Path) -> (std::net::SocketAddr, Serve
                 let dir = receive.clone();
                 async move { receive_pack(&dir, &body).await }
             }),
+        )
+        .route(
+            "/git-upload-pack",
+            axum::routing::post(
+                move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                    let dir = upload.clone();
+                    async move { upload_pack(&dir, &headers, &body).await }
+                },
+            ),
         )
         // The same repository behind a redirect, which is what a host that
         // has renamed one answers with.
@@ -250,29 +279,79 @@ async fn advertise_refs(dir: &Path) -> axum::response::Response {
 
 /// One push, handed to `git receive-pack` on its own standard input.
 async fn receive_pack(dir: &Path, body: &[u8]) -> axum::response::Response {
+    let mut command = tokio::process::Command::from(isolated_git());
+    command.args(["receive-pack", "--stateless-rpc"]).arg(dir);
+    stateless_rpc(command, body, "application/x-git-receive-pack-result").await
+}
+
+/// Run one `--stateless-rpc` request: `body` on standard input, the answer
+/// from standard output.
+async fn stateless_rpc(
+    mut command: tokio::process::Command,
+    body: &[u8],
+    content_type: &str,
+) -> axum::response::Response {
     use tokio::io::AsyncWriteExt as _;
 
-    let mut child = tokio::process::Command::from(isolated_git())
-        .args(["receive-pack", "--stateless-rpc"])
-        .arg(dir)
+    let mut child = command
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .spawn()
-        .expect("git receive-pack");
-    // Written while the output is read, not before it: a push large enough
-    // to make receive-pack answer before it has read all of stdin would
+        .expect("git");
+    // Written while the output is read, not before it: a request large
+    // enough to make git answer before it has read all of stdin would
     // deadlock the two pipes. The block owns the handle, so it closes when
-    // the write does — receive-pack waits for the end of its input.
+    // the write does — git waits for the end of its input.
     let mut stdin = child.stdin.take().expect("a pipe");
     let write = async move {
-        stdin.write_all(body).await.expect("writing the push");
+        stdin.write_all(body).await.expect("writing the request");
     };
     let ((), done) = tokio::join!(write, child.wait_with_output());
+    git_response(content_type, done.expect("git").stdout)
+}
 
+/// `git upload-pack` run as `http-backend` runs it: in the protocol version
+/// the request's `Git-Protocol` header asks for.
+fn upload_pack_command(dir: &Path, headers: &axum::http::HeaderMap) -> tokio::process::Command {
+    let mut command = tokio::process::Command::from(isolated_git());
+    command.args(["upload-pack", "--stateless-rpc"]);
+    if let Some(protocol) = headers.get("git-protocol") {
+        command.env("GIT_PROTOCOL", protocol.to_str().unwrap());
+    }
+    command.arg(dir);
+    command
+}
+
+/// The v2 capability advertisement.
+///
+/// `http-backend` writes no service line in front of it, so neither does this.
+async fn upload_pack_capabilities(
+    dir: &Path,
+    headers: &axum::http::HeaderMap,
+) -> axum::response::Response {
+    let advertised = upload_pack_command(dir, headers)
+        .arg("--advertise-refs")
+        .output()
+        .await
+        .expect("git upload-pack");
     git_response(
-        "application/x-git-receive-pack-result",
-        done.expect("git receive-pack").stdout,
+        "application/x-git-upload-pack-advertisement",
+        advertised.stdout,
     )
+}
+
+/// One v2 command, handed to `git upload-pack` on its own standard input.
+async fn upload_pack(
+    dir: &Path,
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+) -> axum::response::Response {
+    stateless_rpc(
+        upload_pack_command(dir, headers),
+        body,
+        "application/x-git-upload-pack-result",
+    )
+    .await
 }
 
 fn git_response(content_type: &str, body: Vec<u8>) -> axum::response::Response {

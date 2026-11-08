@@ -146,7 +146,7 @@ impl Walk<'_, '_> {
             };
             let content = Arc::new(delta::apply(&base, &idx.inflate(p.entry)?)?);
             drop(base);
-            let oid = try_hash_object(kind, &content)?;
+            let oid = try_hash_object(idx.format(), kind, &content)?;
             (self.visit)(&oid, kind, &content)?;
             out.push((p.entry, oid, kind));
             if stack.push(&self.kids, Some(p.entry), &oid, &content, p.rereadable) {

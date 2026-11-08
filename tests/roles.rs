@@ -1,5 +1,7 @@
 //! Separate roles: ledger-only nodes hold the logs, compute-only nodes do the
-//! git work, follow repositories over gRPC and maintain them by lease.
+//! git work, follow repositories over gRPC and maintain them.
+//!
+//! A ledger node binds none of the ports that serve git and the contract.
 
 #![expect(
     clippy::as_conversions,
@@ -27,7 +29,6 @@ async fn compute_nodes_work_against_a_ledger_cluster() {
         let mut c = Config::local(root.path().join(format!("f{i}")), store.clone());
         c.role = Role::Compute;
         c.compute.flush_interval = Duration::from_millis(200);
-        c.compute.maintenance_lease = Duration::from_secs(2);
         compute_nodes.push(Server::start_config(c).await);
     }
     let git = Git::new();
@@ -60,17 +61,17 @@ async fn compute_nodes_work_against_a_ledger_cluster() {
         "inline layers were not flushed"
     );
 
-    // Once its log is quiet (no ticks anywhere), reads and writes through
-    // either compute wake it, on the same voters.
-    let ticking = || {
+    // Once its log is idle (every replica caught up), reads and writes
+    // through either compute still work, in the same incarnation.
+    let lagging = || {
         ledgers
             .iter()
-            .map(|l| l.node.consensus().unwrap().stats().active_logs)
+            .map(|l| l.node.consensus().unwrap().stats().lagging_logs)
             .sum::<usize>()
     };
     assert!(
-        wait_until(|| ticking() == 0, 30).await,
-        "logs still ticking"
+        wait_until(|| lagging() == 0, 30).await,
+        "logs still lagging"
     );
     clone_matches(&git, &src, &a, "a2").await;
     push_commits(&git, &src, &b, 3, 1).await;
@@ -97,6 +98,7 @@ async fn computes_follow_repositories_with_large_states() {
     let mut c = Config::local(root.path().join("l"), store.clone());
     c.role = Role::Ledger;
     c.ledger.advertise = Some(peer.clone());
+    c.ledger.max_inline_layer_bytes = 4 << 20;
     let _ledger = Server::start_on(c, listener).await;
     let compute = |i: usize| {
         let mut c = Config::local(root.path().join(format!("f{i}")), store.clone());
@@ -141,4 +143,120 @@ async fn computes_follow_repositories_with_large_states() {
         .unwrap();
     let want = a.api_client().refs("big").await.unwrap();
     assert_eq!(refs.get("refs/heads/main"), want.get("refs/heads/main"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_ledger_node_binds_only_its_internal_listener() {
+    let root = tempfile::tempdir().unwrap();
+    let free = || {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+    };
+    let (internal, api, git) = (free(), free(), free());
+    let file = root.path().join("ledger.toml");
+    std::fs::write(
+        &file,
+        format!(
+            "[bucket]\nuri = \"file://{store}\"\n\
+             [node]\nrole = \"ledger\"\ndata_dir = \"{data}\"\n\
+             internal_listen = \"{internal}\"\nadvertise_url = \"http://{internal}\"\n\
+             [listen]\napi = \"{api}\"\ngit = \"{git}\"\n",
+            store = root.path().join("store").display(),
+            data = root.path().join("data").display(),
+        ),
+    )
+    .unwrap();
+    let mut node = tokio::process::Command::new(env!("CARGO_BIN_EXE_enroute"))
+        .arg("--config")
+        .arg(format!("file://{}", file.display()))
+        .env("RUST_LOG", "warn")
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let status = format!("http://{internal}/status");
+    let mut up = false;
+    for _ in 0..600 {
+        up = reqwest::get(&status)
+            .await
+            .is_ok_and(|r| r.status().is_success());
+        if up {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(up, "the ledger node did not answer {status}");
+
+    // Free while the node runs: it never bound them.
+    for at in [api, git] {
+        let bound = std::net::TcpListener::bind(at);
+        assert!(bound.is_ok(), "{at} is bound by the ledger node: {bound:?}");
+    }
+    node.kill().await.unwrap();
+}
+
+/// The first live compute node in a repository's order maintains it.
+///
+/// It does so even if it serves none of the repository's requests, and the
+/// next node takes over once it stops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_first_live_compute_in_order_maintains_a_repository() {
+    let root = tempfile::tempdir().unwrap();
+    let store = local_store(root.path());
+    let ledgers = cluster(root.path(), &store, 1, |_, c| {
+        c.role = Role::Ledger;
+    })
+    .await;
+    let compute = |id: u64| {
+        let dir = root.path().join(format!("f{id}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("compute-id"), format!("{id:016x}")).unwrap();
+        let mut c = Config::local(dir, store.clone());
+        c.role = Role::Compute;
+        c.compute.flush_interval = Duration::from_millis(200);
+        c
+    };
+    let a = Server::start_config(compute(1)).await;
+    let b = Server::start_config(compute(2)).await;
+    // a lists the compute nodes every 2 s: until it sees b, it maintains
+    // every repository.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    // A repository that b maintains.
+    let repo = (0..100)
+        .map(|i| format!("r{i}"))
+        .find(|r| enroute_shared::nodes::first(r, &[1, 2]) == Some(2))
+        .unwrap();
+    let flushed = || {
+        ledgers[0]
+            .node
+            .consensus()
+            .unwrap()
+            .repo_meta(&repo)
+            .is_some_and(|m| {
+                !m.layers.is_empty()
+                    && m.layers
+                        .iter()
+                        .all(enroute_shared::proto::LayerMeta::is_stored)
+            })
+    };
+
+    // Pushes go through a only; b follows the repository and flushes it.
+    let git = Git::new();
+    let src = git.init("src").await;
+    push_commits(&git, &src, &a.repo_url(&repo), 0, 1).await;
+    let b_follows = || b.node.compute().unwrap().state(&repo).is_some();
+    assert!(
+        wait_until(|| flushed() && b_follows(), 20).await,
+        "flushed: {}, b follows: {}",
+        flushed(),
+        b_follows()
+    );
+
+    // b stops; a maintains the repository once b's entry is old.
+    b.node.shutdown().await;
+    drop(b);
+    push_commits(&git, &src, &a.repo_url(&repo), 1, 1).await;
+    assert!(wait_until(flushed, 30).await, "a did not take over");
+    clone_matches(&git, &src, &a.repo_url(&repo), "a0").await;
 }

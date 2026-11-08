@@ -1,54 +1,54 @@
 # Enroute documentation
 
-Enroute is a fast, programmable Git server that is easy to operate. It is
-built like a modern database: compute is separate from storage, and
-repositories are in an object store. Enroute handles Git over HTTP, Git data,
-and a gRPC API. Your application owns repository names, users, permissions,
-and policy.
+Enroute is a Git server for applications that host code. It serves Git over
+HTTP, stores repositories in an object store, and gives your application a
+gRPC API to read and change them. Your application keeps what Enroute does
+not: users, repository names, permissions, and policy, which Enroute asks for
+through signed hooks.
 
-## Choose a starting point
+```text
+Git client -- Git smart HTTP --> Enroute <-- gRPC -------- your application
+                                  |   |
+                                  |   +-- signed HTTP hooks --> your application
+                                  |
+                   ledger nodes (replicated logs) + object store (layers)
+```
 
-| If you need to… | Read… |
-| --- | --- |
-| Run Enroute locally | [Quickstart](quickstart.md) |
-| Build a code-hosting application | [Guide](build/README.md) |
-| Understand responsibilities and boundaries | [Concepts](#concepts) |
-| Assess the current limitations | [Limitations](reference/limitations.md) |
+Start with the [Quickstart](quickstart.md): Enroute on your machine, a push,
+and a commit through the API, in about five minutes.
 
-## Guides
+## Build on Enroute
 
-[Build a code-hosting application](build/README.md) is a seven-part TypeScript
-and Next.js tutorial. It creates an application that can create repositories,
-serve Git traffic, and display files, history, and diffs. The same API and hook
-contract work with any stack that supports gRPC and HTTP.
+You write an application that hosts repositories: a code-hosting product, a CI
+system, or a platform for coding agents.
 
-After the tutorial, use [Patterns](patterns/README.md) for common product
-features such as branch protection, merge requests, CI, and mirroring.
+1. [Concepts](concepts/README.md): what your application holds, what Enroute
+   holds, and how a push moves through both.
+2. [Build a code-hosting application](build/README.md): a seven-chapter
+   TypeScript tutorial, from an empty project to files, history, and diffs on a
+   page.
+3. [Patterns](patterns/README.md): protected branches, merge requests, merge
+   queues, CI, mirroring, and more, each built on the tutorial's application.
+4. [API contract](reference/the-contract.md) and
+   [Hook reference](reference/hooks.md): every RPC and every hook, field by
+   field.
 
-## Concepts
+## Run Enroute
 
-See [Concepts](concepts/README.md) for the data model, interfaces, hooks, and
-storage design.
+You deploy and maintain Enroute for an application.
 
-## Operating Enroute
+1. [Deployment profiles](operate/deployment-profiles.md): one node, one ledger
+   with compute nodes, or a replicated ledger, and what each survives.
+2. [Operate Enroute](operate/README.md): configuration, storage, security,
+   observability, and the maintenance procedures.
+3. [Upgrades and migrations](operate/upgrades.md): moving to a new release.
+4. [Limitations](reference/limitations.md): what does not work yet.
 
-See [Operate Enroute](operate/README.md) for deployment, configuration,
-security, storage, cluster care, and observability. To choose between one
-node, one ledger with compute nodes, and a replicated ledger, see
-[Deployment profiles](operate/deployment-profiles.md).
+## Understand how it works
 
-## Reference
+You want to know how Enroute stores, replicates, and serves repositories, and
+how it is tested.
 
-See [Reference](reference/README.md) for API, hook, protocol, configuration,
-and limitation details.
-
-## Architecture
-
-See [Architecture](internals/README.md) for how Enroute works inside. The design pages are the [overview](internals/overview.md),
-[consensus](internals/consensus.md),
-[ledger and compute](internals/ledger-and-compute.md),
-[storage](internals/storage.md), [write path](internals/write-path.md),
-[read path](internals/read-path.md), [serving](internals/serving.md),
-[lifecycle](internals/lifecycle.md), and [maintenance](internals/maintenance.md).
-[Jepsen tests](internals/jepsen.md) describes how the suite tests consistency
-under faults.
+- [Architecture](internals/README.md): the storage engine, consensus, the
+  write and read paths, and maintenance, with
+  [Jepsen tests](internals/jepsen.md) for consistency under faults.

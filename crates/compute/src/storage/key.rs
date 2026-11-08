@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 
 use object_store::path::Path as StorePath;
 
+use enroute_shared::repo_state::data_path;
+
 /// A layer file: a repository and the layer's id (a random name, never reused).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(super) struct FileKey {
@@ -22,12 +24,16 @@ impl FileKey {
 
     /// Key in the object store.
     pub(crate) fn store_path(&self) -> StorePath {
-        StorePath::from(format!("repos/{}/layers/{}.layer", self.repo, self.id))
+        StorePath::from(format!(
+            "{}/layers/{}.layer",
+            data_path(&self.repo),
+            self.id
+        ))
     }
 
     /// Prefix of `repo`'s layers in the object store.
     pub(crate) fn store_prefix(repo: &str) -> StorePath {
-        StorePath::from(format!("repos/{repo}/layers"))
+        StorePath::from(format!("{}/layers", data_path(repo)))
     }
 
     /// Path of the local copy under `root`.

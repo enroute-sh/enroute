@@ -1,11 +1,11 @@
-//! Which remote may be dialed, and the two URLs a push reaches it at.
+//! Which remote may be dialed, and the URLs a push or a fetch reaches it at.
 //!
 //! A caller names the URL and Enroute dials it from inside the deployment's
 //! own network, where a loopback or a link-local address is somebody else's
 //! database or the cloud's metadata service. So a remote is checked before
 //! it is dialed, and a redirect away from it is refused rather than checked.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use url::Url;
 
@@ -31,15 +31,15 @@ pub(super) struct Endpoint {
 impl Endpoint {
     /// The endpoint at `url`, refused if this deployment may not dial it.
     ///
-    /// The DNS answer checked here is not the one the connection later uses,
-    /// so this stops a mistake rather than a host built to defeat it.
-    pub(super) async fn parse(url: &str, reach: Reach) -> Result<Self, Error> {
+    /// A name's addresses are checked as the connection resolves them, by
+    /// [`PublicOnly`].
+    pub(super) fn parse(url: &str, reach: Reach) -> Result<Self, Error> {
         let url = Url::parse(url).map_err(|error| Error::Remote(format!("not a URL: {error}")))?;
-        Self::at(url, reach).await
+        Self::at(url, reach)
     }
 
-    async fn at(base: Url, reach: Reach) -> Result<Self, Error> {
-        check(&base, reach).await?;
+    fn at(base: Url, reach: Reach) -> Result<Self, Error> {
+        check(&base, reach)?;
         Ok(Self { base })
     }
 
@@ -59,6 +59,16 @@ impl Endpoint {
         self.extend("/git-receive-pack")
     }
 
+    /// Where the remote says what a fetch can ask it for.
+    pub(super) fn upload_pack_capabilities(&self) -> Result<Url, Error> {
+        self.extend("/info/refs?service=git-upload-pack")
+    }
+
+    /// Where a fetch's commands are sent.
+    pub(super) fn upload_pack(&self) -> Result<Url, Error> {
+        self.extend("/git-upload-pack")
+    }
+
     /// `base` with `suffix` on the end.
     ///
     /// Concatenated rather than joined: `Url::join` replaces a path's last
@@ -71,7 +81,7 @@ impl Endpoint {
 }
 
 /// Refuse a URL this deployment may not dial.
-async fn check(url: &Url, reach: Reach) -> Result<(), Error> {
+fn check(url: &Url, reach: Reach) -> Result<(), Error> {
     match url.scheme() {
         "https" => {}
         "http" if reach.private => {}
@@ -102,28 +112,46 @@ async fn check(url: &Url, reach: Reach) -> Result<(), Error> {
     if reach.private {
         return Ok(());
     }
-    // A name is resolved here to be checked; an address needs no resolving
-    // and must not be handed to a resolver, which would only look it up.
-    let addresses: Vec<IpAddr> = match host {
-        url::Host::Ipv4(ip) => vec![IpAddr::V4(ip)],
-        url::Host::Ipv6(ip) => vec![IpAddr::V6(ip)],
-        url::Host::Domain(name) => {
-            let port = url.port_or_known_default().unwrap_or(443);
-            tokio::net::lookup_host((name, port))
-                .await
-                .map_err(|error| Error::Remote(format!("{name} does not resolve: {error}")))?
-                .map(|address| address.ip())
-                .collect()
-        }
+    // A name is checked where it is resolved, by [`PublicOnly`]; an address
+    // reaches no resolver, so it is checked here.
+    let address = match host {
+        url::Host::Ipv4(ip) => IpAddr::V4(ip),
+        url::Host::Ipv6(ip) => IpAddr::V6(ip),
+        url::Host::Domain(_) => return Ok(()),
     };
-    for address in addresses {
-        if !is_public(address) {
-            return Err(Error::Remote(format!(
-                "{host} answers on {address}, which is not on the public internet"
-            )));
-        }
+    if !is_public(address) {
+        return Err(Error::Remote(format!(
+            "{host} is {address}, which is not on the public internet"
+        )));
     }
     Ok(())
+}
+
+/// The client's resolver where only public remotes may be dialed: it
+/// refuses an answer that names an address off the public internet, so the
+/// addresses checked are the ones the connection dials, whatever a name
+/// answered when [`check`] looked it up.
+#[derive(Debug)]
+pub(super) struct PublicOnly;
+
+impl reqwest::dns::Resolve for PublicOnly {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let name = name.as_str().to_string();
+        Box::pin(async move {
+            // The port is the connection's to set; this answers for the name.
+            let addresses: Vec<SocketAddr> =
+                tokio::net::lookup_host((name.as_str(), 0)).await?.collect();
+            if let Some(address) = addresses.iter().find(|a| !is_public(a.ip())) {
+                return Err(format!(
+                    "{name} answers on {}, which is not on the public internet",
+                    address.ip()
+                )
+                .into());
+            }
+            let addresses: reqwest::dns::Addrs = Box::new(addresses.into_iter());
+            Ok(addresses)
+        })
+    }
 }
 
 /// Whether an address is one the public internet routes to.
@@ -194,72 +222,71 @@ mod tests {
     const PUBLIC: Reach = Reach { private: false };
     const ANY: Reach = Reach { private: true };
 
-    async fn refusal(url: &str, reach: Reach) -> String {
+    fn refusal(url: &str, reach: Reach) -> String {
         Endpoint::parse(url, reach)
-            .await
             .expect_err("refused")
             .to_string()
     }
 
+    #[test]
+    fn refuses_http_unless_the_deployment_allows_it() {
+        assert!(refusal("http://example.com/a.git", PUBLIC).contains("https"));
+        Endpoint::parse("http://127.0.0.1:9000/a.git", ANY).expect("allowed");
+    }
+
+    #[test]
+    fn refuses_a_scheme_that_is_not_http() {
+        assert!(refusal("ssh://example.com/a.git", PUBLIC).contains("ssh"));
+    }
+
+    #[test]
+    fn refuses_credentials_in_the_url() {
+        assert!(refusal("https://user:token@example.com/a.git", PUBLIC).contains("credentials"));
+    }
+
+    #[test]
+    fn refuses_an_address_off_the_public_internet() {
+        assert!(refusal("https://127.0.0.1/a.git", PUBLIC).contains("public"));
+        assert!(refusal("https://[::1]/a.git", PUBLIC).contains("public"));
+        assert!(refusal("https://169.254.169.254/a.git", PUBLIC).contains("public"));
+        assert!(refusal("https://10.0.0.1/a.git", PUBLIC).contains("public"));
+    }
+
+    /// A name that answered with a public address when it was checked can
+    /// answer the connection with another.
     #[tokio::test]
-    async fn refuses_http_unless_the_deployment_allows_it() {
-        assert!(
-            refusal("http://example.com/a.git", PUBLIC)
-                .await
-                .contains("https")
-        );
-        Endpoint::parse("http://127.0.0.1:9000/a.git", ANY)
+    async fn the_resolver_refuses_a_name_off_the_public_internet() {
+        use reqwest::dns::Resolve as _;
+
+        let name = "localhost".parse().expect("a name");
+        let refused = PublicOnly
+            .resolve(name)
             .await
-            .expect("allowed");
+            .err()
+            .expect("refused")
+            .to_string();
+        assert!(refused.contains("public"), "{refused}");
     }
 
+    /// A name passes [`check`], so the remote client's resolver is what
+    /// refuses it.
     #[tokio::test]
-    async fn refuses_a_scheme_that_is_not_http() {
-        assert!(
-            refusal("ssh://example.com/a.git", PUBLIC)
-                .await
-                .contains("ssh")
-        );
-    }
-
-    #[tokio::test]
-    async fn refuses_credentials_in_the_url() {
-        assert!(
-            refusal("https://user:token@example.com/a.git", PUBLIC)
-                .await
-                .contains("credentials")
-        );
-    }
-
-    #[tokio::test]
-    async fn refuses_an_address_off_the_public_internet() {
-        assert!(
-            refusal("https://127.0.0.1/a.git", PUBLIC)
-                .await
-                .contains("public")
-        );
-        assert!(
-            refusal("https://[::1]/a.git", PUBLIC)
-                .await
-                .contains("public")
-        );
-        assert!(
-            refusal("https://169.254.169.254/a.git", PUBLIC)
-                .await
-                .contains("public")
-        );
-        assert!(
-            refusal("https://10.0.0.1/a.git", PUBLIC)
-                .await
-                .contains("public")
-        );
-    }
-
-    #[tokio::test]
-    async fn builds_both_endpoints_under_the_repository_path() {
-        let endpoint = Endpoint::parse("https://github.com/acme/widgets.git", ANY)
+    async fn the_client_refuses_a_name_off_the_public_internet() {
+        let client = super::super::Client::new(PUBLIC).expect("a client");
+        let error = client
+            .http
+            .get("https://localhost/a.git")
+            .send()
             .await
-            .expect("allowed");
+            .expect_err("refused");
+        let chain = format!("{:#}", anyhow::Error::from(error));
+        assert!(chain.contains("public"), "{chain}");
+    }
+
+    #[test]
+    fn builds_both_endpoints_under_the_repository_path() {
+        let endpoint =
+            Endpoint::parse("https://github.com/acme/widgets.git", ANY).expect("allowed");
         assert_eq!(
             endpoint.advertisement().expect("a URL").as_str(),
             "https://github.com/acme/widgets.git/info/refs?service=git-receive-pack"

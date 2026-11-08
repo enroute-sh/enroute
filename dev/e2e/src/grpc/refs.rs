@@ -4,11 +4,12 @@
 //! objects, so the whole update is a ref move with no packfile anywhere in it.
 
 use enroute_api::api::v1alpha1::RefUpdate;
+use enroute_api::api::v1alpha1::ref_update_outcome::rejection::Reason;
 
-use crate::contract::{Client, hex, oid};
+use crate::contract::oid;
 use crate::support::Scratch;
 
-use super::support::{absent_oid, hook_backed_repo, pushed_repo, status_of};
+use super::support::{absent_oid, hook_backed_repo, pushed_repo, status_of, tip};
 
 const TRUNK: &str = "refs/heads/main";
 const BRANCH: &str = "refs/heads/feature";
@@ -225,17 +226,6 @@ async fn ancestry_is_answered_and_not_enforced() {
     );
 }
 
-async fn tip(client: &Client, repo: &str, refname: &str) -> Option<String> {
-    client
-        .list_refs(repo)
-        .await
-        .unwrap()
-        .refs
-        .into_iter()
-        .find(|r| r.name == refname)
-        .map(|r| hex(r.object_id.as_ref()))
-}
-
 /// A repository one call old has no refs, and says so rather than failing.
 ///
 /// The default branch is still reported: it is where `HEAD` points, which is
@@ -361,6 +351,73 @@ async fn several_refs_move_in_one_call() {
     );
 }
 
+/// An atomic call lands every update or none.
+///
+/// An update a plain call would refuse on its own refuses the whole atomic
+/// call, as `git push --atomic` does.
+#[tokio::test]
+async fn an_atomic_call_lands_all_or_none() {
+    let (stack, client, repo) = hook_backed_repo(TRUNK).await;
+    let scratch = Scratch::new().await;
+
+    let first = scratch.commit(b"one\n", None, "first").await;
+    let second = scratch.commit(b"two\n", Some(&first), "second").await;
+    stack.seed(&repo, BRANCH, &scratch, &second).await;
+    let stranger = scratch.commit(b"unsent\n", None, "unsent").await;
+
+    let create = |refname: &str, to: &str| RefUpdate {
+        refname: refname.to_string(),
+        old_object_id: None,
+        new_object_id: oid(to.to_string()),
+    };
+    let outcomes = client
+        .update_refs_with(
+            &repo,
+            vec![
+                create(TRUNK, &second.oid),
+                create("refs/heads/nope", &stranger.oid),
+            ],
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcomes[0].reason,
+        Some(Reason::AtomicFailure),
+        "{outcomes:?}"
+    );
+    assert_eq!(
+        outcomes[1].reason,
+        Some(Reason::MissingObjects),
+        "{outcomes:?}"
+    );
+    assert_eq!(tip(&client, &repo, TRUNK).await, None, "nothing may move");
+
+    let outcomes = client
+        .update_refs_with(
+            &repo,
+            vec![
+                create(TRUNK, &second.oid),
+                create("refs/tags/v1", &first.oid),
+            ],
+            true,
+        )
+        .await
+        .unwrap();
+    assert!(
+        outcomes.iter().all(|o| o.rejection.is_none()),
+        "{outcomes:?}"
+    );
+    assert_eq!(
+        tip(&client, &repo, TRUNK).await.as_deref(),
+        Some(second.oid.as_str())
+    );
+    assert_eq!(
+        tip(&client, &repo, "refs/tags/v1").await.as_deref(),
+        Some(first.oid.as_str())
+    );
+}
+
 /// A ref is deleted by moving it to the null id, which is how git says it too.
 #[tokio::test]
 async fn a_ref_moved_to_the_null_id_is_deleted() {
@@ -465,5 +522,87 @@ async fn a_malformed_id_in_an_update_moves_nothing() {
         tip(&client, &repo, TRUNK).await,
         None,
         "the well-formed half of a refused call must not have landed"
+    );
+}
+
+/// A delete names the value it removes, as a git push does: no update moves a
+/// ref it has not seen.
+#[tokio::test]
+async fn a_delete_needs_its_old_id() {
+    let (stack, client, repo) = hook_backed_repo(TRUNK).await;
+    let scratch = Scratch::new().await;
+
+    let commit = scratch.commit(b"one\n", None, "first").await;
+    stack.seed(&repo, BRANCH, &scratch, &commit).await;
+
+    let error = client
+        .update_refs(
+            &repo,
+            vec![RefUpdate {
+                refname: BRANCH.to_string(),
+                old_object_id: None,
+                new_object_id: None,
+            }],
+        )
+        .await
+        .expect_err("a delete without its old id is not a request");
+    assert_eq!(
+        status_of(&error).code(),
+        tonic::Code::InvalidArgument,
+        "{error:?}"
+    );
+    assert_eq!(
+        tip(&client, &repo, BRANCH).await.as_deref(),
+        Some(commit.oid.as_str())
+    );
+}
+
+/// A call updates each ref once, and keeps the branch `HEAD` points at, as
+/// git's `receive-pack` does.
+#[tokio::test]
+async fn git_push_rules_hold() {
+    let (stack, client, repo) = hook_backed_repo(TRUNK).await;
+    let scratch = Scratch::new().await;
+
+    let first = scratch.commit(b"one\n", None, "first").await;
+    let second = scratch.commit(b"two\n", Some(&first), "second").await;
+    stack.seed(&repo, TRUNK, &scratch, &second).await;
+
+    let create = |to: &str| RefUpdate {
+        refname: BRANCH.to_string(),
+        old_object_id: None,
+        new_object_id: oid(to.to_string()),
+    };
+    let outcomes = client
+        .update_refs(&repo, vec![create(&first.oid), create(&second.oid)])
+        .await
+        .unwrap();
+    assert!(
+        outcomes
+            .iter()
+            .all(|o| o.reason == Some(Reason::RepeatedRef)),
+        "{outcomes:?}"
+    );
+    assert_eq!(tip(&client, &repo, BRANCH).await, None);
+
+    let outcomes = client
+        .update_refs(
+            &repo,
+            vec![RefUpdate {
+                refname: TRUNK.to_string(),
+                old_object_id: oid(second.oid.clone()),
+                new_object_id: None,
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcomes[0].reason,
+        Some(Reason::DeleteCurrent),
+        "{outcomes:?}"
+    );
+    assert_eq!(
+        tip(&client, &repo, TRUNK).await.as_deref(),
+        Some(second.oid.as_str())
     );
 }

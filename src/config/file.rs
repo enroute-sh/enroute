@@ -11,6 +11,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,6 +20,9 @@ use anyhow::{Context as _, Result};
 use bytesize::ByteSize;
 use object_store::memory::InMemory;
 use serde::Deserialize;
+
+use enroute_shared::oid::ObjectFormat;
+use enroute_shared::store::IoConfig;
 
 use crate::config::{Bucket, Hook, ObjectUri, PreReceiveMode, Secret, expand};
 use crate::node::{self, Role, Store};
@@ -37,6 +41,12 @@ pub struct Config {
     /// The replicated logs.
     #[serde(default)]
     pub ledger: Ledger,
+    /// The node's concurrent requests to `bucket`, shared by kinds of work.
+    ///
+    /// A kind may always use its `reserve`, never more than its `limit`, and
+    /// shares the rest by `weight`.
+    #[serde(default)]
+    pub store_io: IoConfig,
     /// Where each listener binds.
     #[serde(default)]
     pub listen: Listen,
@@ -81,6 +91,12 @@ pub struct Node {
     /// through it.
     #[serde(default, deserialize_with = "optional_url")]
     pub advertise_url: Option<url::Url>,
+    /// The failure domain this node is in, such as an availability zone.
+    ///
+    /// A ledger node's repository logs keep their replicas in distinct
+    /// zones where the members allow it. Unset: no zone.
+    #[serde(default, deserialize_with = "expand::optional::deserialize")]
+    pub zone: Option<String>,
     /// Workers for CPU-bound work, shared by all requests (0: one per core).
     #[serde(default = "Node::cpu_threads")]
     pub cpu_threads: usize,
@@ -100,6 +116,9 @@ pub struct Node {
     /// Drop a repository's view once it is unused this long.
     #[serde(default = "Node::evict_after", with = "humantime_serde")]
     pub evict_after: Duration,
+    /// Console lines that may wait to be written before new ones are dropped.
+    #[serde(default = "Node::console_buffer_lines")]
+    pub console_buffer_lines: NonZeroUsize,
 }
 
 /// The engine's own defaults, which are the only statement of them.
@@ -127,6 +146,13 @@ impl Node {
 
     fn disk_cache() -> ByteSize {
         ByteSize(defaults().disk_cache_bytes)
+    }
+
+    /// tracing-appender's own default: at a few hundred bytes a line, tens
+    /// of MB that a stalled stdout can hold.
+    fn console_buffer_lines() -> NonZeroUsize {
+        NonZeroUsize::new(tracing_appender::non_blocking::DEFAULT_BUFFERED_LINES_LIMIT)
+            .unwrap_or(NonZeroUsize::MIN)
     }
 
     fn evict_after() -> Duration {
@@ -188,23 +214,27 @@ impl Default for Layers {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Ledger {
-    /// Checkpoint a repository's state to `bucket` at most this long after
-    /// it changed.
-    #[serde(with = "humantime_serde")]
-    pub checkpoint_age: Duration,
-    /// Checkpoints written at once.
-    pub checkpoint_concurrency: usize,
     /// The state store's block cache and memtables.
     pub state_memory: ByteSize,
+    /// The largest inline layer the ledger accepts.
+    ///
+    /// The ledger refuses a push that carries a larger layer. With 0, no
+    /// repository content passes through it.
+    pub max_inline_layer: ByteSize,
+    /// Create repositories whose objects are named in SHA-256.
+    ///
+    /// Off by default: turn it on once every node runs a release that reads
+    /// SHA-256 repositories.
+    pub allow_sha256: bool,
 }
 
 impl Default for Ledger {
     fn default() -> Self {
         let defaults = defaults();
         Self {
-            checkpoint_age: defaults.ledger.checkpoint_age,
-            checkpoint_concurrency: defaults.ledger.checkpoint_concurrency,
             state_memory: size(defaults.ledger.state_memory_bytes),
+            max_inline_layer: ByteSize(defaults.ledger.max_inline_layer_bytes),
+            allow_sha256: defaults.ledger.allow_sha256,
         }
     }
 }
@@ -220,6 +250,11 @@ fn size(bytes: usize) -> ByteSize {
 /// Returns an error naming `key` if `size` does not fit.
 fn bytes(size: ByteSize, key: &str) -> Result<usize> {
     usize::try_from(size.as_u64()).with_context(|| format!("{key} is too large"))
+}
+
+/// A node's internal URL as nodes name it: without a trailing `/`.
+fn internal_url(url: &url::Url) -> String {
+    url.as_str().trim_end_matches('/').to_string()
 }
 
 /// An optional URL, expanded and parsed when it is there.
@@ -345,18 +380,25 @@ pub struct Hooks {
 pub struct Git {
     /// A push to a missing repository creates it.
     pub create_on_push: bool,
-    /// Let `SyncService.PushToRemote` dial `http://`, and hosts that answer
-    /// on an address off the public internet.
+    /// The object format of a repository whose creator names none: one a
+    /// push creates, or `CreateRepository` without `object_format`.
+    pub default_object_format: ObjectFormat,
+    /// Let `SyncService.PushToRemote` and `FetchFromRemote` dial `http://`, and
+    /// hosts that answer on an address off the public internet.
     ///
     /// For a development stack, and for a git server inside your own network.
     pub allow_private_remotes: bool,
+    /// A push with an object larger than this fails, as does an API commit.
+    pub max_object_size: ByteSize,
 }
 
 impl Default for Git {
     fn default() -> Self {
         Self {
             create_on_push: true,
+            default_object_format: ObjectFormat::Sha1,
             allow_private_remotes: false,
+            max_object_size: ByteSize(defaults().compute.max_object_bytes),
         }
     }
 }
@@ -382,6 +424,7 @@ impl Config {
             "node.role \"ledger\" needs node.advertise_url: \
              a ledger node serves no other node without it"
         );
+        self.store_io.check().context("in store_io")?;
         anyhow::ensure!(
             self.layers.flush_max_layers > 0,
             "layers.flush_max_layers must be at least 1"
@@ -389,6 +432,19 @@ impl Config {
         anyhow::ensure!(
             self.layers.merge_factor != 1,
             "layers.merge_factor must be 0 (never merge) or at least 2"
+        );
+        anyhow::ensure!(
+            self.node.role != Role::Both
+                || self.layers.inline_layer <= self.ledger.max_inline_layer,
+            "layers.inline_layer must be at most ledger.max_inline_layer: \
+             the ledger refuses every push that carries a larger layer"
+        );
+        anyhow::ensure!(
+            self.node.role != Role::Both
+                || self.ledger.allow_sha256
+                || self.git.default_object_format != ObjectFormat::Sha256,
+            "git.default_object_format = \"sha256\" needs ledger.allow_sha256 = true: \
+             the ledger refuses every create in that format"
         );
         anyhow::ensure!(
             !self.hooks.timeout.is_zero(),
@@ -405,7 +461,10 @@ impl Config {
     /// built.
     pub fn node(&self) -> Result<node::Config> {
         let mut config = self.node.engine(&self.bucket, &self.layers, &self.ledger)?;
+        config.io = self.store_io;
         config.compute.create_on_push = self.git.create_on_push;
+        config.compute.default_object_format = self.git.default_object_format;
+        config.compute.max_object_bytes = self.git.max_object_size.as_u64();
         Ok(config)
     }
 
@@ -443,60 +502,10 @@ impl std::str::FromStr for Config {
     fn from_str(toml: &str) -> Result<Self> {
         // No context of its own: the caller knows where the bytes came from,
         // and "the configuration" twice in one chain says nothing twice.
-        if let Ok(table) = toml.parse::<toml::Table>() {
-            retired(&table)?;
-        }
         let config: Self = toml::from_str(toml)?;
         config.check()?;
         Ok(config)
     }
-}
-
-/// Tables that 0.2.0 read and 0.3.0 does not.
-///
-/// An upgrade fails on the first of them with what to do, rather than with a
-/// bare unknown field.
-const RETIRED: &[(&str, &str)] = &[
-    (
-        "database",
-        "[database] was removed in 0.3.0: Enroute keeps no database",
-    ),
-    (
-        "ingest",
-        "[ingest] was removed in 0.3.0: each node ingests pushes itself",
-    ),
-    (
-        "maintenance",
-        "[maintenance] was removed in 0.3.0: maintenance always runs, and [layers] tunes it",
-    ),
-    (
-        "sync",
-        "[sync] was removed in 0.3.0: sync.allow_private_remotes is now git.allow_private_remotes",
-    ),
-];
-
-/// Refuses a 0.2.0 table or a `*_secs` key with how to change it.
-///
-/// # Errors
-///
-/// Returns an error for the first retired table or key in `table`.
-fn retired(table: &toml::Table) -> Result<()> {
-    for (name, why) in RETIRED {
-        anyhow::ensure!(!table.contains_key(*name), "{why}");
-    }
-    for (section, value) in table {
-        let Some(keys) = value.as_table() else {
-            continue;
-        };
-        if let Some(key) = keys.keys().find(|key| key.ends_with("_secs")) {
-            let new = key.trim_end_matches("_secs");
-            anyhow::bail!(
-                "{section}.{key} was removed in 0.3.0: write {section}.{new} with a unit, \
-                 such as \"10s\""
-            );
-        }
-    }
-    Ok(())
 }
 
 impl Hooks {
@@ -543,12 +552,11 @@ impl Node {
         config.page_cache_bytes = bytes(table.page_cache, "node.page_cache")?;
         config.disk_cache_bytes = table.disk_cache.as_u64();
         config.max_open_files = table.max_open_files;
-        if let Some(url) = &table.advertise_url {
-            config.ledger.advertise = Some(url.as_str().trim_end_matches('/').to_string());
-        }
+        config.ledger.advertise = table.advertise_url.as_ref().map(internal_url);
+        config.ledger.zone = table.zone.clone().unwrap_or_default();
         config.ledger.state_memory_bytes = bytes(ledger.state_memory, "ledger.state_memory")?;
-        config.ledger.checkpoint_age = ledger.checkpoint_age;
-        config.ledger.checkpoint_concurrency = ledger.checkpoint_concurrency;
+        config.ledger.max_inline_layer_bytes = ledger.max_inline_layer.as_u64();
+        config.ledger.allow_sha256 = ledger.allow_sha256;
         let compute = &mut config.compute;
         compute.evict_after = table.evict_after;
         compute.merge_factor = layers.merge_factor;
@@ -603,6 +611,8 @@ impl Telemetry {
 mod tests {
     use std::str::FromStr as _;
 
+    use enroute_shared::store::Share;
+
     use super::*;
 
     /// The least a file can say and still name a deployment.
@@ -649,6 +659,7 @@ mod tests {
         );
         assert_eq!(node.disk_cache, ByteSize(0));
         assert_eq!(node.max_open_files, None);
+        assert_eq!(node.console_buffer_lines.get(), 128_000);
         assert_eq!(
             (node.cpu_threads, node.evict_after),
             (0, Duration::from_mins(15))
@@ -662,7 +673,7 @@ mod tests {
         );
         assert_eq!(
             (layers.flush_interval, layers.flush_max_layers),
-            (Duration::from_secs(1), 256)
+            (Duration::from_secs(30), 256)
         );
         assert_eq!(
             (layers.sweep_interval, layers.sweep_retention),
@@ -670,11 +681,12 @@ mod tests {
         );
 
         let ledger = &config.ledger;
-        assert_eq!(
-            (ledger.checkpoint_age, ledger.checkpoint_concurrency),
-            (Duration::from_mins(1), 8)
-        );
         assert_eq!(ledger.state_memory, ByteSize::mib(512));
+        assert_eq!(ledger.max_inline_layer, ByteSize::mib(1));
+
+        let io = config.store_io;
+        assert_eq!(io.slots, 256);
+        assert_eq!((io.commit.reserve, io.background.limit), (16, 128));
     }
 
     /// A key that a file leaves out takes the engine's own value, not a copy.
@@ -690,15 +702,12 @@ mod tests {
         assert_eq!(built.page_cache_bytes, engine.page_cache_bytes);
         assert_eq!(built.disk_cache_bytes, engine.disk_cache_bytes);
         assert_eq!(built.max_open_files, engine.max_open_files);
+        assert_eq!(built.io, engine.io);
         assert_eq!(built.ledger.advertise, None);
+        assert_eq!(built.ledger.zone, "");
         assert_eq!(
             built.ledger.state_memory_bytes,
             engine.ledger.state_memory_bytes
-        );
-        assert_eq!(built.ledger.checkpoint_age, engine.ledger.checkpoint_age);
-        assert_eq!(
-            built.ledger.checkpoint_concurrency,
-            engine.ledger.checkpoint_concurrency
         );
         let (compute, defaults) = (&built.compute, &engine.compute);
         assert_eq!(compute.merge_factor, defaults.merge_factor);
@@ -716,17 +725,30 @@ mod tests {
         let toml = format!(
             "bucket.uri = \"memory:///objects\"\n\
              [layers]\nflush_interval = \"300ms\"\ninline_layer = 0\n\
-             [ledger]\ncheckpoint_age = \"5s\"\n\
+             [ledger]\nstate_memory = \"64 MiB\"\nmax_inline_layer = 0\n\
+             allow_sha256 = true\n\
+             [store_io]\nslots = 64\nbackground = {{ reserve = 4, limit = 8, weight = 1 }}\n\
              [node]\ndata_dir = \"/data\"\ncache = \"64 MiB\"\n\
-             advertise_url = \"http://10.0.0.1:7400/\"\n{}",
+             advertise_url = \"http://10.0.0.1:7400/\"\nzone = \"eu-central-1a\"\n{}",
             REQUIRED.replace("[node]\ndata_dir = \"/var/lib/enroute/node\"\n", "")
         );
         let built = Config::from_str(&toml).unwrap().node().unwrap();
+        assert_eq!(built.ledger.zone, "eu-central-1a");
 
         assert_eq!(built.compute.flush_interval, Duration::from_millis(300));
         assert_eq!(built.compute.inline_layer_bytes, 0);
-        assert_eq!(built.ledger.checkpoint_age, Duration::from_secs(5));
+        assert_eq!(built.ledger.state_memory_bytes, 64 << 20);
+        assert_eq!(built.ledger.max_inline_layer_bytes, 0);
+        assert!(built.ledger.allow_sha256);
         assert_eq!(built.cache_bytes, 64 << 20);
+        assert_eq!(built.io.slots, 64);
+        assert_eq!(
+            built.io.background,
+            Share {
+                limit: 8,
+                ..defaults().io.background
+            }
+        );
         assert_eq!(
             built.ledger.advertise.as_deref(),
             Some("http://10.0.0.1:7400")
@@ -737,6 +759,35 @@ mod tests {
     fn a_flush_of_no_layers_is_refused() {
         let error = refused("bucket.uri = \"s3://objects\"\n[layers]\nflush_max_layers = 0\n");
         assert!(error.contains("flush_max_layers"), "{error}");
+    }
+
+    #[test]
+    fn store_io_shares_that_do_not_fit_are_refused() {
+        let error = refused("bucket.uri = \"s3://objects\"\n[store_io]\nslots = 16\n");
+        assert!(error.contains("reservations"), "{error}");
+        let error = refused(
+            "bucket.uri = \"s3://objects\"\n[store_io.commit]\nreserve = 0\nlimit = 1\nweight = 0\n",
+        );
+        assert!(error.contains("commit.weight"), "{error}");
+    }
+
+    #[test]
+    fn a_node_must_not_write_inline_layers_its_ledger_refuses() {
+        let error =
+            refused("bucket.uri = \"s3://objects\"\n[ledger]\nmax_inline_layer = \"512 KiB\"\n");
+        assert!(error.contains("layers.inline_layer"), "{error}");
+        Config::from_str(&format!(
+            "{}[layers]\ninline_layer = \"4 MiB\"\n[ledger]\nmax_inline_layer = \"4 MiB\"\n",
+            minimal()
+        ))
+        .expect("a limit as large as the layers is fine");
+        for role in ["ledger", "compute"] {
+            let node =
+                format!("role = \"{role}\"\nadvertise_url = \"http://10.0.0.1:7400\"\ndata_dir");
+            let toml = minimal().replace("data_dir", &node);
+            Config::from_str(&format!("{toml}[ledger]\nmax_inline_layer = 0\n"))
+                .expect("a node of one role cannot check the other's setting");
+        }
     }
 
     #[test]
@@ -755,22 +806,6 @@ mod tests {
         let toml = minimal().replace("data_dir = \"/var/lib/enroute/node\"\n", "");
         let error = format!("{:#}", Config::from_str(&toml).unwrap_err());
         assert!(error.contains("data_dir"), "{error}");
-    }
-
-    #[test]
-    fn a_0_2_0_table_says_what_replaced_it() {
-        let error =
-            refused("bucket.uri = \"s3://objects\"\n[sync]\nallow_private_remotes = true\n");
-        assert!(error.contains("git.allow_private_remotes"), "{error}");
-        let error = refused("bucket.uri = \"s3://objects\"\n[database]\nurl = \"postgres://x\"\n");
-        assert!(error.contains("[database] was removed"), "{error}");
-    }
-
-    #[test]
-    fn a_secs_key_says_to_write_a_duration() {
-        let toml = minimal().replace("[hooks]\n", "[hooks]\ntimeout_secs = 10\n");
-        let error = format!("{:#}", Config::from_str(&toml).unwrap_err());
-        assert!(error.contains("hooks.timeout with a unit"), "{error}");
     }
 
     #[test]
@@ -812,7 +847,8 @@ mod tests {
                     if rest.starts_with('[')
                         || (rest.contains(" = ")
                             && !rest.starts_with([' ', '\t'])
-                            && !rest.starts_with("advertise_url")) =>
+                            && !rest.starts_with("advertise_url")
+                            && !rest.starts_with("zone")) =>
                 {
                     rest
                 }
@@ -833,6 +869,7 @@ mod tests {
             (engine.cache, engine.page_cache, engine.disk_cache)
         );
         assert_eq!(node.evict_after, engine.evict_after);
+        assert_eq!(shown.store_io, defaults.store_io);
     }
 
     /// One `tracing::debug!(?config)` must not be the end of every care taken
@@ -998,10 +1035,37 @@ mod tests {
     }
 
     #[test]
+    fn default_object_format_reaches_the_engine_and_needs_the_ledger_setting() {
+        let toml = format!("{NODE}[git]\ndefault_object_format = \"sha256\"\n");
+        let err = toml.parse::<Config>().expect_err("needs allow_sha256");
+        assert!(format!("{err:#}").contains("allow_sha256"), "{err:#}");
+        let toml = format!(
+            "{NODE}[git]\ndefault_object_format = \"sha256\"\n[ledger]\nallow_sha256 = true\n"
+        );
+        let config: Config = toml.parse().expect("config");
+        assert_eq!(
+            config.node().unwrap().compute.default_object_format,
+            ObjectFormat::Sha256
+        );
+        format!("{NODE}[git]\ndefault_object_format = \"sha3\"\n")
+            .parse::<Config>()
+            .expect_err("an unknown format");
+    }
+
+    #[test]
     fn create_on_push_reaches_the_engine() {
         let toml = format!("{NODE}[git]\ncreate_on_push = false\n");
         let config = Config::from_str(&toml).unwrap();
         assert!(!config.node().unwrap().compute.create_on_push);
+    }
+
+    #[test]
+    fn max_object_size_reaches_the_engine() {
+        let config = Config::from_str(NODE).unwrap();
+        assert_eq!(config.node().unwrap().compute.max_object_bytes, 100 << 20);
+        let toml = format!("{NODE}[git]\nmax_object_size = \"1 GiB\"\n");
+        let config = Config::from_str(&toml).unwrap();
+        assert_eq!(config.node().unwrap().compute.max_object_bytes, 1 << 30);
     }
 
     #[test]

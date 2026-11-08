@@ -18,9 +18,10 @@ use common::{Git, Server};
 use enroute::node::Node;
 use enroute_compute::{
     HookCommand, HostHooks, Judgement, PreReceiveMode, PushContext, PushHooks, RefJudgement,
+    RepoState,
 };
 use enroute_shared::oid::Oid;
-use enroute_shared::state::{Commit, RefUpdate, RepoMeta};
+use enroute_shared::state::{Commit, RefUpdate};
 
 /// What `pre_receive` saw.
 #[derive(Clone, Debug)]
@@ -29,6 +30,7 @@ struct Pre {
     /// Per command with a new value: readable through a linearizable read,
     /// as the API reads.
     readable: Vec<bool>,
+    options: Vec<String>,
 }
 
 /// A hook that allows everything but what the test says.
@@ -45,6 +47,8 @@ struct TestHook {
     lines: Mutex<Vec<String>>,
     pre: Mutex<Vec<Pre>>,
     post: Mutex<Vec<Vec<HookCommand>>>,
+    /// The push options each `post_receive` saw.
+    post_options: Mutex<Vec<Vec<String>>>,
     mode: Option<PreReceiveMode>,
 }
 
@@ -59,6 +63,7 @@ impl PushHooks for TestHook {
         _ctx: &PushContext,
         repo: &str,
         commands: &[HookCommand],
+        options: &[String],
     ) -> anyhow::Result<Vec<RefJudgement>> {
         assert!(self.mode.is_some(), "pre_receive with no mode");
         let node = self.node.get().and_then(Weak::upgrade).unwrap();
@@ -72,6 +77,7 @@ impl PushHooks for TestHook {
         self.pre.lock().unwrap().push(Pre {
             commands: commands.to_vec(),
             readable,
+            options: options.to_vec(),
         });
         let moved = self.move_ref.lock().unwrap().take();
         if let Some((name, to)) = moved {
@@ -111,7 +117,9 @@ impl PushHooks for TestHook {
         _ctx: &PushContext,
         _repo: &str,
         commands: &[HookCommand],
+        options: &[String],
     ) -> anyhow::Result<Vec<String>> {
+        self.post_options.lock().unwrap().push(options.to_vec());
         self.post.lock().unwrap().push(commands.to_vec());
         Ok(self.lines.lock().unwrap().clone())
     }
@@ -150,17 +158,21 @@ async fn remote(git: &Git, cwd: &Path, url: &str, refname: &str) -> Option<Strin
 }
 
 /// The repository's replicated state, as the compute follows it.
-fn state(server: &Server, repo: &str) -> Arc<RepoMeta> {
-    server.node.compute().unwrap().state(repo).unwrap()
+///
+/// A push is acknowledged before this node follows it, so catch up first.
+async fn state(server: &Server, repo: &str) -> Arc<RepoState> {
+    let compute = server.node.compute().unwrap();
+    compute.repo_for_read(repo, true).await.unwrap();
+    compute.state(repo).unwrap()
 }
 
-fn version(server: &Server, repo: &str) -> u64 {
-    state(server, repo).version
+async fn version(server: &Server, repo: &str) -> u64 {
+    state(server, repo).await.version
 }
 
 /// The layer count and the version of `repo`.
-fn layers_and_version(server: &Server, repo: &str) -> (usize, u64) {
-    let state = state(server, repo);
+async fn layers_and_version(server: &Server, repo: &str) -> (usize, u64) {
+    let state = state(server, repo).await;
     (state.layers.len(), state.version)
 }
 
@@ -193,6 +205,21 @@ async fn allow_all_lands_and_post_receive_sees_it() {
     assert_eq!(*hook.post.lock().unwrap(), vec![vec![want]]);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn push_options_reach_both_hooks() {
+    let (server, hook) = start(Some(PreReceiveMode::Commands)).await;
+    let git = Git::new();
+    let url = server.repo_url("r");
+    let src = git.init("src").await;
+    git.commit_file(&src, "f", "1\n", "1").await;
+    let push = ["push", "-o", "ci.skip", "-o", "title=Fix it", &url, "main"];
+    let (ok, _, err) = git.try_run(&src, &push).await;
+    assert!(ok, "{err}");
+    let sent = ["ci.skip", "title=Fix it"];
+    assert_eq!(hook.pre.lock().unwrap()[0].options, sent);
+    assert_eq!(hook.post_options.lock().unwrap()[0], sent);
+}
+
 /// The hook and the command of a second push of `main` in `mode`.
 ///
 /// The second push, new objects and a ref move, must commit in one entry and
@@ -206,11 +233,11 @@ async fn second_push_in_one_entry(mode: Option<PreReceiveMode>) -> (Arc<TestHook
     let c1 = git.commit_file(&src, "f", "1\n", "1").await;
     git.run(&src, &["push", "-q", &url, "main"]).await;
 
-    let v = version(&server, "r");
+    let v = version(&server, "r").await;
     let c2 = git.commit_file(&src, "f", "2\n", "2").await;
     let (ok, _, err) = git.try_run(&src, &["push", &url, "main"]).await;
     assert!(ok, "{err}");
-    assert_eq!(version(&server, "r") - v, 1);
+    assert_eq!(version(&server, "r").await - v, 1);
     assert!(err.contains("remote: build queued"), "{err}");
     let want = HookCommand {
         refname: "refs/heads/main".into(),
@@ -251,7 +278,7 @@ async fn default_refusal_commits_nothing() {
     let src = git.init("src").await;
     git.commit_file(&src, "f", "1\n", "1").await;
     git.run(&src, &["push", "-q", &url, "main"]).await;
-    let before = layers_and_version(&server, "r");
+    let before = layers_and_version(&server, "r").await;
 
     git.run(&src, &["checkout", "-q", "-b", "b"]).await;
     let c2 = git.commit_file(&src, "f", "2\n", "2").await;
@@ -263,7 +290,7 @@ async fn default_refusal_commits_nothing() {
     );
     assert_eq!(hook.pre.lock().unwrap().len(), 2);
     // No entry, so no layer: the refused objects were never stored.
-    assert_eq!(layers_and_version(&server, "r"), before);
+    assert_eq!(layers_and_version(&server, "r").await, before);
     let repo = server
         .node
         .compute()
@@ -289,11 +316,11 @@ async fn default_force_flags() {
     git.run(&src, &["push", "-q", &url, "main"]).await;
     let mut want = vec![("refs/heads/main".to_string(), None, Some(oid(&c1)), false)];
     let mut push = async |args: &[&str], expect: Expect<'_>| {
-        let v = version(&server, "r");
+        let v = version(&server, "r").await;
         let mut full = vec!["push", "-q"];
         full.extend_from_slice(args);
         git.run(&src, &full).await;
-        assert_eq!(version(&server, "r") - v, 1, "{args:?}");
+        assert_eq!(version(&server, "r").await - v, 1, "{args:?}");
         want.extend(
             expect
                 .into_iter()
@@ -501,24 +528,24 @@ async fn force_and_entry_count() {
     let c1 = git.commit_file(&src, "f", "1\n", "1").await;
     git.run(&src, &["push", "-q", &url, "main"]).await;
     // Fast-forward, with new objects: two entries.
-    let v = version(&server, "r");
+    let v = version(&server, "r").await;
     let c2 = git.commit_file(&src, "f", "2\n", "2").await;
     git.run(&src, &["push", "-q", &url, "main"]).await;
-    assert_eq!(version(&server, "r") - v, 2);
+    assert_eq!(version(&server, "r").await - v, 2);
     // Rewrite history: non-fast-forward.
     git.run(&src, &["reset", "-q", "--hard", &c1]).await;
     let c3 = git.commit_file(&src, "f", "3\n", "3").await;
     git.run(&src, &["push", "-q", "--force", &url, "main"])
         .await;
     // Create a branch at an existing commit: no new objects, one entry.
-    let v = version(&server, "r");
+    let v = version(&server, "r").await;
     git.run(&src, &["push", "-q", &url, "main:refs/heads/b"])
         .await;
-    assert_eq!(version(&server, "r") - v, 1);
+    assert_eq!(version(&server, "r").await - v, 1);
     // Delete it: one entry.
-    let v = version(&server, "r");
+    let v = version(&server, "r").await;
     git.run(&src, &["push", "-q", &url, ":refs/heads/b"]).await;
-    assert_eq!(version(&server, "r") - v, 1);
+    assert_eq!(version(&server, "r").await - v, 1);
 
     let pre = hook.pre.lock().unwrap().clone();
     let got: Vec<_> = pre

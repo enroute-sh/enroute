@@ -1,11 +1,11 @@
-//! A node: the parts its roles share (the object store, the local store, the
-//! node registry), and the roles it runs ([`Role`]).
+//! A node: the parts its roles share (the object store, the local store),
+//! and the roles it runs ([`Role`]).
 //!
 //! The [`Ledger`] holds the replicated logs, and decides each repository's
 //! incarnation and its state in the object store. The [`Compute`] holds views
 //! and storage, serves git traffic and does maintenance. A node that runs both
-//! calls its ledger in-process. A compute-only node reaches the ledger nodes it
-//! finds in the registry over gRPC.
+//! calls its ledger in-process. A compute-only node reaches the ledger nodes at
+//! its configured URLs over gRPC.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,12 +14,14 @@ use std::time::Duration;
 use anyhow::Result;
 use serde::Deserialize;
 
+use enroute_compute::LedgerUrls;
 use enroute_compute::{Compute, ComputeConfig, HostHooks, RemoteLedger, Storage};
 use enroute_ledger::consensus::Engine;
 use enroute_ledger::{Ledger, LedgerConfig};
-use enroute_shared::registry::Registry;
+use enroute_shared::auth::Bearer;
 use enroute_shared::roles::LedgerRef;
 pub use enroute_shared::store::Store;
+use enroute_shared::store::{IoClass, IoConfig, IoLimiter};
 
 /// What a node runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Deserialize)]
@@ -30,11 +32,22 @@ pub enum Role {
     Both,
     /// The replicated logs only, served on the internal listener alone.
     Ledger,
-    /// The git work only, with the ledger nodes found in the registry.
+    /// The git work only, with the ledger's members found in the object
+    /// store.
     Compute,
 }
 
 impl Role {
+    /// The role as a configuration names it.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Role::Both => "both",
+            Role::Ledger => "ledger",
+            Role::Compute => "compute",
+        }
+    }
+
     /// Whether the node runs the ledger.
     #[must_use]
     pub fn ledger(self) -> bool {
@@ -57,6 +70,8 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Where the objects live.
     pub store: Store,
+    /// The node's store request slots, and each IO class's share of them.
+    pub io: IoConfig,
     /// The decoded object and entry caches, in bytes.
     pub cache_bytes: usize,
     /// The buffer pool for layer pages, in bytes.
@@ -88,6 +103,7 @@ impl Config {
             role: Role::default(),
             data_dir,
             store,
+            io: IoConfig::default(),
             cache_bytes: 512 << 20,
             page_cache_bytes: 256 << 20,
             cpu_threads: 0,
@@ -105,6 +121,7 @@ pub struct Node {
     pub role: Role,
     ledger: Option<Arc<Ledger>>,
     compute: Option<Arc<Compute>>,
+    io: Arc<IoLimiter>,
 }
 
 impl std::fmt::Debug for Node {
@@ -120,32 +137,35 @@ impl Node {
     ///
     /// # Errors
     ///
-    /// Returns an error if the object store, the local stores or the registry
-    /// cannot be opened.
+    /// Returns an error if the object store or the local stores cannot be
+    /// opened, or the ledger cannot start.
     pub async fn start(config: Config, hooks: HostHooks) -> Result<Arc<Node>> {
         let role = config.role;
-        let objects = config.store.objects();
+        let io = IoLimiter::new(config.io)?;
+        let objects = config.store.objects_in(&io, None);
+        enroute_shared::format::check(&objects, role.ledger()).await?;
         let ledger = if role.ledger() {
-            let ledger = Ledger::open(&config.data_dir, config.ledger.clone(), objects.clone());
+            let ledger = Ledger::open(
+                &config.data_dir,
+                config.ledger.clone(),
+                // Trash markers: what deletions wait on.
+                config.store.objects_in(&io, Some(IoClass::Commit)),
+            );
             Some(ledger.await?)
         } else {
             None
         };
         let compute = if role.compute() {
-            let api: LedgerRef = match &ledger {
-                // Its own ledger first, which may not host a repository yet.
-                Some(l) => match &l.registry {
-                    Some(registry) => Arc::new(RemoteLedger::new(
-                        registry.clone(),
-                        Some((l.engine.id, l.clone())),
-                    )),
-                    None => l.clone(),
-                },
-                // It does not join the registry: nobody dials a compute node.
-                None => Arc::new(RemoteLedger::new(
-                    Registry::watch(objects.clone()).await?,
-                    None,
-                )),
+            // Its own ledger first, which may not host a repository yet; its
+            // peers with the ledger's own token. A compute-only node does not
+            // register (nobody dials it), but joins the ledger for a token
+            // (see `enroute_compute::join`).
+            let api: LedgerRef = if let Some(l) = &ledger {
+                with_peers(l, config.ledger.advertise.clone())
+            } else {
+                let urls = enroute_compute::members(objects.clone());
+                let token = enroute_compute::join(urls.clone(), objects.clone());
+                Arc::new(RemoteLedger::new(urls, None, Bearer::new(token)))
             };
             enroute_compute::init_cpu_pool(config.cpu_threads);
             let storage = Arc::new(Storage::new(
@@ -162,6 +182,7 @@ impl Node {
                 storage,
                 config.cache_bytes,
                 api,
+                enroute_compute::compute_id(&config.data_dir)?,
             ))
         } else {
             None
@@ -170,6 +191,7 @@ impl Node {
             role,
             ledger,
             compute,
+            io,
         }))
     }
 
@@ -217,27 +239,42 @@ impl Node {
     }
 
     /// `GET /status`, `GET /status/repos/<repo>`, and on a ledger node the
-    /// `Raft` and `Ledger` gRPC services.
+    /// `Peer`, `Ledger`, `Membership` and `Cluster` gRPC services.
     ///
     /// Only other nodes and operators use them, so keep them inside the cluster.
     pub(crate) fn internal_router(&self) -> axum::Router {
-        let (ledger, compute) = (self.ledger.clone(), self.compute.clone());
+        let (ledger, compute, io) = (self.ledger.clone(), self.compute.clone(), self.io.clone());
         let repo_ledger = ledger.clone();
         let status = move || async move {
             let mut s = compute.map_or_else(|| serde_json::json!({}), |f| f.status());
             if let Some(fields) = s.as_object_mut() {
                 let consensus = ledger.as_ref().map(|l| l.engine.status());
                 fields.insert("consensus".into(), serde_json::json!(consensus));
+                fields.insert("store_io".into(), io.status());
             }
             axum::Json(s)
         };
         let router = match &self.ledger {
-            Some(l) => tonic::service::Routes::new(l.engine.raft_server())
-                .add_service(
-                    enroute_shared::proto::ledger_server::LedgerServer::from_arc(l.clone())
-                        .max_decoding_message_size(enroute_shared::proto::MAX_MESSAGE),
-                )
-                .into_axum_router(),
+            Some(l) => {
+                use enroute_shared::proto::ledger_server::LedgerServer;
+                use enroute_shared::proto::membership_server::MembershipServer;
+                let auth = l.clone();
+                tonic::service::Routes::new(l.engine.peer_server())
+                    .add_service(
+                        LedgerServer::from_arc(l.clone())
+                            .max_decoding_message_size(enroute_shared::proto::MAX_MESSAGE),
+                    )
+                    .add_service(MembershipServer::from_arc(l.clone()))
+                    .add_service(enroute_ledger::cluster::server(
+                        l.engine.clone(),
+                        l.objects.clone(),
+                    ))
+                    .into_axum_router()
+                    .layer(axum::middleware::from_fn(move |req, next| {
+                        authenticate(auth.clone(), req, next)
+                    }))
+                    .layer(axum::middleware::from_fn(join_trace))
+            }
             None => axum::Router::new(),
         };
         let repo_status = move |axum::extract::Path(repo): axum::extract::Path<String>| async move {
@@ -271,4 +308,96 @@ impl Node {
             drop(tokio::time::timeout(Duration::from_secs(10), engine.stopped()).await);
         }
     }
+}
+
+/// The ledger API of a node that runs both roles, advertised as `me`.
+///
+/// Its own ledger first, then the live members, with the ledger's own
+/// token. Just its own ledger when it does not replicate.
+fn with_peers(ledger: &Arc<Ledger>, me: Option<String>) -> LedgerRef {
+    let (Some(token), Some(me)) = (ledger.token(), me) else {
+        return ledger.clone();
+    };
+    let engine = Arc::downgrade(&ledger.engine);
+    let peers: LedgerUrls = Arc::new(move || {
+        let Some(engine) = engine.upgrade() else {
+            return Arc::default();
+        };
+        let alive = engine.alive();
+        let mut urls: Vec<String> = (engine.peers().into_iter())
+            .filter(|p| alive.contains(&p.id))
+            .map(|p| p.url)
+            .collect();
+        urls.sort_unstable();
+        urls.dedup();
+        urls.into()
+    });
+    Arc::new(RemoteLedger::new(
+        peers,
+        Some((me, ledger.clone())),
+        Bearer::new(token),
+    ))
+}
+
+/// Serve a gRPC call that carries a trace context in a span of that trace,
+/// so that the ledger's spans of a push are in the compute's trace.
+///
+/// Calls without one, such as `Peer` calls, get no span: they would be traces of
+/// their own, one per message.
+async fn join_trace(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use tracing::Instrument as _;
+    if !enroute_shared::trace_context::carried(req.headers()) {
+        return next.run(req).await;
+    }
+    let span = tracing::info_span!("enroute::grpc::server", rpc.path = req.uri().path());
+    enroute_shared::trace_context::adopt(&span, req.headers());
+    next.run(req).instrument(span).await
+}
+
+/// Let a gRPC call to the ledger through only with a token that `ledger`
+/// accepts (an `authorization: Bearer` header).
+///
+/// `Membership` calls, which earn tokens, need none; `Ledger` calls take
+/// any; every other service (`Peer`) needs a ledger node's own.
+async fn authenticate(
+    ledger: Arc<Ledger>,
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    use enroute_shared::proto::{ledger_server, membership_server};
+    let service = req.uri().path().split('/').nth(1).unwrap_or_default();
+    // Joining and listing the members act on what the object store says;
+    // removing one takes a ledger node's own token (`members --remove`).
+    let open_cluster = service == enroute_ledger::cluster::SERVICE_NAME
+        && req.uri().path().rsplit('/').next() != Some("Remove");
+    if service == membership_server::SERVICE_NAME || open_cluster {
+        return next.run(req).await;
+    }
+    let ledger_only = service != ledger_server::SERVICE_NAME;
+    let token = req
+        .headers()
+        .get(http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    let refused = match token {
+        None => "no token: join the ledger first (the Membership service)".to_string(),
+        Some(t) => match ledger.authenticate(t) {
+            // A token a node earned by joining reaches the Ledger service alone.
+            Ok(claims) if ledger_only && !claims.is_ledger() => {
+                "this service needs a ledger node's own token".to_string()
+            }
+            Ok(claims) => {
+                req.extensions_mut().insert(claims);
+                return next.run(req).await;
+            }
+            Err(e) => e.to_string(),
+        },
+    };
+    tonic::Status::unauthenticated(refused)
+        .into_http::<axum::body::Body>()
+        .into_response()
 }

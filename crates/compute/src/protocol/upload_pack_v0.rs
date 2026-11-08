@@ -18,7 +18,7 @@ use anyhow::{Result, bail};
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
-use crate::git::oid::Oid;
+use crate::git::oid::{ObjectFormat, Oid};
 use crate::query::RefView;
 use crate::repo::serve::{FetchArgs, plan};
 use crate::repo::view::Snapshot;
@@ -34,7 +34,7 @@ pub(crate) const CAPABILITIES: &str = "multi_ack_detailed side-band-64k thin-pac
 
 /// The ref advertisement of `view`, peeled.
 pub(crate) fn advertisement(view: &RefView<'_>) -> Vec<u8> {
-    let mut caps = format!("{CAPABILITIES} object-format=sha1 agent={AGENT}");
+    let mut caps = format!("{CAPABILITIES} object-format={} agent={AGENT}", view.format);
     let mut lines: Vec<(Oid, String)> = Vec::new();
     if let Some((branch, Some(oid))) = view.head {
         caps = format!("{caps} symref=HEAD:{branch}");
@@ -46,7 +46,7 @@ pub(crate) fn advertisement(view: &RefView<'_>) -> Vec<u8> {
             lines.push((*p, format!("{name}^{{}}")));
         }
     }
-    super::advertise_refs("git-upload-pack", &lines, &caps)
+    super::advertise_refs("git-upload-pack", view.format, &lines, &caps)
 }
 
 /// How far a request got.
@@ -83,8 +83,20 @@ fn take_want_caps<'a>(v: &'a str, caps: &mut Vec<String>) -> &'a str {
     oid
 }
 
-/// Parse one stateless-RPC upload-pack request.
-pub(crate) fn parse(body: &[u8]) -> Result<Request> {
+/// Refuse a client whose first want's capabilities, `caps`, name another
+/// object format than the repository's, `server`. Git's v0 client names
+/// none (it checks the advertisement itself), and its wants are then
+/// parsed as the repository's ids.
+fn check_format(server: ObjectFormat, caps: &[String]) -> Result<()> {
+    if let Some(client) = super::named_format(caps.iter().map(String::as_str))? {
+        super::same_format(server, client)?;
+    }
+    Ok(())
+}
+
+/// Parse one stateless-RPC upload-pack request to a `format` repository.
+/// A client that names another format with `object-format` is refused.
+pub(crate) fn parse(format: ObjectFormat, body: &[u8]) -> Result<Request> {
     let mut r = Reader::new(body);
     let mut args = FetchArgs::default();
     let mut caps: Vec<String> = Vec::new();
@@ -106,8 +118,9 @@ pub(crate) fn parse(body: &[u8]) -> Result<Request> {
                 // The first want carries the capabilities.
                 if k == "want" {
                     v = take_want_caps(v, &mut caps);
+                    check_format(format, &caps)?;
                 }
-                if fetch_line(&mut args, k, v)? {
+                if fetch_line(format, &mut args, k, v)? {
                     negotiation |= k == "have";
                 } else if k == "done" {
                     negotiation = true;
@@ -117,7 +130,6 @@ pub(crate) fn parse(body: &[u8]) -> Result<Request> {
         }
     }
     let has = |c: &str| caps.iter().any(|x| x == c);
-    args.thin_pack = has("thin-pack");
     args.ofs_delta = has("ofs-delta");
     args.include_tag = has("include-tag");
     args.deepen_relative = has("deepen-relative");

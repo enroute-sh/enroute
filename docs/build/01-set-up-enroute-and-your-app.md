@@ -81,14 +81,19 @@ Add each hook to `enabled` when your app answers it. See
 
 ## Get the contract
 
-Copy the proto files out of the Enroute checkout that you installed from, so
-that your code builds against the contract that `enroute` serves:
+Copy the proto files of the release that you run, so that your code builds
+against the contract that `enroute` serves. `enroute --version` prints the
+release. Each release is a tag of the source repository on GitHub, so take
+the files from its archive. For release `0.4.0`:
 
 ```sh
-mkdir -p proto && cp -R <enroute checkout>/proto/enroute proto/
+curl -fsSL https://github.com/enroute-sh/enroute/archive/refs/tags/v0.4.0.tar.gz | tar -xz
+mkdir -p proto && cp -R enroute-0.4.0/proto/enroute proto/
+rm -rf enroute-0.4.0
 ```
 
-The image carries the same files at `/usr/share/enroute/proto`.
+The image carries the same files at `/usr/share/enroute/proto`. If you built
+`enroute` from a checkout, copy `proto/enroute` from it.
 
 Commit the copy. Do not add the Enroute repository as a build dependency:
 `v1alpha1` can change before `1.0.0`, and a contract that moves under your

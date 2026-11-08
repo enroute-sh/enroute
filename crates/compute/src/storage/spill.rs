@@ -869,7 +869,7 @@ impl OidIndex {
 
 /// The leading `bits` bits of `oid`.
 fn prefix(oid: &Oid, bits: u32) -> usize {
-    let [a, b, c, d, ..] = oid.0;
+    let [a, b, c, d, ..] = *oid.prefix();
     to_usize((u32::from_be_bytes([a, b, c, d]) >> (32 - bits)).into())
 }
 
@@ -960,7 +960,7 @@ mod tests {
                     x ^= x << 17;
                     chunk.copy_from_slice(&x.to_le_bytes()[..chunk.len()]);
                 }
-                Oid(o)
+                Oid::sha1(o)
             })
             .collect();
         let mut items: Vec<(Oid, u32)> = oids

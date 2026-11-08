@@ -17,6 +17,83 @@ Any store supported by `bucket` can store the file. See
 [Configuration keys](../reference/configuration-keys.md) for the complete
 schema and `dev/enroute.example.toml` for an annotated example.
 
+## A production configuration
+
+A replicated deployment has two kinds of node, and each kind has its own
+file. The ledger nodes share one file except for `advertise_url`. The compute
+nodes share one file.
+
+A compute node serves Git and the API to your application, so it holds the
+`[hooks]`, `[listen]`, and `[git]` tables:
+
+```toml
+# A compute node: serves Git and the API, and keeps only caches.
+[bucket]
+uri = "s3://enroute-objects/prod?region=eu-central-1"
+
+[node]
+role = "compute"
+data_dir = "/var/lib/enroute"
+internal_listen = "0.0.0.0:7400"
+
+[listen]
+git = "0.0.0.0:8080"         # Public, behind your TLS terminator.
+api = "10.0.1.15:50051"      # A private address that only your application reaches.
+
+[hooks]
+enabled = ["authorize", "visible_refs", "pre_receive", "post_receive"]
+endpoint_url = "https://app.example.com/api/enroute/hooks"
+signing_key = "${ENROUTE_HOOK_SIGNING_KEY}"
+
+[git]
+create_on_push = false       # Create repositories only with CreateRepository.
+
+[telemetry]
+endpoint = "https://otlp.example.com/v1/traces"
+sample_ratio = 0.1
+
+[telemetry.headers]
+authorization = "Bearer ${OTEL_TOKEN}"
+```
+
+A ledger node serves only `internal_listen`, so it needs no `[hooks]`,
+`[listen]`, or `[git]`:
+
+```toml
+# A ledger node: holds the replicated logs on a durable disk.
+[bucket]
+uri = "s3://enroute-objects/prod?region=eu-central-1"
+
+[node]
+role = "ledger"
+data_dir = "/var/lib/enroute"            # On a durable disk with low sync latency.
+internal_listen = "0.0.0.0:7400"
+advertise_url = "http://ledger-1.internal:7400"   # Different on each ledger node.
+
+[telemetry]
+endpoint = "https://otlp.example.com/v1/traces"
+sample_ratio = 0.1
+
+[telemetry.headers]
+authorization = "Bearer ${OTEL_TOKEN}"
+```
+
+Both files leave out `[bucket.credentials]`, so the nodes use the instance's
+workload identity. Give each role its own object store permissions; see
+[Security](security.md#object-store-permissions-by-role). For the other
+deployment models, see [Deployment profiles](deployment-profiles.md).
+
+| Table | Compute node | Ledger node | Purpose |
+| --- | --- | --- | --- |
+| `[bucket]` | Yes | Yes | The object store. Every node of a deployment uses the same one |
+| `[node]` | Yes | Yes | The role, the data directory, the internal listener, and cache sizes |
+| `[listen]` | Yes | No | The Git and API listeners |
+| `[hooks]` | Yes | No | Your application's hook endpoint |
+| `[git]` | Yes | No | Repository creation, object format, object size, and remotes |
+| `[telemetry]` | Optional | Optional | Where traces go. See [Observability](observability.md) |
+| `[layers]`, `[store_io]` | Optional | Optional | Engine tuning for layers and object store requests |
+| `[ledger]` | No | Optional | Engine tuning for the ledger, and `allow_sha256` |
+
 ## Secrets
 
 String values can reference an environment variable:
@@ -81,5 +158,5 @@ Other nodes dial `advertise_url`, which must reach `internal_listen`. Without
 ## Engine tuning
 
 The `[layers]` and `[ledger]` tables tune how the engine writes, merges,
-deletes, and checkpoints data. Every key is optional. A key that you leave out
+and deletes data. Every key is optional. A key that you leave out
 takes the engine's own default. Change these only to fix a measured problem.

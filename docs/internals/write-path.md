@@ -4,6 +4,29 @@ This page describes how a push becomes durable state: ingest, validation, delta
 encoding, and the log entry that commits the result. It also covers server-side
 commits and the two-entry form of a push when the host installs hooks.
 
+**The key idea.** The expensive work of a push (indexing, checking, and delta
+encoding) runs in parallel and without locks, also for pushes to the same
+repository. Only the last step is serialized: one log entry that adds the new
+layer and moves the refs with a compare-and-swap. A small layer travels inside
+that entry, so the push waits for the ledger disks and never for the object
+store.
+
+```text
+compute node                          ledger (3 replicas)        object store
+------------                          -------------------        ------------
+spool the pack to disk
+index, check, delta-encode (parallel)
+build the layer
+  layer > 1 MiB? ------------------------------------------------> upload
+propose: add layer, CAS refs -------> sequencer appends
+                                      majority syncs to disk
+<------------------------------------ committed
+report to the client
+...later, as maintainer:
+merge the inline run, upload ------------------------------------> PUT
+swap the run for the file ----------> manifest CAS
+```
+
 ## Push
 
 1. Spool the request body to local disk, gunzipping if needed.
@@ -65,10 +88,12 @@ a few bytes per object and per commit.
 
 **Every ref points into indexed storage.** There are no staged packs.
 
-Object ids use SHA-1 with collision detection, so content addressing
-stays sound against known SHA-1 collision attacks. Enroute rejects objects that
-carry such an attack, as Git does. Pack trailers are integrity checksums, not
-addresses, so they use plain SHA-1.
+Object ids use the repository's format. SHA-1 ids hash with collision
+detection, so content addressing stays sound against known SHA-1 collision
+attacks: Enroute rejects objects that carry such an attack, as Git does. Pack
+trailers are integrity checksums, not addresses, so they use plain SHA-1, or
+SHA-256 in a SHA-256 repository. Every layer holds ids of one format, which
+its footer names; the layout is the same for both, with 20- or 32-byte ids.
 
 ## Durability without waiting for S3
 
@@ -98,19 +123,20 @@ there is no third:
   proposed.
 
 **Local copies** are never the durable copy. The node writes them without fsync.
-They are evictable, and the node checks them chunk by chunk when it finds them
-on disk at startup. A damaged chunk is fetched again from the object store.
+They are evictable, and the node deletes them at startup: local disk does
+not outlive the process ([Local disk is a
+cache](read-path.md#local-disk-is-a-cache)).
 Inline layers have no local copy: the node serves them from their bytes in the
 log. With a `file://` store on the same filesystem, a local copy is a hard link
 to the stored file ([Linked local copies](storage.md#linked-local-copies)).
 
 ### Merge before upload
 
-Inline layers are not uploaded one by one. The maintainer of the repository (the
-compute node that holds its lease) takes each contiguous run of inline layers
-when either condition holds:
+Inline layers are not uploaded one by one. The maintainer of the repository
+([Maintainers](ledger-and-compute.md#maintainers)) takes each contiguous run of
+inline layers when either condition holds:
 
-- its oldest layer is `layers.flush_interval` old (default 1 s);
+- its oldest layer is `layers.flush_interval` old (default 30 s);
 - the run reaches 32 MiB or `layers.flush_max_layers` (default 256).
 
 It merges the run, uploads the result once, and swaps the run for it with a
@@ -133,8 +159,7 @@ push.
 A repository holds at most `layers.max_inline` (64 MiB) of inline layers. Beyond
 that, the node uploads new layers first. This bounds the replicated state while
 the object store is slow or down. Inline layers are part of that state
-(snapshots, checkpoints), and their entries stay in the log until they are
-flushed.
+(snapshots), and their entries stay in the log until they are flushed.
 
 ### Deletes never race with references
 
@@ -150,10 +175,8 @@ sweep.
 
 Until it is flushed, an inline layer is as durable as the log: it is on the
 disks of a majority of nodes. This is the guarantee that Neon's safekeepers
-give. Checkpoints of the state, inline layers included, reach the object store
-within a minute of a change, and sooner once the log goes quiet
-([Checkpoints](ledger-and-compute.md#checkpoints)). If a majority of the voters
-lose their logs, an operator recovers by hand from the last one.
+give. If a majority of the replicas lose their logs, an operator restores the
+ledger from volume snapshots ([Recovery](ledger-and-compute.md#recovery)).
 
 ## Server-side writes
 

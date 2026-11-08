@@ -19,7 +19,7 @@
 
 include!(concat!(env!("OUT_DIR"), "/enroute.internal.v1.rs"));
 
-/// The largest message the protocol carries: proposals and Raft batches
+/// The largest message the protocol carries: proposals and `Peer` batches
 /// carry inline layers (up to 1 MiB each, more when merged), far above
 /// gRPC's default 4 MiB limit.
 pub const MAX_MESSAGE: usize = 512 << 20;

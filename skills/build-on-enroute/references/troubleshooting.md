@@ -35,9 +35,10 @@ this deployment, or it was created in another one. Keys are unique across a
 deployment and mean nothing outside it. `ListRepositories` shows what is
 actually here.
 
-**`INVALID_ARGUMENT` on a key.** A key is 1 to 256 bytes of ASCII letters,
-digits, `-`, `_`, and `.`, starting and ending with a letter or digit. A `/`
-is refused. See `contract.md`.
+**`INVALID_ARGUMENT` on a key.** A key is at most 256 bytes of segments
+joined by `/`, such as `acme/widgets`. A segment is ASCII letters, digits, `-`,
+`_`, and `.`, and starts and ends with a letter or digit. An empty segment is
+refused: a leading, trailing, or doubled `/`. See `contract.md`.
 
 **The client cannot connect.** The contract is plain HTTP/2, with no TLS. Use
 the "insecure" or "plaintext" credentials the library offers. A TLS client

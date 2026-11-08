@@ -18,10 +18,12 @@ use crate::git::oid::Oid;
 
 use super::repo_key::RepoKey;
 
-/// Object ids cross the contract as hex.
+/// Object ids cross the contract as hex: 40 digits in a SHA-1 repository,
+/// 64 in a SHA-256 one. An id of the other format names nothing there, and
+/// the ledger refuses it as a ref's value.
 ///
-/// A malformed or non-SHA-1 id is the caller's own string, not a repository
-/// fault, so it comes back as `InvalidArgument`.
+/// A malformed id is the caller's own string, not a repository fault, so it
+/// comes back as `InvalidArgument`.
 pub(crate) fn parse_oid(id: &WireObjectId) -> Result<Oid, Status> {
     parse_hex(&id.hex, "an object id")
 }
@@ -29,9 +31,7 @@ pub(crate) fn parse_oid(id: &WireObjectId) -> Result<Oid, Status> {
 /// An object id spelled as a bare string, which the page token is.
 pub(crate) fn parse_hex(hex: &str, what: &str) -> Result<Oid, Status> {
     // Exact, because `Oid::from_hex` forgives surrounding whitespace.
-    let sha1 = hex.len() == 40 && hex.bytes().all(|b| b.is_ascii_hexdigit());
-    sha1.then(|| Oid::from_hex(hex).ok())
-        .flatten()
+    Oid::from_hex_exact(hex.as_bytes())
         .ok_or_else(|| Status::invalid_argument(format!("not {what}: {hex}")))
 }
 
@@ -99,20 +99,27 @@ pub(crate) fn wire_system_time(at: Option<SystemTime>) -> Option<prost_types::Ti
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::oid::ObjectFormat;
 
     fn wire(hex: &str) -> WireObjectId {
         WireObjectId { hex: hex.into() }
     }
 
     #[test]
-    fn an_id_is_forty_hex_digits_and_nothing_else() {
+    fn an_id_is_forty_or_sixty_four_hex_digits_and_nothing_else() {
         let hex = "9f2c1b7e4a8d3c5f6b0e2a1d4c7f8b3e5a6d9c0f";
         assert_eq!(parse_oid(&wire(hex)).unwrap().to_hex(), hex);
         assert_eq!(parse_oid(&wire(&hex.to_uppercase())).unwrap().to_hex(), hex);
+        let long = "a".repeat(64);
+        assert_eq!(
+            parse_oid(&wire(&long)).unwrap().format(),
+            ObjectFormat::Sha256
+        );
         for bad in [
             "",
             " 9f2c1b7e4a8d3c5f6b0e2a1d4c7f8b3e5a6d9c0",
-            &"a".repeat(64),
+            &"a".repeat(63),
+            &"a".repeat(41),
             "zz",
         ] {
             let refused = parse_oid(&wire(bad)).unwrap_err();

@@ -306,3 +306,30 @@ fn clear_state_drops_stored_and_round_writes() {
     };
     s.export(1, inline).unwrap();
 }
+
+/// The oldest pin follows the rounds that pin and drop inline layers, and
+/// a reopened store still knows it (and no other log's).
+#[test]
+fn the_oldest_pin_is_kept_across_a_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let s = open(dir.path());
+        create(&s, 7);
+        create(&s, 8);
+        let mut r = s.round();
+        r.pin_inline(7, 9, b"b");
+        r.pin_inline(7, 5, b"a");
+        r.commit().unwrap();
+        assert_eq!(s.oldest_pin(7).unwrap(), Some(5));
+        assert_eq!(s.oldest_pin(8).unwrap(), None);
+        s.persist().unwrap();
+    }
+    let s = open(dir.path());
+    assert_eq!(s.oldest_pin(7).unwrap(), Some(5));
+    let mut r = s.round();
+    r.drop_inline(7, 5, b"a");
+    r.commit().unwrap();
+    assert_eq!(s.oldest_pin(7).unwrap(), Some(9));
+    s.delete(7).unwrap();
+    assert_eq!(s.oldest_pin(7).unwrap(), None);
+}

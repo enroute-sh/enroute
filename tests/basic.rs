@@ -112,9 +112,18 @@ async fn rejects_stale_push() {
 
 /// A raw receive-pack request of `commands` (`old new name`), with no pack.
 async fn receive_pack(server: &Server, repo: &str, commands: &[String]) -> String {
+    receive_pack_with(server, repo, "report-status", commands).await
+}
+
+/// [`receive_pack`] with the capabilities `caps`.
+async fn receive_pack_with(server: &Server, repo: &str, caps: &str, commands: &[String]) -> String {
     let mut body = Vec::new();
     for (i, c) in commands.iter().enumerate() {
-        let caps = if i == 0 { "\0report-status" } else { "" };
+        let caps = if i == 0 {
+            format!("\0{caps}")
+        } else {
+            String::new()
+        };
         pktline::line(&mut body, &format!("{c}{caps}\n"));
     }
     pktline::flush(&mut body);
@@ -128,6 +137,60 @@ async fn receive_pack(server: &Server, repo: &str, commands: &[String]) -> Strin
         .text()
         .await
         .unwrap()
+}
+
+/// As git: a push may update a ref once, but deletes land first, so it may
+/// delete a ref and create it again, unless the push is atomic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_push_updates_each_ref_once() {
+    let server = Server::start().await;
+    let git = Git::new();
+    let url = server.repo_url("r");
+    let src = git.init("src").await;
+    let one = git.commit_file(&src, "f", "1\n", "1").await;
+    git.run(&src, &["push", "-q", &url, "main"]).await;
+    let two = git.commit_file(&src, "f", "2\n", "2").await;
+    git.run(&src, &["push", "-q", &url, "main:side"]).await;
+    let main = async || {
+        let out = git.run(&src, &["ls-remote", &url, "refs/heads/main"]).await;
+        out.split('\t').next().unwrap_or_default().to_string()
+    };
+    let zero = "0".repeat(40);
+    let report = receive_pack(
+        &server,
+        "r",
+        &[
+            format!("{one} {two} refs/heads/main"),
+            format!("{one} {two} refs/heads/main"),
+            format!("{zero} {two} refs/heads/other"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        report
+            .matches("ng refs/heads/main multiple updates")
+            .count(),
+        2,
+        "{report}"
+    );
+    assert!(report.contains("ok refs/heads/other"), "{report}");
+    assert_eq!(main().await, one);
+
+    // Not `main`: deleting the branch `HEAD` names is refused outright.
+    let side = async || {
+        let out = git.run(&src, &["ls-remote", &url, "refs/heads/side"]).await;
+        out.split('\t').next().unwrap_or_default().to_string()
+    };
+    let recreate = [
+        format!("{two} {zero} refs/heads/side"),
+        format!("{zero} {one} refs/heads/side"),
+    ];
+    let report = receive_pack_with(&server, "r", "report-status atomic", &recreate).await;
+    assert_eq!(report.matches("ng refs/heads/side").count(), 2, "{report}");
+    assert_eq!(side().await, two);
+    let report = receive_pack(&server, "r", &recreate).await;
+    assert_eq!(report.matches("ok refs/heads/side").count(), 2, "{report}");
+    assert_eq!(side().await, one);
 }
 
 /// A push takes the ref names the API takes, so the API can update and

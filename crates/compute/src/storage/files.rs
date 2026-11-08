@@ -456,15 +456,16 @@ mod tests {
     #[tokio::test]
     async fn a_gzip_body_inflates_into_the_spool() {
         use crate::git::io::ReadAt as _;
-        use std::io::Write as _;
 
         let dir = tempfile::tempdir().unwrap();
         let pool = BufferPool::new(1 << 20);
         for (size, in_memory) in [(1000, true), (3 << 20, false)] {
             let data: Vec<u8> = (0..size).map(|i| u8::try_from(i % 7).unwrap()).collect();
-            let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-            gz.write_all(&data).unwrap();
-            let gz = Bytes::from(gz.finish().unwrap());
+            let gz = Bytes::from(sirocco::compress(
+                sirocco::Format::Gzip,
+                sirocco::deflate::Level::FASTEST,
+                &data,
+            ));
             let body = futures::stream::iter(
                 gz.chunks(4096)
                     .map(|chunk| Ok::<_, std::io::Error>(gz.slice_ref(chunk)))

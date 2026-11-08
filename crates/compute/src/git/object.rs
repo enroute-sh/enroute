@@ -1,10 +1,11 @@
 //! The git object formats Enroute reads and writes: commits, trees and tag
 //! targets, over gix-object.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use gix_object::WriteTo as _;
 
-use super::oid::{Kind, OID_LEN, Oid};
+use super::fsck::{self, TreeCheck};
+use super::oid::{Kind, ObjectFormat, Oid};
 
 /// A commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,7 +34,7 @@ pub(crate) struct Signature<'a> {
 /// The largest time zone offset git writes, `±9959`, in seconds.
 const MAX_OFFSET_SECONDS: u32 = 99 * 3600 + 59 * 60;
 
-impl Signature<'_> {
+impl<'a> Signature<'a> {
     /// What keeps git from reading the signature back as [`write_commit`]
     /// writes it, if anything does.
     pub(crate) fn unwritable(&self) -> Option<&'static str> {
@@ -54,52 +55,95 @@ impl Signature<'_> {
             None
         }
     }
+
+    /// Read a person line as git's `split_ident_line` does: the name ends
+    /// at `<` with its trailing spaces dropped, the email ends at the next
+    /// `>`, and the date and time zone, after the last `>`, read as zero
+    /// when missing.
+    fn parse(line: &'a [u8]) -> Option<Self> {
+        let open = line.iter().position(|&b| b == b'<')?;
+        let name = line.get(..open)?.trim_ascii_end();
+        let rest = line.get(open + 1..)?;
+        let email = rest.get(..rest.iter().position(|&b| b == b'>')?)?;
+        let last = line.iter().rposition(|&b| b == b'>')?;
+        let when = line.get(last + 1..)?.trim_ascii_start();
+        let (date, rest) = digits(when);
+        let offset = match rest.trim_ascii_start().split_first() {
+            Some((&sign @ (b'+' | b'-'), tz)) => digits(tz).0.and_then(|hhmm| {
+                let seconds = (hhmm / 100).checked_mul(3600)? + hhmm % 100 * 60;
+                let offset = i32::try_from(seconds).ok()?;
+                Some(if sign == b'-' { -offset } else { offset })
+            }),
+            _ => None,
+        };
+        let (seconds, offset_seconds) = date.zip(offset).unwrap_or_default();
+        Some(Signature {
+            name,
+            email,
+            seconds,
+            offset_seconds,
+        })
+    }
 }
 
-/// Parse a commit: the headers start with `tree`, the `parent`s, `author`
-/// and `committer`, in the order `git fsck` checks.
+/// Read a commit as git does: `tree` and the `parent`s start its headers,
+/// and the first `author` and `committer` lines name its people. With no
+/// blank line after the headers the message is empty.
+///
+/// Pushed commits pass [`fsck::commit`] first; this also reads what that
+/// would refuse.
 ///
 /// # Errors
 ///
-/// A header is missing or out of order, a signature does not parse, or no
-/// blank line ends the headers.
+/// The tree is missing or a person line does not name anyone.
 pub(crate) fn parse_commit(data: &[u8]) -> Result<Commit<'_>> {
-    use gix_object::commit::ref_iter::Token;
-
-    let (mut tree, mut parents, mut author, mut committer) = (None, Vec::new(), None, None);
-    // The iterator, not `CommitRef`, which also collects every extra header.
-    for token in gix_object::CommitRefIter::from_bytes(data, HASH) {
-        match token? {
-            Token::Tree { id } => tree = Some(oid(&id)),
-            Token::Parent { id } => parents.push(oid(&id)),
-            Token::Author { signature } => author = Some(signature.into()),
-            Token::Committer { signature } => committer = Some(signature.into()),
-            Token::Message(message) => {
-                return Ok(Commit {
-                    tree: tree.context("commit without a tree")?,
-                    parents,
-                    author: author.context("commit without an author")?,
-                    committer: committer.context("commit without a committer")?,
-                    message,
-                });
-            }
-            Token::Encoding(_) | Token::ExtraHeader(_) => {}
+    let (headers, message) = match data.windows(2).position(|w| w == b"\n\n") {
+        Some(i) => (
+            data.get(..=i).unwrap_or_default(),
+            data.get(i + 2..).unwrap_or_default(),
+        ),
+        None => (data, &[][..]),
+    };
+    let mut lines = headers.split(|&b| b == b'\n').peekable();
+    let tree = lines
+        .next()
+        .and_then(|l| l.strip_prefix(b"tree "))
+        .and_then(Oid::from_hex_exact)
+        .context("commit without a tree")?;
+    let mut parents = Vec::new();
+    while let Some(p) = lines.peek().and_then(|l| l.strip_prefix(b"parent ")) {
+        parents.push(Oid::from_hex_exact(p).context("commit with a bad parent")?);
+        lines.next();
+    }
+    let (mut author, mut committer) = (None, None);
+    for line in lines {
+        if let Some(who) = line.strip_prefix(b"author ") {
+            author = author.or(Some(who));
+        } else if let Some(who) = line.strip_prefix(b"committer ") {
+            committer = committer.or(Some(who));
         }
     }
-    bail!("commit without a message")
+    Ok(Commit {
+        tree,
+        parents,
+        author: author
+            .and_then(Signature::parse)
+            .context("commit without an author")?,
+        committer: committer
+            .and_then(Signature::parse)
+            .context("commit without a committer")?,
+        message,
+    })
 }
 
-impl<'a> From<gix_actor::SignatureRef<'a>> for Signature<'a> {
-    fn from(who: gix_actor::SignatureRef<'a>) -> Self {
-        let who = who.trim();
-        let time = who.time().unwrap_or_default();
-        Signature {
-            name: who.name,
-            email: who.email,
-            seconds: time.seconds,
-            offset_seconds: time.offset,
-        }
-    }
+/// The number `s` starts with, if it fits, and what follows its digits.
+fn digits(s: &[u8]) -> (Option<i64>, &[u8]) {
+    let n = s.iter().take_while(|b| b.is_ascii_digit()).count();
+    let (number, rest) = s.split_at(n);
+    let number = std::str::from_utf8(number)
+        .ok()
+        .and_then(|n| n.parse().ok());
+    (number, rest)
 }
 
 /// A commit as git writes it, with a final newline after the message.
@@ -156,6 +200,10 @@ impl EntryMode {
         self.0 & Self::TYPE_BITS == Self::TREE.0
     }
 
+    pub(crate) fn is_symlink(self) -> bool {
+        self.0 & Self::TYPE_BITS == Self::SYMLINK.0
+    }
+
     pub(crate) fn is_gitlink(self) -> bool {
         self.0 & Self::TYPE_BITS == Self::GITLINK.0
     }
@@ -185,14 +233,18 @@ impl TreeEntry<'_> {
     }
 }
 
-/// The entries of a tree, in the order it stores them.
-pub(crate) fn tree_entries(data: &[u8]) -> impl Iterator<Item = Result<TreeEntry<'_>>> {
-    gix_object::TreeRefIter::from_bytes(data, HASH).map(|entry| {
+/// The entries of a tree of a `format` repository, in the order it stores
+/// them.
+pub(crate) fn tree_entries(
+    format: ObjectFormat,
+    data: &[u8],
+) -> impl Iterator<Item = Result<TreeEntry<'_>>> {
+    gix_object::TreeRefIter::from_bytes(data, hash_kind(format)).map(move |entry| {
         let entry = entry?;
         Ok(TreeEntry {
             mode: EntryMode(u32::from(entry.mode.value())),
             name: entry.filename,
-            oid: oid(entry.oid),
+            oid: Oid::from_slice(format, entry.oid.as_bytes()),
         })
     })
 }
@@ -200,17 +252,25 @@ pub(crate) fn tree_entries(data: &[u8]) -> impl Iterator<Item = Result<TreeEntry
 /// The entries of a tree with the bytes each takes, in the order the tree
 /// stores them.
 pub(crate) fn tree_entries_at(
+    format: ObjectFormat,
     data: &[u8],
 ) -> impl Iterator<Item = Result<(TreeEntry<'_>, std::ops::Range<usize>)>> {
     let mut start = 0;
-    tree_entries(data).map(move |e| {
+    tree_entries(format, data).map(move |e| {
         let e = e?;
         // The name borrows from `data`; its id follows its NUL.
-        let end = e.name.as_ptr().addr() - data.as_ptr().addr() + e.name.len() + 1 + OID_LEN;
+        let end = e.name.as_ptr().addr() - data.as_ptr().addr() + e.name.len() + 1 + format.len();
         let at = start..end;
         start = end;
         Ok((e, at))
     })
+}
+
+/// The most entries a `len`-byte tree of a `format` repository can hold:
+/// the shortest entry is a five-digit mode, a space, a one-byte name, a NUL
+/// and an id.
+pub(crate) fn max_tree_entries(format: ObjectFormat, len: usize) -> usize {
+    len / (format.len() + 8)
 }
 
 /// The order of two tree entries in git's tree order.
@@ -246,57 +306,57 @@ pub(crate) fn write_tree<'a>(entries: impl IntoIterator<Item = TreeEntry<'a>>) -
     Ok(out)
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct TagInfo {
-    pub target: Oid,
-    pub target_kind: Kind,
+/// What a tag tags, read as git does from the `object` line that starts
+/// it. Pushed tags pass [`fsck::tag`] first.
+///
+/// # Errors
+///
+/// The tag does not start with an `object` line.
+pub(crate) fn tag_target(data: &[u8]) -> Result<Oid> {
+    data.split(|&b| b == b'\n')
+        .next()
+        .and_then(|l| l.strip_prefix(b"object "))
+        .and_then(Oid::from_hex_exact)
+        .context("tag without an object")
 }
 
-pub(crate) fn parse_tag(data: &[u8]) -> Result<TagInfo> {
-    let tag = gix_object::TagRef::from_bytes(data, HASH)?;
-    Ok(TagInfo {
-        target: oid(&tag.target()),
-        target_kind: match tag.target_kind {
-            gix_object::Kind::Commit => Kind::Commit,
-            gix_object::Kind::Tree => Kind::Tree,
-            gix_object::Kind::Blob => Kind::Blob,
-            gix_object::Kind::Tag => Kind::Tag,
-        },
-    })
-}
-
-/// Enroute's ids are SHA-1.
-const HASH: gix_hash::Kind = gix_hash::Kind::Sha1;
-
-fn oid(id: &gix_hash::oid) -> Oid {
-    Oid::from_slice(id.as_bytes())
+/// gix's name for `format`.
+fn hash_kind(format: ObjectFormat) -> gix_hash::Kind {
+    match format {
+        ObjectFormat::Sha1 => gix_hash::Kind::Sha1,
+        ObjectFormat::Sha256 => gix_hash::Kind::Sha256,
+    }
 }
 
 fn id(oid: Oid) -> gix_hash::ObjectId {
-    gix_hash::ObjectId::Sha1(*oid.as_bytes())
+    gix_hash::ObjectId::from_bytes_or_panic(oid.as_bytes())
 }
 
 /// Objects an object refers to (kind and id).
 pub(crate) type References = Vec<(Kind, Oid)>;
 
-/// Objects directly referenced by an object (fsck-lite + connectivity),
-/// and, for a commit, what it says.
-pub(crate) fn references(kind: Kind, data: &[u8]) -> Result<(References, Option<Commit<'_>>)> {
+/// Objects directly referenced by an object of a `format` repository, which
+/// must pass git's fsck checks, and, for a commit, what it says.
+pub(crate) fn references(
+    format: ObjectFormat,
+    kind: Kind,
+    data: &[u8],
+) -> Result<(References, Option<Commit<'_>>)> {
     Ok((
         match kind {
             Kind::Commit => {
+                fsck::commit(format, data)?;
                 let c = parse_commit(data)?;
                 let mut v = vec![(Kind::Tree, c.tree)];
                 v.extend(c.parents.iter().map(|&p| (Kind::Commit, p)));
                 return Ok((v, Some(c)));
             }
             Kind::Tree => {
-                let mut v = Vec::new();
-                for e in tree_entries(data) {
-                    let e = e?;
-                    if e.name.is_empty() || e.name.contains(&b'/') {
-                        bail!("invalid tree entry name");
-                    }
+                let mut v = Vec::with_capacity(max_tree_entries(format, data.len()));
+                let mut check = TreeCheck::default();
+                for e in tree_entries_at(format, data) {
+                    let (e, at) = e?;
+                    check.entry(&e, data.get(at.start) == Some(&b'0'))?;
                     if let Some(k) = e.kind() {
                         v.push((k, e.oid));
                     }
@@ -304,8 +364,8 @@ pub(crate) fn references(kind: Kind, data: &[u8]) -> Result<(References, Option<
                 v
             }
             Kind::Tag => {
-                let t = parse_tag(data)?;
-                vec![(t.target_kind, t.target)]
+                let (target, kind) = fsck::tag(format, data)?;
+                vec![(kind, target)]
             }
             Kind::Blob => Vec::new(),
         },
@@ -320,6 +380,50 @@ mod tests {
 
     const TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbe4904d";
     const PARENT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    #[test]
+    fn trees_are_checked_as_git_fsck_does() {
+        let tree = |entries: &[(&str, &str)]| {
+            let mut t = Vec::new();
+            for (mode, name) in entries {
+                t.extend_from_slice(format!("{mode} {name}\0").as_bytes());
+                t.extend_from_slice(&[7; 20]);
+            }
+            t
+        };
+        let refs = references(
+            ObjectFormat::Sha1,
+            Kind::Tree,
+            &tree(&[("100644", "a"), ("40000", "b")]),
+        )
+        .unwrap()
+        .0;
+        assert_eq!(refs.len(), 2);
+        for bad in [
+            tree(&[("0100644", "a")]),
+            tree(&[("100644", ".git")]),
+            tree(&[("100644", "b"), ("100644", "a")]),
+        ] {
+            references(ObjectFormat::Sha1, Kind::Tree, &bad).unwrap_err();
+        }
+    }
+
+    #[test]
+    fn sha256_trees_hold_32_byte_ids() {
+        let mut t = b"100644 a\0".to_vec();
+        t.extend_from_slice(&[7; 32]);
+        t.extend_from_slice(b"40000 b\0");
+        t.extend_from_slice(&[8; 32]);
+        let entries: Vec<_> = tree_entries(ObjectFormat::Sha256, &t)
+            .collect::<Result<_>>()
+            .unwrap();
+        let oids: Vec<_> = entries.iter().map(|e| e.oid).collect();
+        assert_eq!(oids, [Oid::sha256([7; 32]), Oid::sha256([8; 32])]);
+        let refs = references(ObjectFormat::Sha256, Kind::Tree, &t).unwrap().0;
+        assert_eq!(refs.len(), 2);
+        // Read as SHA-1, the same bytes are not a tree.
+        references(ObjectFormat::Sha1, Kind::Tree, &t).unwrap_err();
+    }
 
     #[test]
     fn a_commit_reads_back_as_written() {
@@ -344,24 +448,87 @@ mod tests {
     }
 
     #[test]
-    fn commit_headers_come_in_the_order_git_fsck_checks() {
+    fn pushed_commits_are_checked_as_git_fsck_does() {
         let author = "author A <a> 1 +0000\n";
         let committer = "committer C <c> 5 +0130\n";
         let ok = format!("tree {TREE}\nparent {PARENT}\n{author}{committer}gpgsig x\n y\n\nm\n");
-        let commit = parse_commit(ok.as_bytes()).unwrap();
+        let (refs, commit) = references(ObjectFormat::Sha1, Kind::Commit, ok.as_bytes()).unwrap();
+        assert_eq!(refs.len(), 2);
+        let commit = commit.unwrap();
         assert_eq!(commit.committer.seconds, 5);
         assert_eq!(commit.committer.offset_seconds, 5400);
         assert_eq!(commit.message, b"m\n");
+        // No message at all is fine.
+        references(
+            ObjectFormat::Sha1,
+            Kind::Commit,
+            format!("tree {TREE}\n{author}{committer}").as_bytes(),
+        )
+        .unwrap();
         for bad in [
             format!("{author}tree {TREE}\n{committer}\nm\n"),
             format!("tree {TREE}\n{committer}{author}\nm\n"),
             format!("tree {TREE}\n{author}parent {PARENT}\n{committer}\nm\n"),
+            format!("tree {TREE}\n{author}{author}{committer}\nm\n"),
             format!("tree {TREE}\n{committer}\nm\n"),
-            format!("tree {TREE}\n{author}{committer}"),
             format!("tree {TREE}\n{author}committer C <c> soon\n\nm\n"),
+            format!("tree {TREE}\n{author}{committer}\nm\0\n"),
         ] {
-            parse_commit(bad.as_bytes()).unwrap_err();
+            references(ObjectFormat::Sha1, Kind::Commit, bad.as_bytes()).unwrap_err();
         }
+    }
+
+    #[test]
+    fn stored_commits_read_as_git_reads_them() {
+        let data =
+            format!("tree {TREE}\nauthor A  <a> 07 +0100\ncommitter <c@x>\nauthor B <b> 9 +0000\n");
+        let commit = parse_commit(data.as_bytes()).unwrap();
+        assert_eq!(
+            (commit.author.name, commit.author.email),
+            (&b"A"[..], &b"a"[..])
+        );
+        assert_eq!(
+            (commit.author.seconds, commit.author.offset_seconds),
+            (7, 3600)
+        );
+        assert_eq!(
+            (commit.committer.name, commit.committer.seconds),
+            (&b""[..], 0)
+        );
+        assert_eq!(commit.message, b"");
+        let huge = format!("tree {TREE}\nauthor A <a> 1 +99999999999999999\ncommitter C <c> 1\n");
+        let commit = parse_commit(huge.as_bytes()).unwrap();
+        assert_eq!((commit.author.seconds, commit.committer.seconds), (0, 0));
+        parse_commit(format!("tree {TREE}\nauthor A\ncommitter C <c> 1 +0000\n").as_bytes())
+            .unwrap_err();
+    }
+
+    #[test]
+    fn pushed_tags_are_checked_as_git_fsck_does() {
+        let head = format!("object {PARENT}\ntype commit\ntag v1\n");
+        let tagger = "tagger T <t> 1 +0000\n";
+        for ok in [
+            format!("{head}{tagger}\nm\n"),
+            format!("{head}\nm\n"),
+            format!("{head}{tagger}extra\n\nm\n"),
+            // git's note on the extra header drops the bad tagger's error.
+            format!("{head}tagger T <t>\nextra\n"),
+            format!("object {PARENT}\ntype commit\ntag ..\n{tagger}"),
+        ] {
+            let (refs, _) = references(ObjectFormat::Sha1, Kind::Tag, ok.as_bytes()).unwrap();
+            assert_eq!(refs, [(Kind::Commit, Oid::from_hex(PARENT).unwrap())]);
+        }
+        for bad in [
+            format!("{head}tagger T <t>\n\nm\n"),
+            format!("object {PARENT}\ntype thing\ntag v1\n{tagger}"),
+            format!("object {PARENT}\ntag v1\n{tagger}"),
+            format!("{head}{tagger}\0"),
+            format!("object {PARENT}\ntype tag\ntag \n\n"),
+        ] {
+            references(ObjectFormat::Sha1, Kind::Tag, bad.as_bytes()).unwrap_err();
+        }
+        let tag = tag_target(format!("{head}tagger T <t>\n\nm\n").as_bytes()).unwrap();
+        assert_eq!(tag, Oid::from_hex(PARENT).unwrap());
     }
 
     #[test]
@@ -378,7 +545,9 @@ mod tests {
             oid,
         };
         let encoded = write_tree([dir, file]).unwrap();
-        let read: Vec<TreeEntry<'_>> = tree_entries(&encoded).map(Result::unwrap).collect();
+        let read: Vec<TreeEntry<'_>> = tree_entries(ObjectFormat::Sha1, &encoded)
+            .map(Result::unwrap)
+            .collect();
         assert_eq!(read, [file, dir]);
     }
 

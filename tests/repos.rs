@@ -22,7 +22,7 @@ use enroute_shared::state::{Commit, RefUpdate};
 
 /// The ids of `repo`'s layer files in the (file) object store under `root`.
 fn files(root: &Path, repo: &str) -> HashSet<String> {
-    let dir = root.join("store").join("repos").join(repo).join("layers");
+    let dir = root.join("store/data/repos").join(repo).join("layers");
     std::fs::read_dir(dir)
         .map(|d| {
             d.flatten()
@@ -108,7 +108,7 @@ async fn created_with_a_default_branch() {
 
     // A refused push (a stale compare-and-swap) leaves the time.
     let epoch = compute.state("r").unwrap().epoch;
-    let stale = enroute_shared::oid::Oid([9; 20]);
+    let stale = enroute_shared::oid::Oid::sha1([9; 20]);
     let out = compute
         .commit(
             "r",
@@ -137,6 +137,32 @@ async fn created_with_a_default_branch() {
     compute.create_repo("a b", "main").await.unwrap_err();
     compute.create_repo("ok", "bad..branch").await.unwrap_err();
     assert!(compute.get_repo("missing").await.unwrap().is_none());
+}
+
+/// A push or an API commit with an object over `max_object_bytes` fails with
+/// the reason, and stores nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn objects_over_the_limit_are_refused() {
+    let server = Server::start_with(|c| c.compute.max_object_bytes = 1000).await;
+    let git = Git::new();
+    let src = git.init("src").await;
+    git.commit_file(&src, "small", "a\n", "c1").await;
+    let url = server.repo_url("limited");
+    assert!(push(&git, &src, &url, "main").await.0);
+    git.commit_file(&src, "big", &"x".repeat(1001), "c2").await;
+    let (ok, out) = push(&git, &src, &url, "main").await;
+    assert!(!ok && out.contains("over the limit"), "{out}");
+    let e = server
+        .api_client()
+        .create_commit(common::commit(
+            "limited",
+            "main",
+            "c",
+            vec![common::put("big", "x".repeat(1001))],
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), tonic::Code::InvalidArgument, "{e}");
 }
 
 /// Without `create_on_push`, a push, a clone or an API commit to a missing
@@ -178,7 +204,8 @@ async fn pushes_do_not_create_unless_configured() {
             .repos
             .is_empty()
     );
-    assert!(!root.path().join("store/repos/nope").exists());
+    assert!(!root.path().join("store/ledger/repos/nope").exists());
+    assert!(!root.path().join("store/data/repos/nope").exists());
 
     compute.create_repo("nope", "").await.unwrap();
     assert!(push(&git, &src, &url, "main").await.0);
@@ -353,12 +380,12 @@ async fn deleted_and_created_again_on_a_cluster() {
     assert!(epochs.contains(&Some(2)), "{epochs:?}");
 }
 
-/// A voter that was down during a deletion never takes writes for the old one.
+/// A replica that was down during a deletion never takes writes for the old one.
 ///
-/// Any leader has the tombstone, and at startup the voter drops its copy
+/// Any sequencer has the tombstone, and at startup the replica drops its copy
 /// once the state object says deleted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn a_lagging_voter_never_serves_the_deleted_repository() {
+async fn a_lagging_replica_never_serves_the_deleted_repository() {
     let root = tempfile::tempdir().unwrap();
     let servers = cluster(root.path(), &local_store(root.path()), 3, cluster_config).await;
     let mut servers: Vec<Option<Server>> = servers.into_iter().map(Some).collect();
@@ -468,7 +495,7 @@ async fn deletions_and_new_incarnations_survive_restarts() {
     restart_all(&mut servers).await;
     for i in 0..3 {
         // A read barrier first: a restarted follower learns the commit index
-        // only from a leader, and fetches take none.
+        // only from a sequencer, and fetches take none.
         assert!(compute(&servers, i).get_repo("r").await.unwrap().is_some());
         clone_matches(&git, &fresh, &url(&servers, i), &format!("back{i}")).await;
     }
@@ -495,7 +522,7 @@ async fn deleted_layer_files_are_reclaimed() {
     assert_eq!(files(root.path(), "r").len(), 3);
 
     compute.delete_repo("r").await.unwrap();
-    let trash = root.path().join("store/trash/r");
+    let trash = root.path().join("store/data/trash/r");
     assert!(
         std::fs::read_dir(&trash).is_ok_and(|mut d| d.next().is_some()),
         "a trash marker"

@@ -714,7 +714,7 @@ impl StateMachineTest for OracleStateMachine {
     type Reference = Self;
 
     #[tracing::instrument(skip_all)]
-    fn init_test(_ref_state: &RefState) -> Self::SystemUnderTest {
+    fn init_test(ref_state: &RefState) -> Self::SystemUnderTest {
         let rt = shared_runtime_handle();
         let tmp = tempfile::tempdir().unwrap();
 
@@ -723,13 +723,13 @@ impl StateMachineTest for OracleStateMachine {
         let repo_name = format!("repo-{}", uuid::Uuid::new_v4());
         let (stack, repo) = rt.block_on(async {
             let stack = STACK.get_or_init(Stack::start).await;
-            (stack, stack.create(&repo_name).await)
+            (stack, stack.create_in(&repo_name, ref_state.format).await)
         });
         // Credentials in the URL: git reads a `user:pass@host` authority as
         // Basic auth with no more setup.
         let enroute_url = stack.url(&repo_name);
 
-        let oracle = OracleDaemon::spawn(tmp.path());
+        let oracle = OracleDaemon::spawn(tmp.path(), ref_state.format);
 
         // Both remotes are empty here, so this also exercises cloning an
         // empty repo — both advertise their unborn HEAD as `refs/heads/main`,

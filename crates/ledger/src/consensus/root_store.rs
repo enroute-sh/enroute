@@ -1,33 +1,28 @@
-//! One replicated log's storage, implementing raft-rs `Storage`.
+//! The root log's storage: [`LogMeta`] and raft-rs's `Storage` over the
+//! node's log store.
 //!
 //! Entries live in the node's log store ([`crate::logdb`]); their terms,
 //! the hard state and where the log starts (the latest snapshot's
 //! metadata) are also kept in memory ([`LogMeta`]). The engine writes every
 //! change to the log store and only then applies it here, so this view is
-//! always of durable state; entries not yet durable are in raft-rs's
-//! unstable log, not here.
+//! always of durable state; the root's entries not yet durable are in
+//! raft-rs's unstable log, not here.
 //!
-//! The state machine is in the node's state store, so a snapshot (for a
-//! follower behind the log's start) is made when raft asks for one: the
-//! state as of the last entry applied.
+//! A root snapshot (for a follower behind the root log's start) is made
+//! when raft asks for one: the directory as of the last entry applied.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
 use parking_lot::RwLock;
-use prost::Message as _;
 use raft::prelude::*;
 use raft::{GetEntriesContext, RaftState, Storage, StorageError};
 
-use enroute_shared::state::{Command, RepoMeta};
-
 use crate::logdb::LogDb;
-use crate::state_machine::count;
-use crate::state_store::{Root, StateStore};
-use crate::stored;
+use crate::state::machine::count;
 
 use super::codec::{Entries, Prost};
+use super::root::SharedRoot;
 
 /// Saturating: indexes and lengths never reach the limits.
 fn to_usize(n: u64) -> usize {
@@ -126,17 +121,18 @@ impl LogMeta {
 pub(super) struct LogStore {
     pub id: u64,
     pub db: LogDb,
-    pub state: Arc<StateStore>,
     pub meta: Arc<RwLock<LogMeta>>,
+    /// The root log's directory: its snapshots carry it.
+    root: SharedRoot,
 }
 
 impl LogStore {
-    pub(super) fn new(id: u64, db: LogDb, state: Arc<StateStore>, meta: LogMeta) -> LogStore {
+    pub(super) fn new(id: u64, db: LogDb, meta: LogMeta, root: SharedRoot) -> LogStore {
         LogStore {
             id,
             db,
-            state,
             meta: Arc::new(RwLock::new(meta)),
+            root,
         }
     }
 
@@ -217,53 +213,29 @@ impl Storage for LogStore {
         Ok(self.meta.read().last_index())
     }
 
-    /// The state machine as of the last entry applied, with its identity.
+    /// The root's directory as of the last entry applied.
     fn snapshot(&self, request_index: u64, _to: u64) -> raft::Result<Snapshot> {
-        let other = |e: anyhow::Error| raft::Error::Store(StorageError::Other(e.into()));
-        let Some((root, meta)) = load(&self.state, &self.db, self.id).map_err(other)? else {
-            return Err(raft::Error::Store(
-                StorageError::SnapshotTemporarilyUnavailable,
-            ));
+        let (index, term, conf, data) = {
+            let root = self.root.read();
+            let m = &root.dir.meta;
+            if m.applied_index < request_index {
+                return Err(raft::Error::Store(
+                    StorageError::SnapshotTemporarilyUnavailable,
+                ));
+            }
+            (
+                m.applied_index,
+                m.applied_term,
+                root.dir.conf(),
+                root.dir.encode(),
+            )
         };
-        let index = root.applied_index;
-        if index < request_index {
-            return Err(raft::Error::Store(
-                StorageError::SnapshotTemporarilyUnavailable,
-            ));
-        }
         // With the membership as of its index.
-        let mut snap = self.meta.read().snapshot_at(index, root.applied_term);
-        snap.mut_metadata().set_conf_state(root.conf());
-        snap.data = root.record(meta).encode_to_vec();
+        let mut snap = self.meta.read().snapshot_at(index, term);
+        snap.mut_metadata().set_conf_state(conf);
+        snap.data = data;
         Ok(snap)
     }
-}
-
-/// An entry's command, if it is one (of log `log`, for the error).
-pub(super) fn decode(log: u64, e: &Entry) -> Option<Command> {
-    if e.get_entry_type() != EntryType::EntryNormal || e.data.is_empty() {
-        return None;
-    }
-    match Command::decode(e.data.as_slice()) {
-        Ok(c) => Some(c),
-        Err(err) => {
-            tracing::error!(log, index = e.index, "undecodable entry: {err}");
-            None
-        }
-    }
-}
-
-/// The command at log index `index`.
-fn command_at(db: &LogDb, log: u64, index: u64) -> Result<Command> {
-    let entries = db.read(move |db| fetch(db, log, index, index + 1, None))?;
-    let e = entries.first().context("no such entry")?;
-    Ok(Command::decode(e.data.as_slice())?)
-}
-
-/// `log`'s root and whole state at the last entry applied, inline layers'
-/// bytes read from the log. None if it has no state.
-pub(super) fn load(store: &StateStore, db: &LogDb, log: u64) -> Result<Option<(Root, RepoMeta)>> {
-    stored::load(store, log, |index| command_at(db, log, index))
 }
 
 #[cfg(test)]

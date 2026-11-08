@@ -1,11 +1,21 @@
-//! The replicated state machine: applying a command from a repository's
-//! log to its state ([`apply`]), deterministically (every replica applying
-//! the same log reaches the same state). It returns the command's outcome,
-//! for its proposer, and the change it made, for subscribers (who apply it
-//! with [`enroute_shared::state::RepoMeta::apply_change`]).
+//! The replicated state machine, in two halves. A proposer *evaluates* a
+//! command against the state it sees ([`evaluate`]): every rule lives
+//! there (compare-and-swaps, refusals, id assignment), and the result is
+//! the command's outcome and the change it makes. The log carries the
+//! change, as an [`Effect`], and every replica *applies* it
+//! ([`apply_effect`]): a patch, written only if the state is still the one
+//! it was evaluated against, so replicas never re-run the rules and cannot
+//! disagree on them. Subscribers apply the same changes
+//! ([`enroute_shared::state::RepoMeta::apply_change`]).
+//!
+//! As the leaseholder in `CockroachDB` evaluates a command and replicates its
+//! effect, guarded by a lease index, the log's leader evaluates here. The
+//! guard is the version (and evaluation chain) the effect was evaluated
+//! against, as in execute-order-validate (Hyperledger Fabric): an old
+//! leader's effects may still commit after a new leader took over.
 //!
 //! It reads and writes the state through [`State`]: the node's state store
-//! ([`crate::stored`]), or, in tests, a `RepoMeta` in memory. It reads only what the
+//! ([`crate::state::stored`]), or, in tests, a `RepoMeta` in memory. It reads only what the
 //! command needs (the refs it compare-and-swaps, the layers a replacement
 //! removes), so a command costs the same however big the repository.
 //!
@@ -15,13 +25,16 @@
 
 use anyhow::{Context, Result};
 
-use enroute_shared::oid::Oid;
+use enroute_shared::oid::{ObjectFormat, Oid};
 use enroute_shared::state::{
-    Change, Command, Commit, LayerEdit, LayerMeta, Outcome, RefChange, RefResult, RefUpdate,
-    Refusal, RemovedLayer, UPLOAD_GEN_WINDOW, command, layer_gen,
+    ATOMIC_FAILURE, Change, ChangeTarget, Command, Commit, LayerEdit, LayerMeta, Outcome,
+    REF_EXISTS, REF_STALE, RefChange, RefResult, RefUpdate, Refusal, RemovedLayer, Scalars,
+    UPLOAD_GEN_WINDOW, apply_change as shared_apply, command, layer_gen,
 };
 
-pub(crate) use crate::state_store::Counters;
+use crate::proto::Effect;
+
+pub(crate) use crate::state::store::Counters;
 
 /// A repository's state, as the state machine sees it. Reads see the
 /// command's own writes; the manifest is only read before a command
@@ -49,17 +62,12 @@ pub(crate) trait State {
     fn clear(&mut self) -> Result<()>;
 }
 
-/// Apply a command from a repository's log. `version` must increase
-/// with the log position (we use index + 1, creation being version 1).
-/// Fails only if the state cannot be read or written.
-pub(crate) fn apply(
-    state: &mut impl State,
-    version: u64,
-    cmd: &Command,
-) -> Result<(Outcome, Option<Change>)> {
-    let c = state.counters()?;
+/// The outcome of `cmd` if it needs no evaluation: refusals that hold
+/// whatever the log does next (the incarnation is over, or it is another
+/// one's), and malformed commands.
+pub(crate) fn settled(c: &Counters, cmd: &Command) -> Option<Outcome> {
     if c.deleted {
-        return Ok((on_deleted(cmd, c.version), None));
+        return Some(on_deleted(cmd, c.version));
     }
     let mut out = Outcome {
         repo_version: c.version,
@@ -67,16 +75,114 @@ pub(crate) fn apply(
     };
     if cmd.epoch != 0 && cmd.epoch != c.epoch {
         out.refuse(Refusal::OtherIncarnation);
+        return Some(out);
+    }
+    if cmd.kind.is_none() {
+        out.refuse_invalid("empty command");
+        return Some(out);
+    }
+    None
+}
+
+/// Evaluate a command in evaluation chain `chain` against `state`, writing
+/// its change there too (so the next command evaluated sees it): its
+/// outcome, and the change, if it makes one. Fails only if the state
+/// cannot be read or written.
+pub(crate) fn evaluate(
+    state: &mut impl State,
+    cmd: &Command,
+    chain: u64,
+) -> Result<(Outcome, Option<Change>)> {
+    let mut c = state.counters()?;
+    if let Some(out) = settled(&c, cmd) {
         return Ok((out, None));
     }
+    c.chain = chain;
+    let out = Outcome {
+        repo_version: c.version,
+        ..Default::default()
+    };
     match &cmd.kind {
-        None => {
-            out.refuse_invalid("empty command");
-            Ok((out, None))
+        None => Ok((out, None)),
+        Some(command::Kind::Delete(_)) => evaluate_delete(state, c, out),
+        Some(command::Kind::AdvanceUploadGen(_)) => evaluate_advance(state, c, out),
+        Some(command::Kind::Commit(commit)) => evaluate_commit(state, c, out, commit),
+    }
+}
+
+/// Whether `effect` applies to a state with counters `c`: the one it was
+/// evaluated against.
+pub(crate) fn applies(c: &Counters, effect: &Effect) -> bool {
+    (c.version, c.chain) == (effect.base, effect.base_chain)
+}
+
+/// Apply a log entry's effect to `state`: its change, if it applies (see
+/// [`applies`]). Whether it did. It reads only what the patch needs.
+pub(crate) fn apply_effect(state: &mut impl State, effect: &Effect) -> Result<bool> {
+    let c = state.counters()?;
+    if !applies(&c, effect) {
+        return Ok(false);
+    }
+    if let Some(change) = &effect.change {
+        apply_change(state, c, change)?;
+    }
+    Ok(true)
+}
+
+/// Write `change` over a state with counters `c`.
+fn apply_change(state: &mut impl State, c: Counters, change: &Change) -> Result<()> {
+    shared_apply(&mut Applying { state, c }, change)
+}
+
+/// A state with its counters, as a change writes to them.
+struct Applying<'a, S> {
+    state: &'a mut S,
+    c: Counters,
+}
+
+impl<S: State> ChangeTarget for Applying<'_, S> {
+    type Error = anyhow::Error;
+
+    fn clear(&mut self) -> Result<()> {
+        self.state.clear()?;
+        self.c.layers = 0;
+        self.c.deleted = true;
+        Ok(())
+    }
+
+    fn set_ref(&mut self, name: &str, value: Option<Oid>, updated_ms: u64) -> Result<()> {
+        self.state.set_ref(name, value, updated_ms)
+    }
+
+    fn set_head(&mut self, head: &str) -> Result<()> {
+        self.state.set_head(head)
+    }
+
+    fn edit_layers(&mut self, e: &LayerEdit) -> Result<()> {
+        for r in &e.remove {
+            self.state.remove_layer(&LayerMeta {
+                id: r.id.clone(),
+                first_id: r.first_id,
+                ..Default::default()
+            })?;
         }
-        Some(command::Kind::Delete(_)) => apply_delete(state, version, c, out),
-        Some(command::Kind::AdvanceUploadGen(_)) => apply_advance(state, version, c, out),
-        Some(command::Kind::Commit(commit)) => apply_commit(state, version, c, out, commit),
+        for l in &e.insert {
+            self.state.add_layer(l)?;
+        }
+        self.c.layers = self.c.layers - count(e.remove.len()) + count(e.insert.len());
+        Ok(())
+    }
+
+    fn set_scalars(&mut self, s: &Scalars) -> Result<()> {
+        let c = &mut self.c;
+        s.apply([
+            &mut c.next_id,
+            &mut c.upload_gen,
+            &mut c.last_push_ms,
+            &mut c.version,
+            &mut c.chain,
+        ]);
+        self.state.set_counters(*c)
     }
 }
 
@@ -98,51 +204,50 @@ pub(crate) fn count(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
 }
 
-fn apply_delete(
+fn evaluate_delete(
     state: &mut impl State,
-    version: u64,
     mut c: Counters,
     mut out: Outcome,
 ) -> Result<(Outcome, Option<Change>)> {
     state.clear()?;
     c.layers = 0;
     c.deleted = true;
-    c.version = version.max(c.version + 1);
+    c.version += 1;
     state.set_counters(c)?;
     out.repo_version = c.version;
     Ok((
         out,
         Some(Change {
             version: c.version,
+            chain: c.chain,
             deleted: true,
             ..Default::default()
         }),
     ))
 }
 
-fn apply_advance(
+fn evaluate_advance(
     state: &mut impl State,
-    version: u64,
     mut c: Counters,
     mut out: Outcome,
 ) -> Result<(Outcome, Option<Change>)> {
     c.upload_gen += 1;
-    c.version = version.max(c.version + 1);
+    c.version += 1;
     state.set_counters(c)?;
     out.repo_version = c.version;
     Ok((
         out,
         Some(Change {
             version: c.version,
+            chain: c.chain,
             upload_gen: Some(c.upload_gen),
             ..Default::default()
         }),
     ))
 }
 
-fn apply_commit(
+fn evaluate_commit(
     state: &mut impl State,
-    version: u64,
     mut c: Counters,
     mut out: Outcome,
     commit: &Commit,
@@ -150,7 +255,7 @@ fn apply_commit(
     let Some(plan) = plan_layers(state, &c, commit, &mut out)? else {
         return Ok((out, None));
     };
-    let errors = check_refs(state, &commit.updates, commit.atomic)?;
+    let errors = check_refs(state, c.format, &commit.updates, commit.atomic)?;
     let mut change = Change::default();
     if !plan.added.is_empty() || !commit.remove_layers.is_empty() {
         for l in &plan.removed {
@@ -161,7 +266,7 @@ fn apply_commit(
         }
         c.layers = c.layers - count(plan.removed.len()) + count(plan.added.len());
         change.layers = Some(LayerEdit {
-            remove: commit.remove_layers.iter().map(|r| r.id.clone()).collect(),
+            remove: commit.remove_layers.clone(),
             insert: plan.added,
         });
     }
@@ -200,10 +305,10 @@ fn apply_commit(
     if change.layers.is_none() && change.refs.is_empty() && change.head.is_none() {
         return Ok((out, None));
     }
-    c.version = version.max(c.version + 1);
+    c.version += 1;
     state.set_counters(c)?;
     out.repo_version = c.version;
-    change.version = c.version;
+    (change.version, change.chain) = (c.version, c.chain);
     Ok((out, Some(change)))
 }
 
@@ -325,27 +430,37 @@ fn are_consecutive(state: &mut impl State, prev: &LayerMeta, next: &LayerMeta) -
 }
 
 /// The compare-and-swap check of each ref update, all against the state
-/// before the command: None for a ref that can change, else why not.
+/// before the command: None for a ref that can change, else why not. A
+/// `format` repository's refs hold ids of that format only.
 fn check_refs(
     state: &mut impl State,
+    format: ObjectFormat,
     updates: &[RefUpdate],
     atomic: bool,
 ) -> Result<Vec<Option<String>>> {
     let mut errors = Vec::with_capacity(updates.len());
     for u in updates {
+        if let Some(bad) = [u.old, u.new]
+            .into_iter()
+            .flatten()
+            .find(|o| o.format() != format)
+        {
+            errors.push(Some(format!("{bad} is not a {format} object id")));
+            continue;
+        }
         let cur = state.get_ref(&u.name)?;
         errors.push((cur != u.old).then(|| {
             if u.old.is_none() {
-                "reference already exists"
+                REF_EXISTS
             } else {
-                "stale info (ref changed)"
+                REF_STALE
             }
             .to_string()
         }));
     }
     if atomic && errors.iter().any(Option::is_some) {
         for r in &mut errors {
-            r.get_or_insert_with(|| "atomic push failure".into());
+            r.get_or_insert_with(|| ATOMIC_FAILURE.into());
         }
         // Layers are still published: their objects are valid and
         // are reclaimed by compaction if unreachable.
@@ -503,9 +618,9 @@ mod tests {
     /// command applied to both.
     struct Twin {
         m: RepoMeta,
-        store: crate::state_store::StateStore,
+        store: crate::state::store::StateStore,
         /// The log: what pinned inline layers are read from.
-        log: std::collections::HashMap<u64, Command>,
+        log: std::collections::HashMap<u64, Effect>,
         _dir: tempfile::TempDir,
     }
 
@@ -520,20 +635,11 @@ mod tests {
     impl Twin {
         fn new() -> Twin {
             let dir = tempfile::tempdir().unwrap();
-            let store = crate::state_store::StateStore::open(dir.path(), 16 << 20).unwrap();
+            let store = crate::state::store::StateStore::open(dir.path(), 16 << 20).unwrap();
             let m = RepoMeta::new();
-            let root = crate::stored::root(
-                "r",
-                1,
-                &raft::prelude::ConfState {
-                    voters: vec![1],
-                    ..Default::default()
-                },
-                0,
-                0,
-            );
+            let root = crate::state::stored::root("r", 1, 0, 0);
             store
-                .install(LOG, root, crate::stored::entries(&m).unwrap())
+                .install(LOG, root, crate::state::stored::entries(&m).unwrap())
                 .unwrap();
             Twin {
                 m,
@@ -543,22 +649,35 @@ mod tests {
             }
         }
 
-        /// Apply the command at log index `index` to both states, which
-        /// must agree on its outcome, its change and the state after it.
+        /// Evaluate the command against both states, which must agree on
+        /// its outcome and change, then apply its effect at log index
+        /// `index` to both, which must then agree on the state.
         fn apply(&mut self, index: u64, cmd: &Command) -> (Outcome, Option<Change>) {
-            let mem = apply(&mut self.m, index + 1, cmd).unwrap();
+            let (mem, effect) = run(&mut self.m, cmd);
             let mut round = self.store.round();
-            let stored = crate::stored::apply(&mut round, LOG, index, 1, Some(cmd))
-                .unwrap()
-                .expect("a command");
-            round.commit().unwrap();
+            let stored = evaluate(
+                &mut crate::state::stored::Stored::new(&mut round, LOG, 0),
+                cmd,
+                CHAIN,
+            )
+            .unwrap();
+            drop(round);
             assert_eq!(
                 stored, mem,
                 "the store and memory agree on the outcome and change"
             );
-            self.log.insert(index, cmd.clone());
+            let mut round = self.store.round();
+            let applied =
+                crate::state::stored::apply(&mut round, LOG, index, 1, Some(&effect)).unwrap();
+            round.commit().unwrap();
+            assert_eq!(
+                applied,
+                Some(true),
+                "an effect applies where it was evaluated"
+            );
+            self.log.insert(index, effect);
             let (root, loaded) =
-                crate::stored::load(&self.store, LOG, |i| Ok(self.log[&i].clone()))
+                crate::state::stored::load(&self.store, LOG, |i| Ok(self.log[&i].clone()))
                     .unwrap()
                     .unwrap();
             assert_eq!(loaded, self.m, "the store and memory agree on the state");
@@ -579,6 +698,28 @@ mod tests {
         }
     }
 
+    /// The chain the tests' effects are evaluated in.
+    const CHAIN: u64 = 7;
+
+    /// Evaluate `cmd` against `m`, then apply its effect: its outcome and
+    /// change, and the effect. Applying writes what evaluating did.
+    fn run(m: &mut RepoMeta, cmd: &Command) -> ((Outcome, Option<Change>), Effect) {
+        let mut evaluated = m.clone();
+        let done = evaluate(&mut evaluated, cmd, CHAIN).unwrap();
+        let effect = Effect {
+            base: m.version,
+            base_chain: m.chain,
+            chain: CHAIN,
+            change: done.1.clone(),
+        };
+        assert!(apply_effect(m, &effect).unwrap());
+        assert_eq!(
+            evaluated, *m,
+            "applying the effect writes what evaluating did"
+        );
+        (done, effect)
+    }
+
     /// Apply a command, and check that its change takes a follower (who
     /// had the state before it) to the same state.
     fn apply_followed(m: &mut Twin, index: u64, cmd: &Command) -> Outcome {
@@ -597,7 +738,7 @@ mod tests {
     #[test]
     fn cas_and_compaction() {
         let mut m = Twin::new();
-        let (a, b) = (Oid([1; 20]), Oid([2; 20]));
+        let (a, b) = (Oid::sha1([1; 20]), Oid::sha1([2; 20]));
         let layer = |id: &str| LayerMeta {
             id: sid(id),
             objects: 1,
@@ -669,6 +810,36 @@ mod tests {
         let stale = commit(vec![], vec![], vec![update("refs/heads/x", Some(b), None)]);
         let (_, change) = m.apply(6, &stale);
         assert!(change.is_none(), "a rejected update changes nothing");
+    }
+
+    /// Two proposers evaluate against the same state: the effect that
+    /// lands first applies, and the other is skipped, and so is everything
+    /// its chain evaluated after it, even where the version matches again.
+    #[test]
+    fn effects_apply_only_to_the_state_they_were_evaluated_against() {
+        let mut m = RepoMeta::new();
+        let (a, b) = (Oid::sha1([1; 20]), Oid::sha1([2; 20]));
+        let effect = |state: &mut RepoMeta, chain, cmd: &Command| Effect {
+            base: state.version,
+            base_chain: state.chain,
+            chain,
+            change: evaluate(state, cmd, chain).unwrap().1,
+        };
+        // Chain 1 evaluates two commands, the second after the first.
+        let mut one = m.clone();
+        let a1 = effect(&mut one, 1, &set_ref("refs/heads/x", None, Some(a)));
+        let a2 = effect(&mut one, 1, &set_ref("refs/heads/x", Some(a), Some(b)));
+        // Chain 2 evaluates one, against the same state.
+        let mut two = m.clone();
+        let b1 = effect(&mut two, 2, &set_ref("refs/heads/x", None, Some(b)));
+        assert!(apply_effect(&mut m, &b1).unwrap());
+        assert!(
+            !apply_effect(&mut m, &a1).unwrap(),
+            "evaluated against an older state"
+        );
+        assert_eq!(m.version, a2.base, "the version matches a2's");
+        assert!(!apply_effect(&mut m, &a2).unwrap(), "but not the state");
+        assert_eq!(m.refs["refs/heads/x"], b);
     }
 
     #[test]
@@ -875,7 +1046,7 @@ mod tests {
     #[test]
     fn one_round_applies_many_commands() {
         let mut m = Twin::new();
-        let a = Oid([1; 20]);
+        let a = Oid::sha1([1; 20]);
         let inline = LayerMeta {
             id: "i1".into(),
             objects: 2,
@@ -930,16 +1101,16 @@ mod tests {
         let mut round = m.store.round();
         for (i, cmd) in cmds.iter().enumerate() {
             let index = count(i) + 1;
-            let mem = apply(&mut m.m, index + 1, cmd).unwrap();
-            let stored = crate::stored::apply(&mut round, LOG, index, 1, Some(cmd))
-                .unwrap()
-                .unwrap();
-            assert_eq!(stored, mem);
+            let (_, effect) = run(&mut m.m, cmd);
+            let applied =
+                crate::state::stored::apply(&mut round, LOG, index, 1, Some(&effect)).unwrap();
+            assert_eq!(applied, Some(true));
         }
         round.commit().unwrap();
-        let (_, loaded) = crate::stored::load(&m.store, LOG, |_| anyhow::bail!("no pins left"))
-            .unwrap()
-            .unwrap();
+        let (_, loaded) =
+            crate::state::stored::load(&m.store, LOG, |_| anyhow::bail!("no pins left"))
+                .unwrap()
+                .unwrap();
         assert_eq!(loaded, m.m);
         assert_eq!((m.head.as_str(), m.layers.len()), ("refs/heads/b", 1));
         assert_eq!(m.store.oldest_pin(LOG).unwrap(), None);
@@ -951,7 +1122,7 @@ mod tests {
     #[test]
     fn a_deletion_is_a_tombstone() {
         let mut m = Twin::new();
-        let a = Oid([1; 20]);
+        let a = Oid::sha1([1; 20]);
         let push = Command::commit(
             "r",
             Commit {
@@ -1014,7 +1185,7 @@ mod tests {
     #[test]
     fn pushes_stamp_their_time() {
         let mut m = Twin::new();
-        let (a, b) = (Oid([1; 20]), Oid([2; 20]));
+        let (a, b) = (Oid::sha1([1; 20]), Oid::sha1([2; 20]));
         let push = |old: Option<Oid>, new: Oid, at: u64| {
             Command::commit(
                 "r",
@@ -1047,7 +1218,7 @@ mod tests {
     #[test]
     fn refs_keep_their_update_time() {
         let mut m = Twin::new();
-        let (a, b) = (Oid([1; 20]), Oid([2; 20]));
+        let (a, b) = (Oid::sha1([1; 20]), Oid::sha1([2; 20]));
         let set = |name: &str, old: Option<Oid>, new: Option<Oid>, at: u64| {
             Command::commit(
                 "r",
@@ -1098,7 +1269,7 @@ mod tests {
         );
         round.commit().unwrap();
         (m.m.head, m.m.keep_head) = ("refs/heads/dev".into(), true);
-        let a = Oid([1; 20]);
+        let a = Oid::sha1([1; 20]);
         apply_followed(&mut m, 1, &set_ref("refs/heads/main", None, Some(a)));
         assert_eq!(m.head, "refs/heads/dev");
         apply_followed(&mut m, 2, &set_ref("refs/heads/dev", None, Some(a)));
@@ -1111,7 +1282,7 @@ mod tests {
     #[test]
     fn an_implicit_head_is_repaired() {
         let mut m = Twin::new();
-        let a = Oid([1; 20]);
+        let a = Oid::sha1([1; 20]);
         apply_followed(&mut m, 1, &set_ref("refs/heads/main", None, Some(a)));
         apply_followed(&mut m, 2, &set_ref("refs/heads/dev", None, Some(a)));
         assert_eq!(m.head, "refs/heads/main");
@@ -1140,7 +1311,7 @@ mod tests {
     #[test]
     fn inline_layers_are_pinned_until_flushed() {
         let mut m = Twin::new();
-        let a = Oid([1; 20]);
+        let a = Oid::sha1([1; 20]);
         let inline = |id: &str| LayerMeta {
             id: id.into(),
             objects: 2,

@@ -1,63 +1,94 @@
 # Storage
 
-Enroute embeds a storage engine that is built like a modern database. Each
-repository is a set of immutable layers in an object store. Each repository also has its own replicated log for
-its refs and its layer list. There is no external database.
+Enroute embeds a storage engine built like a modern database. A repository's
+objects are immutable files, called layers, in an object store such as S3.
+Its refs and its list of layers are in a replicated log on the ledger nodes.
+There is no external database.
+
+This page follows one push and one clone through that engine. For the design
+in depth, see [Architecture](../internals/README.md).
 
 ## Nodes
 
 An Enroute process is a node. A node runs one of three roles:
 
-- **Ledger.** A ledger node holds the replicated logs. It needs a durable local
-  disk. Every ledger node is a voter in the log of every repository.
-- **Compute.** A compute node does the Git work. It serves Git and the gRPC API. It
-  keeps only caches that it can rebuild, so it needs no durable disk.
+- **Ledger.** Holds the replicated logs on a durable local disk. Each
+  repository's log is on three ledger nodes, its replicas. With fewer than
+  three ledger nodes, it is on all of them.
+- **Compute.** Does the Git work: receives pushes, serves clones and fetches,
+  and answers the API. It keeps only caches that it can rebuild.
 - **Both.** The default. One process runs the ledger and the compute.
 
-A compute node reads the current state of a repository from the ledger. Compute
-nodes find ledger nodes through the object store. See
-[Hosting](../operate/hosting.md).
+A compute node finds the ledger nodes through the object store.
 
-## Layers
+## Life of a push
 
-A push or an API change adds a layer to the repository. A layer holds Git
-objects, a commit graph, and an index. Layers never change after Enroute writes
-them. In the background, Enroute merges small layers into larger ones, and it
-removes layers that nothing refers to.
+A push of a few commits to `acme/widgets`:
 
-The layer list and the refs are the state of the repository. The ledger keeps
-that state. Enroute writes a checkpoint of it to the object store within
-a minute of a change.
+1. **The compute node checks the pack.** It indexes the objects, checks that
+   each one is well formed and that everything it names exists, and builds a
+   new layer from them. Many pushes, to the same repository too, do this at
+   the same time without locks.
+2. **One log entry commits it.** The compute node proposes one entry to the
+   repository's log: add this layer, and move these refs if they still hold
+   the values that the client saw. A small layer, up to 1 MiB by default,
+   travels inside the entry. A larger one is uploaded to the object store
+   first.
+3. **A majority syncs it to disk.** Two of the log's three replicas write the
+   entry and sync their disks. Only then does Enroute answer the client. The
+   sync time of the ledger disks is the commit time of a push.
+4. **The layer is flushed later.** Within 30 seconds by default, a compute
+   node copies small layers from the log to the object store, in one upload
+   for many pushes. Until then, the log is their only copy.
+5. **Layers are merged in the background.** Small layers are merged into
+   larger ones, as an LSM tree does. A layer file that nothing names any more
+   is removed after 6 hours, so that slow readers can finish.
 
-## Durability
+Two pushes to different branches do not conflict. Two pushes that move the same
+branch from the same commit race at step 2. The first one lands, and the
+second is rejected, as in any Git server.
 
-A small push is acknowledged when its layer is in the replicated log on a
-majority of ledger nodes. Enroute then flushes the layer to the object store in
-the background. A large push uploads its layer to the object store first.
+## Life of a clone
 
-Until the flush, the data is as durable as the logs on the ledger nodes' disks.
-If a majority of ledger nodes lose their disks, recovery is manual, from the
-last checkpoint, and up to about a minute of writes can be lost. See
-[Maintenance](../operate/maintenance.md).
+1. **The refs are current.** The compute node asks the ledger for the
+   repository's latest state before it answers. The refs that a client sees
+   include every push that finished before the request, through any compute
+   node.
+2. **The pack comes from a snapshot.** The compute node reads one immutable
+   version of the repository from start to end. A push that lands during the
+   clone does not change what the clone gets, and the clone does not block
+   the push.
+3. **Layers come from local disk.** The compute node keeps local copies of the
+   layers that it reads, and fetches a layer from the object store only on a
+   miss. A compute node drops its view of a repository that nobody has used
+for 15 minutes (`node.evict_after`).
 
-## Reads
+The API reads work the same way: every read sees every write that finished
+before it began.
 
-Reads are linearizable: they see every write that finished before the read
-began, through any compute node. This is true for the gRPC API reads, for the
-refs of a fetch (`ls-refs`, or the ref advertisement of protocol v0), and for
-the ref advertisement of a push.
+## What survives what
 
-## Repositories
+An acknowledged write is on the disks of a majority of its repository's
+ledger replicas. What it survives depends on the deployment:
 
-`CreateRepository` creates a repository. A push to a key that does not exist
-also creates one, unless `git.create_on_push` is `false`. A fetch never creates
-one. `DeleteRepository` frees the key at once. Enroute reclaims the stored layers in
-the background after a retention delay. A new repository can use the key
-immediately.
+| Deployment | An acknowledged write survives | Writes continue while |
+| --- | --- | --- |
+| One node | A restart of the process or the machine | The node is up |
+| One ledger node and compute nodes | The loss of any compute node | The ledger node is up |
+| Three or more ledger nodes | The permanent loss of one of a repository's three ledger nodes | Two of each repository's three ledger nodes are up |
 
-## Retention
+Losing more than that needs a restore from volume snapshots, which loses the
+writes after the snapshots. See [Deployment profiles](../operate/deployment-profiles.md)
+for each model in full, and [Maintenance](../operate/maintenance.md) for the
+procedures.
 
-Enroute does not garbage-collect objects made unreachable by branch deletion.
-Delete the repository to remove its data. Configure encryption at rest in the
-object store and on the ledger disks; Enroute does not provide it. See
+## Deleting data
+
+`DeleteRepository` frees the key at once, and Enroute reclaims the layers in
+the background after the same 6-hour delay. Enroute does not garbage-collect
+objects that a deleted branch leaves unreachable. To remove them, delete the
+repository.
+
+Enroute does not encrypt data at rest. Configure encryption in the object
+store and on the ledger disks. See
 [Storage backends](../operate/storage-backends.md).

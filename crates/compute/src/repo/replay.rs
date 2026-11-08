@@ -499,7 +499,7 @@ fn replay_group(shared: &Arc<Shared>, g: Group, tx: &mpsc::Sender<Msg>) -> Resul
             })
             .transpose()?;
         let content = lv.layer.with_entry_at(off, len, Access::Scan, |entry| {
-            StoredEntry::parse(entry)?.decode(base_content.map(|c| c.as_slice()))
+            StoredEntry::parse(lv.layer.format(), entry)?.decode(base_content.map(|c| c.as_slice()))
         })??;
         if let Some(b) = base {
             let n = uses.get_mut(&b).expect("counted use");

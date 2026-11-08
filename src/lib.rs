@@ -34,29 +34,45 @@ use node::Node;
 #[derive(Debug)]
 pub struct Listeners {
     /// Where the contract is served, for an application to call.
-    pub api: TcpListener,
+    ///
+    /// None on a node that runs no compute, which serves no contract.
+    pub api: Option<TcpListener>,
     /// Where git is served, for a git client.
-    pub git: TcpListener,
+    ///
+    /// None on a node that runs no compute, which serves no git.
+    pub git: Option<TcpListener>,
     /// Where other nodes and operators reach this node: `GET /status`, and the
     /// gRPC between nodes.
     pub internal: TcpListener,
 }
 
 impl Listeners {
-    /// Bind each address.
+    /// Bind each address given.
     ///
     /// # Errors
     ///
     /// Returns an error if an address cannot be bound.
-    pub async fn bind(api: SocketAddr, git: SocketAddr, internal: SocketAddr) -> Result<Self> {
+    pub async fn bind(
+        api: Option<SocketAddr>,
+        git: Option<SocketAddr>,
+        internal: SocketAddr,
+    ) -> Result<Self> {
         let bind = |at: SocketAddr, what: &'static str| async move {
             TcpListener::bind(at)
                 .await
                 .with_context(|| format!("binding the {what} listener on {at}"))
         };
+        let api = match api {
+            Some(at) => Some(bind(at, "contract").await?),
+            None => None,
+        };
+        let git = match git {
+            Some(at) => Some(bind(at, "git").await?),
+            None => None,
+        };
         Ok(Self {
-            api: bind(api, "contract").await?,
-            git: bind(git, "git").await?,
+            api,
+            git,
             internal: bind(internal, "internal").await?,
         })
     }
@@ -147,8 +163,8 @@ impl Enroute {
     ///
     /// # Errors
     ///
-    /// Returns an error if the contract's services cannot be built, or if a
-    /// listener stops.
+    /// Returns an error if the contract's services cannot be built, if a
+    /// compute node lacks a listener, or if a listener stops.
     pub async fn serve(
         self,
         listeners: Listeners,
@@ -156,8 +172,11 @@ impl Enroute {
     ) -> Result<()> {
         let mut served = tokio::task::JoinSet::new();
         if let Some(git) = self.node.git_router().map(git::front) {
-            self.warn_if_open(listeners.git.local_addr()?);
-            spawn_http(&mut served, listeners.git, git, "git")?;
+            let listener = listeners
+                .git
+                .context("a compute node needs a git listener")?;
+            self.warn_if_open(listener.local_addr()?);
+            spawn_http(&mut served, listener, git, "git")?;
         }
         let routes = self
             .node
@@ -166,7 +185,10 @@ impl Enroute {
         if let Some(routes) = routes {
             // Through axum, as the internal listener serves its gRPC.
             let api = routes.into_axum_router();
-            spawn_http(&mut served, listeners.api, api, "enroute.api.v1alpha1")?;
+            let listener = listeners
+                .api
+                .context("a compute node needs a contract listener")?;
+            spawn_http(&mut served, listener, api, "enroute.api.v1alpha1")?;
         }
         let internal = self.node.internal_router();
         spawn_http(&mut served, listeners.internal, internal, "internal")?;

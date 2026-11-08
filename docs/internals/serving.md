@@ -20,7 +20,9 @@ which refs it could push to.
 ### Fetch
 
 Protocol v2 is the default when the client asks for it. Enroute advertises
-`ls-refs=unborn`, `fetch=shallow filter` and `object-format=sha1`.
+`ls-refs=unborn`, `fetch=shallow filter` and the repository's `object-format`
+(`sha1` or `sha256`). A request in another format is refused, as Git refuses
+it.
 
 - `ls-refs` supports `symrefs`, `peel`, `unborn` and `ref-prefix`.
 - `fetch` supports `want`, `have`, `done`, `thin-pack`, `ofs-delta`,
@@ -41,8 +43,8 @@ path uses the same planner and pack writer as v2.
 ### Push
 
 The advertisement of `git-receive-pack` offers `report-status`,
-`delete-refs`, `side-band-64k`, `quiet`, `atomic`, `ofs-delta` and
-`object-format=sha1`.
+`delete-refs`, `side-band-64k`, `quiet`, `atomic`, `ofs-delta` and the
+repository's `object-format`.
 
 - With `atomic`, one refused command fails every command of the push
   ([Write path](write-path.md#pushes-with-hooks)).

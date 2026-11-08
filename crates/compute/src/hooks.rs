@@ -164,7 +164,8 @@ pub trait PushHooks: Send + Sync + std::fmt::Debug {
     /// must choose: the mode sets the cost of a push.
     fn pre_receive_mode(&self) -> Option<PreReceiveMode>;
 
-    /// Which `commands` may land. No ref has moved yet.
+    /// Which `commands` may land, pushed with the `git push -o` `options`.
+    /// No ref has moved yet.
     ///
     /// In [`PreReceiveMode::Objects`], the pushed objects are committed, and
     /// readable through the API on every compute node. In
@@ -176,15 +177,18 @@ pub trait PushHooks: Send + Sync + std::fmt::Debug {
         ctx: &PushContext,
         repo: &str,
         commands: &[HookCommand],
+        options: &[String],
     ) -> Result<Vec<RefJudgement>>;
 
-    /// The `commands` that landed. Returns lines for the client. An error is
-    /// only logged, because the refs have already moved.
+    /// The `commands` that landed, pushed with the `git push -o` `options`.
+    /// Returns lines for the client. An error is only logged, because the
+    /// refs have already moved.
     async fn post_receive(
         &self,
         ctx: &PushContext,
         repo: &str,
         commands: &[HookCommand],
+        options: &[String],
     ) -> Result<Vec<String>>;
 }
 

@@ -9,6 +9,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
+use tracing::Instrument as _;
 
 use crate::access::{Access, Denial, GitRequest, Grant, Hidden, hidden_refs};
 use crate::compute::Compute;
@@ -85,8 +86,33 @@ fn route(path: &str) -> Option<(String, &'static str)> {
     Some((decoded.join("/"), service))
 }
 
+/// [`handle`] in a span for the request, which joins a trace that the
+/// caller (a proxy, say) sends. A fetch's pack task holds the span until the
+/// pack is sent.
 async fn dispatch(
     State(node): State<Arc<Compute>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let span = tracing::info_span!(
+        "enroute::git::request",
+        http.request.method = %method,
+        repo = tracing::field::Empty,
+        git.service = tracing::field::Empty,
+        http.response.status_code = tracing::field::Empty,
+    );
+    enroute_shared::trace_context::adopt(&span, &headers);
+    let res = handle(node, method, uri, headers, body)
+        .instrument(span.clone())
+        .await;
+    span.record("http.response.status_code", res.status().as_u16());
+    res
+}
+
+async fn handle(
+    node: Arc<Compute>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
@@ -113,6 +139,9 @@ async fn dispatch(
         }
         _ => return error(StatusCode::NOT_FOUND, "not found"),
     };
+    tracing::Span::current()
+        .record("repo", path)
+        .record("git.service", service);
     let grant = match authorize(&node, spelled, path, &headers, access).await {
         Ok(grant) => grant,
         Err(denial) => return denied(path, denial),
@@ -326,7 +355,7 @@ async fn info_refs(
             let body = if v0 {
                 upload_pack_v0::advertisement(&reading.refs(&[], true).await?)
             } else {
-                upload_pack::advertisement()
+                upload_pack::advertisement(reading.snap.format())
             };
             Ok(git_response(
                 "application/x-git-upload-pack-advertisement",
@@ -335,12 +364,13 @@ async fn info_refs(
         }
         "git-receive-pack" => {
             // If pushes create repositories, a missing one advertises no
-            // refs.
+            // refs, in the format a push would create it in.
             let body = match Reading::open(node, grant, Access::Write, true).await? {
                 Some(mut reading) => receive_pack::advertisement(&reading.refs(&[], false).await?),
-                None if node.config.create_on_push => {
-                    receive_pack::advertisement(&RefView::default())
-                }
+                None if node.config.create_on_push => receive_pack::advertisement(&RefView {
+                    format: node.config.default_object_format,
+                    ..RefView::default()
+                }),
                 None => return Ok(error(StatusCode::NOT_FOUND, "repository not found")),
             };
             Ok(git_response(
@@ -370,7 +400,7 @@ async fn upload_pack(
         .map_err(|e| Refusal::new(format!("reading the request: {e}")))?;
     let raw = if is_gzip(headers) {
         let mut out = Vec::new();
-        flate2::read::GzDecoder::new(&raw[..])
+        sirocco::inflate::Reader::new(sirocco::Format::Gzip, &raw[..])
             .take(u64::try_from(MAX_UPLOAD_PACK_REQUEST).unwrap_or(u64::MAX))
             .read_to_end(&mut out)?;
         out
@@ -388,7 +418,7 @@ async fn upload_pack(
     // Wants are not checked against the hidden refs: as with git's
     // `uploadpack.hideRefs`, an object ID stays fetchable.
     let Some(req) = v2 else {
-        let mut req = upload_pack_v0::parse(&raw)?;
+        let mut req = upload_pack_v0::parse(reading.snap.format(), &raw)?;
         reading.with_wants(&req.args.wants).await?;
         if req.sends_pack() {
             reading.hide_tags(&mut req.args).await?;
@@ -399,14 +429,15 @@ async fn upload_pack(
             Body::from_stream(crate::util::received(rx)),
         ));
     };
+    req.check_format(reading.snap.format())?;
     let body = match req.command {
         "ls-refs" => {
-            let ask = upload_pack::parse_ls_refs(&req.args);
+            let ask = upload_pack::parse_ls_refs(&req.args)?;
             let view = reading.refs(&ask.prefixes, ask.peel).await?;
             Body::from(upload_pack::ls_refs(&view, ask.symrefs, ask.unborn))
         }
         "fetch" => {
-            let mut fetch = upload_pack::parse_fetch(&req.args)?;
+            let mut fetch = upload_pack::parse_fetch(req.format, &req.args)?;
             reading.with_wants(&fetch.args.wants).await?;
             reading.hide_tags(&mut fetch.args).await?;
             Body::from_stream(crate::util::received(upload_pack::fetch(
@@ -414,13 +445,9 @@ async fn upload_pack(
                 fetch,
             )))
         }
-        "" => Body::from(Bytes::new()),
-        c => {
-            return Ok(error(
-                StatusCode::BAD_REQUEST,
-                format!("unknown command {c}"),
-            ));
-        }
+        // The client asked for nothing: `parse_request` passes no other
+        // command.
+        _ => Body::from(Bytes::new()),
     };
     Ok(git_response("application/x-git-upload-pack-result", body))
 }

@@ -32,28 +32,36 @@
 (defn- git-fetch-op [max-repo] {:f :git-fetch, :value @max-repo})
 
 (defn txn-gen
-  "Reads of every key of the current repository, and pushes of 1 to 4 of
-  its keys. Moves to a new repository after `per-key` appends per key, so
-  that lists stay short."
-  [{:keys [key-count per-key max-repo push]}]
-  (let [value (atom 0), appends (atom 0)]
+  "Reads of every key of a current repository, and pushes of 1 to 4 of its
+  keys. `repos` repositories are current at once: half the ops go to the
+  first (one hot log), the rest to any of them (many logs at once). Each
+  moves to a new repository after `per-key` appends per key, so that lists
+  stay short."
+  [{:keys [key-count per-key max-repo hot-repo push repos]}]
+  (let [n       (max 1 (or repos 1))
+        value   (atom 0)
+        current (atom (vec (range n)))
+        appends (atom (vec (repeat n 0)))]
+    (reset! max-repo (dec n))
     (fn []
-      (when (<= (* key-count per-key) @appends)
-        (reset! appends 0)
-        (swap! max-repo inc))
-      (let [keys (client/repo-keys {:key-count key-count} @max-repo)]
-        (cond
-          ;; A real git client now and then, for fetch completeness.
-          (< (rand) 0.01) (git-fetch-op max-repo)
+      (let [i (if (< (rand) 0.5) 0 (rand-int n))]
+        (when (<= (* key-count per-key) (get @appends i))
+          (swap! appends assoc i 0)
+          (swap! current assoc i (swap! max-repo inc))
+          (when (zero? i) (reset! hot-repo (get @current 0))))
+        (let [keys (client/repo-keys {:key-count key-count} (get @current i))]
+          (cond
+            ;; A real git client now and then, for fetch completeness.
+            (< (rand) 0.01) {:f :git-fetch, :value (get @current i)}
 
-          (< (rand) 0.5)
-          {:f :read, :value (mapv (fn [k] [:r k nil]) keys)}
-          :else
-          (let [ks (take (inc (rand-int 4)) (shuffle keys))]
-            (swap! appends + (count ks))
-            {:f :write
-             :atomic? (case push :atomic true, :non-atomic false, :mixed (< (rand) 0.5))
-             :value (mapv (fn [k] [:append k (swap! value inc)]) ks)}))))))
+            (< (rand) 0.5)
+            {:f :read, :value (mapv (fn [k] [:r k nil]) keys)}
+            :else
+            (let [ks (take (inc (rand-int 4)) (shuffle keys))]
+              (swap! appends update i + (count ks))
+              {:f :write
+               :atomic? (case push :atomic true, :non-atomic false, :mixed (< (rand) 0.5))
+               :value (mapv (fn [k] [:append k (swap! value inc)]) ks)})))))))
 
 (defn elle
   "Elle on the transactions only, with the outcome of timed-out pushes that
@@ -74,7 +82,7 @@
         topo     (cluster/topology (:topology opts))
         faults   (:nemesis opts)
         max-repo (atom 0)
-        opts     (merge opts w {:max-repo max-repo})
+        opts     (merge opts w {:max-repo max-repo, :hot-repo (atom 0)})
         git-gen  #(git-fetch-op max-repo)]
     (merge tests/noop-test
            opts
@@ -114,8 +122,8 @@
 (def cli-opts
   [["-w" "--workload NAME" "w1, w1-v0, w2, w3, or w4"
     :default :w1, :parse-fn keyword, :validate [workloads "unknown workload"]]
-   [nil "--topology NAME" "split (3 ledger and 2 compute nodes) or both (3 nodes)"
-    :default :split, :parse-fn keyword, :validate [#{:split :both} "split or both"]]
+   [nil "--topology NAME" "split (3 ledger and 2 compute nodes), both (3 nodes), or wide (5 ledger and 2 compute nodes)"
+    :default :split, :parse-fn keyword, :validate [#{:split :both :wide} "split, both, or wide"]]
    [nil "--nemesis FAULTS" (str "Comma-separated faults: " (str/join ", " (sort fault-names)))
     :default [], :parse-fn #(mapv keyword (remove str/blank? (str/split % #",")))
     :validate [#(every? (comp fault-names name) %) "unknown fault"]]
@@ -129,6 +137,8 @@
     :default 8, :parse-fn parse-long]
    [nil "--per-key N" "Appends per key before a new repository"
     :default 200, :parse-fn parse-long]
+   [nil "--repos N" "Repositories written at once: half the ops to one, the rest spread over all"
+    :default 1, :parse-fn parse-long, :validate [pos? "at least 1"]]
    [nil "--binary PATH" "The enroute binary"
     :default "../../target/release/enroute"]
    [nil "--dir PATH" "Parent of the per-test directories for node data and the bucket"

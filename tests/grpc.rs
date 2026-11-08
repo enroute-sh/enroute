@@ -9,17 +9,16 @@
 
 use std::sync::Arc;
 
-use futures::StreamExt;
 use tonic::{Request, Response, Status};
 
 use enroute_compute::testing::client;
 use enroute_shared::proto::{
     ActivateRequest, ActivateResponse, DeleteRequest, DeleteResponse, DescribeRequest,
-    DescribeResponse, FollowRequest, ListRequest, ListResponse, ReadBarrierRequest,
-    ReadBarrierResponse, Update, ledger_server, update,
+    DescribeResponse, ListRequest, ListResponse, PendingRequest, PendingResponse,
+    ReadBarrierRequest, ReadBarrierResponse, WatchRequest, ledger_server,
 };
-use enroute_shared::roles::FollowStream;
-use enroute_shared::state::{Change, Command, Commit, LayerMeta, Outcome, RepoMeta};
+use enroute_shared::roles::WatchStream;
+use enroute_shared::state::{Command, Commit, LayerMeta, Outcome};
 
 /// Answers from the request, so the test sees what crossed the wire.
 struct Echo;
@@ -57,6 +56,13 @@ impl ledger_server::Ledger for Echo {
         Ok(Response::new(ReadBarrierResponse { version: 42 }))
     }
 
+    async fn pending(
+        &self,
+        _req: Request<PendingRequest>,
+    ) -> Result<Response<PendingResponse>, Status> {
+        Ok(Response::new(PendingResponse::default()))
+    }
+
     async fn delete(
         &self,
         _req: Request<DeleteRequest>,
@@ -75,22 +81,13 @@ impl ledger_server::Ledger for Echo {
         Err(Status::unimplemented("list"))
     }
 
-    type FollowStream = FollowStream;
+    type WatchStream = WatchStream;
 
-    async fn follow(&self, _req: Request<FollowRequest>) -> Result<Response<FollowStream>, Status> {
-        let state = Update {
-            kind: Some(update::Kind::State(RepoMeta::new())),
-        };
-        let change = Update {
-            kind: Some(update::Kind::Change(Change {
-                version: 2,
-                next_id: Some(5),
-                ..Default::default()
-            })),
-        };
-        Ok(Response::new(
-            futures::stream::iter([Ok(state), Ok(change)]).boxed(),
-        ))
+    async fn watch(
+        &self,
+        _req: Request<tonic::Streaming<WatchRequest>>,
+    ) -> Result<Response<WatchStream>, Status> {
+        Err(Status::unimplemented("watch"))
     }
 }
 
@@ -107,7 +104,7 @@ async fn ledger_over_grpc() {
     let activate = |repo: &str, create| ActivateRequest {
         repo: repo.into(),
         create,
-        head: None,
+        ..Default::default()
     };
     assert!(
         c.activate(activate("r", true))
@@ -153,20 +150,4 @@ async fn ledger_over_grpc() {
             .version,
         42
     );
-    // A followed repository: its state, then the changes after it, applied
-    // by the subscriber.
-    let stream = c
-        .follow(FollowRequest { repo: "r".into() })
-        .await
-        .unwrap()
-        .into_inner();
-    let updates: Vec<Update> = stream.map(|u| u.unwrap()).collect().await;
-    let mut meta = RepoMeta::default();
-    for u in updates {
-        match u.kind.unwrap() {
-            update::Kind::State(s) => meta = s,
-            update::Kind::Change(c) => meta.apply_change(&c),
-        }
-    }
-    assert!(meta.next_id == 5 && meta.version == 2);
 }

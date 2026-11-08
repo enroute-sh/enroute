@@ -63,7 +63,7 @@ pub(crate) async fn merge_layers(
 ) -> Result<Option<Merged>> {
     let views: Arc<[Arc<LayerView>]> = snap.layers[range].into();
     let ids = views[0].base..views[views.len() - 1].end();
-    let mut b = LayerBuilder::new(&ws);
+    let mut b = LayerBuilder::new(&ws, snap.format());
     b.set_ids(ids.clone());
     let cut = views.clone();
     let windows = blocking(move || windows(&cut, window)).await?;
@@ -155,7 +155,7 @@ fn load_window(
         .iter()
         .map(|p| views[p.layer].layer.load_range(p.bytes.clone()))
         .collect();
-    tokio::spawn(futures::future::try_join_all(loads))
+    enroute_shared::store::io::spawn(futures::future::try_join_all(loads))
 }
 
 /// Add the canonical objects of window `w` of `views` (local now) to `b`,

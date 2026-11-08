@@ -20,6 +20,18 @@ pub(crate) fn split_once(line: &[u8], at: u8) -> Option<(&[u8], &[u8])> {
     Some((before, after.get(1..)?))
 }
 
+/// A line's payload without the newline git puts on the end of most of them.
+pub(crate) fn chomp(line: &[u8]) -> &[u8] {
+    line.strip_suffix(b"\n").unwrap_or(line)
+}
+
+/// A line as git reads it into a C string, lossily as text: without its
+/// newline, and up to its first NUL.
+pub(crate) fn c_text(line: &[u8]) -> String {
+    let line = chomp(line).split(|&b| b == 0).next().unwrap_or_default();
+    String::from_utf8_lossy(line).into_owned()
+}
+
 /// [`data`] for a payload from outside, which may not fit one pkt-line.
 ///
 /// # Errors
@@ -71,6 +83,14 @@ pub(crate) enum Pkt<'a> {
     Data(&'a [u8]),
 }
 
+/// The length a pkt-line's 4-byte `prefix` gives, its own 4 bytes included.
+pub(crate) fn length(prefix: &[u8]) -> Result<usize> {
+    std::str::from_utf8(prefix)
+        .ok()
+        .and_then(|hex| usize::from_str_radix(hex, 16).ok())
+        .with_context(|| format!("bad pkt-line length {:?}", String::from_utf8_lossy(prefix)))
+}
+
 pub(crate) struct Reader<'a> {
     buf: &'a [u8],
     pub pos: usize,
@@ -89,10 +109,7 @@ impl<'a> Reader<'a> {
             .buf
             .get(self.pos..self.pos + 4)
             .context("truncated pkt-line")?;
-        let hex = std::str::from_utf8(prefix)?;
-        let len = usize::from_str_radix(hex, 16)
-            .ok()
-            .with_context(|| format!("bad pkt-line length {hex:?}"))?;
+        let len = length(prefix)?;
         self.pos += 4;
         Ok(Some(match len {
             0 => Pkt::Flush,
@@ -110,16 +127,22 @@ impl<'a> Reader<'a> {
         }))
     }
 
-    /// Next data line as a string with the trailing newline removed; `None`
-    /// for any special packet or end of input.
+    /// Next data packet with the trailing newline removed, as git's
+    /// `PACKET_READ_CHOMP_NEWLINE` reads it; the packet itself if it is a
+    /// special one.
+    pub(crate) fn next_data(&mut self) -> Result<Option<Result<&'a [u8], Pkt<'a>>>> {
+        Ok(self.read()?.map(|p| match p {
+            Pkt::Data(d) => Ok(chomp(d)),
+            p => Err(p),
+        }))
+    }
+
+    /// [`Reader::next_data`], as a string.
     pub(crate) fn next_line(&mut self) -> Result<Option<Result<&'a str, Pkt<'a>>>> {
-        Ok(match self.read()? {
+        Ok(match self.next_data()? {
+            Some(Ok(d)) => Some(Ok(std::str::from_utf8(d)?)),
+            Some(Err(p)) => Some(Err(p)),
             None => None,
-            Some(Pkt::Data(d)) => {
-                let s = std::str::from_utf8(d)?;
-                Some(Ok(s.strip_suffix('\n').unwrap_or(s)))
-            }
-            Some(p) => Some(Err(p)),
         })
     }
 }

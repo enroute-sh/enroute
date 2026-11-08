@@ -1,6 +1,5 @@
 //! The only module allowed to use `unsafe` (the crate denies it elsewhere):
-//! the OS calls that rustix does not wrap, and the libdeflate call that
-//! `libdeflater` does not wrap.
+//! the OS calls that rustix does not wrap.
 
 #![warn(clippy::undocumented_unsafe_blocks)]
 
@@ -72,45 +71,4 @@ pub(crate) fn read_exact_vectored_at(
         IoSliceMut::advance_slices(&mut rest, n);
     }
     Ok(())
-}
-
-/// Inflate the zlib stream at the start of `z` to exactly fill `out`; the
-/// bytes the stream takes. `libdeflater` does not report that count.
-pub(crate) fn zlib_decompress_prefix(z: &[u8], out: &mut [u8]) -> Option<usize> {
-    use libdeflate_sys::{
-        libdeflate_alloc_decompressor, libdeflate_decompressor, libdeflate_free_decompressor,
-        libdeflate_result_LIBDEFLATE_SUCCESS, libdeflate_zlib_decompress_ex,
-    };
-    struct Decoder(*mut libdeflate_decompressor);
-    impl Drop for Decoder {
-        fn drop(&mut self) {
-            // SAFETY: the pointer came from `libdeflate_alloc_decompressor`
-            // (null is allowed) and is freed only here.
-            unsafe { libdeflate_free_decompressor(self.0) }
-        }
-    }
-    thread_local! {
-        // SAFETY: allocation has no preconditions; null is checked on use.
-        static DECODER: Decoder = Decoder(unsafe { libdeflate_alloc_decompressor() });
-    }
-    DECODER.with(|d| {
-        if d.0.is_null() {
-            return None;
-        }
-        let (mut used, mut n) = (0, 0);
-        // SAFETY: the decoder is this thread's own and not in use; the
-        // pointers and lengths come from live slices.
-        let rc = unsafe {
-            libdeflate_zlib_decompress_ex(
-                d.0,
-                z.as_ptr().cast(),
-                z.len(),
-                out.as_mut_ptr().cast(),
-                out.len(),
-                &raw mut used,
-                &raw mut n,
-            )
-        };
-        (rc == libdeflate_result_LIBDEFLATE_SUCCESS && n == out.len()).then_some(used)
-    })
 }

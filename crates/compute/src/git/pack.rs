@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail, ensure};
 
 use super::cast::to_u64;
 use super::io::Incoming;
-use super::oid::{Kind, OID_LEN, Oid};
+use super::oid::{Kind, ObjectFormat, Oid};
 use super::zlib;
 
 pub(crate) const OFS_DELTA: u8 = 6;
@@ -39,7 +39,8 @@ pub(crate) fn decode_entry_header(data: &[u8]) -> Result<(u8, u64, usize)> {
     let mut rest = rest.iter();
     while c & 0x80 != 0 {
         c = *rest.next().context("truncated pack entry header")?;
-        ensure!(shift < 64, "pack entry size overflow");
+        // As git: refuse a byte whose bits would not all fit.
+        ensure!(shift <= 64 - 7, "pack entry size overflow");
         size |= u64::from(c & 0x7f) << shift;
         shift += 7;
         i += 1;
@@ -109,11 +110,12 @@ pub(crate) struct StoredEntry<'a> {
 }
 
 impl StoredEntry<'_> {
-    pub(crate) fn parse(bytes: &[u8]) -> Result<StoredEntry<'_>> {
+    /// The entry in `bytes`, from a layer of a `format` repository.
+    pub(crate) fn parse(format: ObjectFormat, bytes: &[u8]) -> Result<StoredEntry<'_>> {
         let (ty, size, hl) = decode_entry_header(bytes)?;
         let delta = ty == REF_DELTA;
         let skip = if delta {
-            OID_LEN
+            format.len()
         } else {
             Kind::from_code(ty).context("unsupported stored entry type")?;
             0
@@ -164,15 +166,24 @@ pub(crate) struct PackEntry {
 /// pass over a pack. The trailer checksum is checked at the end.
 pub(crate) struct PackReader<'a> {
     inc: &'a mut Incoming,
+    format: ObjectFormat,
     hash: PackHasher,
     pos: u64,
     count: u32,
     read: u32,
+    /// The largest object an entry may hold, or build as a delta.
+    max_object: u64,
 }
 
 impl<'a> PackReader<'a> {
-    /// Read the header.
-    pub(crate) fn new(inc: &'a mut Incoming) -> Result<PackReader<'a>> {
+    /// Read the header of a pack of a `format` repository. An entry whose
+    /// object is over `max_object` bytes is an error, found before its data
+    /// is inflated.
+    pub(crate) fn new(
+        inc: &'a mut Incoming,
+        format: ObjectFormat,
+        max_object: u64,
+    ) -> Result<PackReader<'a>> {
         let head = inc.take(12).context("pack too short")?;
         let (magic, rest) = head.split_first_chunk::<4>().context("not a pack")?;
         ensure!(magic == b"PACK", "not a pack");
@@ -184,15 +195,31 @@ impl<'a> PackReader<'a> {
         );
         let (count, _) = rest.split_first_chunk::<4>().context("not a pack")?;
         let count = u32::from_be_bytes(*count);
-        let mut hash = PackHasher::default();
+        let mut hash = PackHasher::new(format);
         hash.update(head);
         Ok(PackReader {
             inc,
+            format,
             hash,
             pos: 12,
             count,
             read: 0,
+            max_object,
         })
+    }
+
+    fn check_size(&self, size: u64) -> Result<()> {
+        ensure!(
+            size <= self.max_object,
+            "object of {size} bytes is over the limit of {} bytes",
+            self.max_object
+        );
+        Ok(())
+    }
+
+    /// The format of the pack's ids.
+    pub(crate) fn format(&self) -> ObjectFormat {
+        self.format
     }
 
     /// Number of entries the header announces.
@@ -203,16 +230,16 @@ impl<'a> PackReader<'a> {
     /// The next entry; after the last, checks the trailer.
     pub(crate) fn next_entry(&mut self) -> Result<Option<PackEntry>> {
         if self.read == self.count {
-            let trailer = self.inc.take(OID_LEN).context("pack truncated")?;
+            let trailer = self.inc.take(self.format.len()).context("pack truncated")?;
             ensure!(
-                trailer == std::mem::take(&mut self.hash).finish(),
+                trailer == self.hash.finish().as_slice(),
                 "pack checksum mismatch"
             );
             ensure!(self.inc.fill(1)?.is_empty(), "trailing garbage in pack");
             return Ok(None);
         }
         let offset = self.pos;
-        // Entry header, ofs or ref base: at most 10 + 10 + 20 bytes.
+        // Entry header, ofs or ref base: at most 10 + 10 + 32 bytes.
         let w = self.inc.fill(64)?;
         ensure!(!w.is_empty(), "pack truncated at entry {}", self.read);
         let (ty, size, hl) = decode_entry_header(w)?;
@@ -229,14 +256,20 @@ impl<'a> PackReader<'a> {
                 )
             }
             REF_DELTA => {
-                let id = w.get(hl..hl + OID_LEN).context("truncated ref-delta")?;
-                (EntryBase::Ref(Oid::from_slice(id)), OID_LEN)
+                let n = self.format.len();
+                let id = w.get(hl..hl + n).context("truncated ref-delta")?;
+                (EntryBase::Ref(Oid::from_slice(self.format, id)), n)
             }
             1..=4 => (EntryBase::None, 0),
             _ => bail!("invalid pack entry type {ty}"),
         };
         let head = hl + bl;
+        // The buffer takes the declared size, so check it first.
+        self.check_size(size)?;
         let (content, used) = self.inc.inflate(head, usize::try_from(size)?)?;
+        if base != EntryBase::None {
+            self.check_size(to_u64(super::delta::target_size(&content)?))?;
+        }
         self.hash.update(self.inc.take(head + used)?);
         self.pos += to_u64(head + used);
         self.read += 1;
@@ -252,9 +285,11 @@ impl<'a> PackReader<'a> {
     }
 }
 
-/// A pack of `entries` (header, entries, trailer).
-pub(crate) fn pack_of(entries: &[Vec<u8>]) -> Vec<u8> {
+/// A pack of `entries` (header, entries, trailer) of a `format`
+/// repository.
+pub(crate) fn pack_of(format: ObjectFormat, entries: &[Vec<u8>]) -> Vec<u8> {
     let (mut h, mut pack) = PackHasher::header(
+        format,
         // A pack with 2^32 entries does not fit in memory.
         u32::try_from(entries.len()).unwrap_or(u32::MAX),
     );
@@ -266,35 +301,97 @@ pub(crate) fn pack_of(entries: &[Vec<u8>]) -> Vec<u8> {
     pack
 }
 
-/// The hash of a pack's trailer. It is an integrity checksum, not an
-/// address, so it is plain SHA-1, without collision detection.
-#[derive(Default)]
-pub(crate) struct PackHasher(sha1::Sha1);
+/// The hash of a pack's trailer, in the repository's format. It is an
+/// integrity checksum, not an address, so SHA-1 is plain SHA-1, without
+/// collision detection.
+pub(crate) enum PackHasher {
+    Sha1(sha1::Sha1),
+    Sha256(sha2::Sha256),
+}
 
 impl PackHasher {
+    /// A hasher of a `format` repository's packs.
+    pub(crate) fn new(format: ObjectFormat) -> Self {
+        match format {
+            ObjectFormat::Sha1 => PackHasher::Sha1(sha1::Digest::new()),
+            ObjectFormat::Sha256 => PackHasher::Sha256(sha2::Digest::new()),
+        }
+    }
+
     /// The header of a pack of `count` entries, and a hasher that has it.
-    pub(crate) fn header(count: u32) -> (Self, Vec<u8>) {
+    pub(crate) fn header(format: ObjectFormat, count: u32) -> (Self, Vec<u8>) {
         let mut h = Vec::with_capacity(12);
         h.extend_from_slice(b"PACK");
         h.extend_from_slice(&2u32.to_be_bytes());
         h.extend_from_slice(&count.to_be_bytes());
-        let mut hasher = PackHasher::default();
+        let mut hasher = PackHasher::new(format);
         hasher.update(&h);
         (hasher, h)
     }
 
     pub(crate) fn update(&mut self, b: &[u8]) {
-        sha1::Digest::update(&mut self.0, b);
+        match self {
+            PackHasher::Sha1(h) => sha1::Digest::update(h, b),
+            PackHasher::Sha256(h) => sha2::Digest::update(h, b),
+        }
     }
 
-    pub(crate) fn finish(self) -> [u8; OID_LEN] {
-        sha1::Digest::finalize(self.0).into()
+    /// The trailer, as long as an id of the format, leaving the hasher
+    /// as new.
+    pub(crate) fn finish(&mut self) -> Vec<u8> {
+        match self {
+            PackHasher::Sha1(h) => sha1::Digest::finalize_reset(h).to_vec(),
+            PackHasher::Sha256(h) => sha2::Digest::finalize_reset(h).to_vec(),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether the pack's first entry reads, under `max_object`.
+    fn first_entry(pack: &[u8], max_object: u64) -> Result<bool> {
+        let src: std::sync::Arc<dyn super::super::io::ReadAt> =
+            std::sync::Arc::new(super::super::io::Owned(pack.to_vec()));
+        let mut inc = Incoming::of(src);
+        Ok(PackReader::new(&mut inc, ObjectFormat::Sha1, max_object)?
+            .next_entry()?
+            .is_some())
+    }
+
+    #[test]
+    fn objects_over_the_limit_are_errors() {
+        let blob = pack_of(ObjectFormat::Sha1, &[full_entry(Kind::Blob, &[7; 100])]);
+        assert!(first_entry(&blob, 100).unwrap());
+        first_entry(&blob, 99).unwrap_err();
+        // A declared size that no allocation could hold fails before any.
+        let mut huge = Vec::new();
+        encode_entry_header(Kind::Blob.code(), 1 << 60, &mut huge);
+        zlib::compress(b"x", &mut huge);
+        first_entry(&pack_of(ObjectFormat::Sha1, &[huge]), 100).unwrap_err();
+        // A small delta that builds a large object: base size 1, result 1000.
+        let delta = pack_of(
+            ObjectFormat::Sha1,
+            &[ref_delta_entry(&Oid::ZERO, &[0x01, 0xe8, 0x07])],
+        );
+        assert!(first_entry(&delta, 1000).unwrap());
+        first_entry(&delta, 999).unwrap_err();
+    }
+
+    #[test]
+    fn a_size_past_64_bits_is_an_error() {
+        let mut header = vec![0xb3];
+        header.extend([0x80; 7]);
+        // Eight 7-bit groups after the first four bits: 60 bits fit.
+        header.push(0x7f);
+        let (_, size, n) = decode_entry_header(&header).unwrap();
+        assert_eq!((size, n), (0x7f << 53 | 3, 9));
+        // A ninth group starts at bit 60, and its bits would be dropped.
+        *header.last_mut().unwrap() = 0x80;
+        header.push(0x01);
+        decode_entry_header(&header).unwrap_err();
+    }
 
     #[test]
     fn ofs_roundtrip() {

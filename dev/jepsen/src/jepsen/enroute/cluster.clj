@@ -30,12 +30,16 @@
 
 (defn topology
   "Node names, roles and ports. `:split` is 3 ledger and 2 compute nodes;
-  `:both` is 3 nodes with both roles."
+  `:both` is 3 nodes with both roles; `:wide` is 5 ledger and 2 compute
+  nodes, so that a log's 3 replicas have nodes to move to."
   [kind]
   (let [roles (case kind
                 :split (array-map "n1" "ledger" "n2" "ledger" "n3" "ledger"
                                   "n4" "compute" "n5" "compute")
-                :both  (array-map "n1" "both" "n2" "both" "n3" "both"))]
+                :both  (array-map "n1" "both" "n2" "both" "n3" "both")
+                :wide  (array-map "n1" "ledger" "n2" "ledger" "n3" "ledger"
+                                  "n4" "ledger" "n5" "ledger"
+                                  "n6" "compute" "n7" "compute"))]
     {:kind     kind
      :nodes    (vec (keys roles))
      :roles    roles
@@ -77,7 +81,9 @@
          "cpu_threads = 2\n"
          "[layers]\nflush_interval = \"300ms\"\n"
          (when-let [kb (:inline-layer-kb test)]
-           (str "inline_layer = \"" kb " KiB\"\n"))
+           (str "inline_layer = \"" kb " KiB\"\n"
+                (when (not= role "compute")
+                  (str "[ledger]\nmax_inline_layer = \"" kb " KiB\"\n"))))
          "[listen]\n"
          "git = \"127.0.0.1:" (git-port node) "\"\n"
          "api = \"127.0.0.1:" (api-port node) "\"\n")))
@@ -124,9 +130,55 @@
 (defn await-ready [node timeout-ms]
   (await! (str node " to be ready") timeout-ms #(ready? node)))
 
+(defn- consensus
+  "The `consensus` object of `node`'s `GET /status`, or nil."
+  [node]
+  (try (:consensus (http/get-json (str "http://127.0.0.1:" (internal-port node) "/status")
+                                  {:timeout 2000}))
+       (catch Exception _ nil)))
+
+(defn node-id
+  "The ledger node ID that `node` runs as now, or nil."
+  [node]
+  (some-> (consensus node) (get "node") long))
+
+(defn hosted-logs
+  "How many repository logs `node` holds, or nil."
+  [node]
+  (some-> (consensus node) (get "repos") long))
+
+(defn await-new-id
+  "Waits until `node` answers with an ID other than `old`, and returns it."
+  [node old timeout-ms]
+  (await! (str node " to join with a new ID") timeout-ms
+          #(when-let [id (node-id node)] (when (not= id old) id))))
+
+(defn wipe!
+  "Deletes everything in `node`'s data directory, as if it lost its disk.
+  Call it while the node is down. It keeps the directory, which can be a
+  LazyFS mount."
+  [test node]
+  (sh! "find" (data-dir test node) "-mindepth" "1" "-delete")
+  (info "wiped the disk of" node))
+
+(defn remove-member!
+  "Runs `enroute members --remove id` on ledger node `via`, as `via`'s user:
+  the command signs with the key in its data directory. True if the ledger
+  removed `id`. Never forces: a removal that would leave no live majority is
+  refused, and the caller retries it later."
+  [test via id]
+  (let [{:keys [exit err]}
+        (shell/sh "setpriv" (str "--reuid=" via) (str "--regid=" via) "--clear-groups"
+                  "env" "-i" "PATH=/usr/bin:/bin" "RUST_LOG=warn"
+                  (bin test) "members" "--config" (str "file://" (config-file test via))
+                  "--remove" (str id))]
+    (if (zero? exit)
+      (do (info via "removed member" id) true)
+      (do (warn via "could not remove member" id ":" (str/trim err)) false))))
+
 (defn await-serving
   "Waits until compute `node` reaches the ledger: /status answers before the
-  node finds the ledger nodes in the bucket."
+  node has joined the ledger."
   [node timeout-ms]
   (let [url (str (git-url node) "/jepsen-ready.git/info/refs?service=git-upload-pack")]
     (await! (str node " to reach the ledger") timeout-ms

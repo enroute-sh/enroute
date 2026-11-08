@@ -3,7 +3,7 @@
 #
 #   curl -fsSL https://enroute.sh/install | sh
 #
-# ENROUTE_VERSION picks a release, for example `0.3.0`. The default is the
+# ENROUTE_VERSION picks a release, for example `0.4.0`. The default is the
 # latest. ENROUTE_INSTALL_DIR picks the directory. The default is
 # `~/.local/bin`, so that the script does not need root.
 #
@@ -34,7 +34,7 @@ target() {
 	esac
 }
 
-# The Linux binaries link against glibc 2.36. A loader error after install
+# The Linux binaries link against glibc 2.28. A loader error after install
 # says less than this does.
 linux() {
 	glibc="$(getconf GNU_LIBC_VERSION 2>/dev/null || true)"
@@ -44,8 +44,8 @@ linux() {
 	esac
 	minor="${glibc#glibc 2.}"
 	minor="${minor%%.*}"
-	if [ "${minor}" -lt 36 ]; then
-		fail "the Linux binaries need glibc 2.36 or later, and this system has ${glibc#glibc }."
+	if [ "${minor}" -lt 28 ]; then
+		fail "the Linux binaries need glibc 2.28 or later, and this system has ${glibc#glibc }."
 	fi
 	echo "$1-unknown-linux-gnu"
 }

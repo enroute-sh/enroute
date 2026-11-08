@@ -7,6 +7,7 @@
 #![cfg(test)]
 
 mod commit;
+mod fetch;
 mod history;
 mod objects;
 mod reflection;
@@ -57,6 +58,18 @@ mod support {
         git(&["commit", "-m", "first"], Some(&local)).await;
         git(&["push", "origin", "main"], Some(&local)).await;
         (client, id, tmp, local, stack)
+    }
+
+    /// Where `repo` holds `refname`, as hex.
+    pub(super) async fn tip(client: &Client, repo: &str, refname: &str) -> Option<String> {
+        client
+            .list_refs(repo)
+            .await
+            .unwrap()
+            .refs
+            .into_iter()
+            .find(|r| r.name == refname)
+            .map(|r| crate::contract::hex(r.object_id.as_ref()))
     }
 
     /// An object id no repository holds, and none ever will.

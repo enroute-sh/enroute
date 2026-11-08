@@ -80,7 +80,9 @@ async fn cold_node(disk_budget: u64) {
 
     let data_a = root.path().join("a");
     {
-        let server = Server::start_config(Config::local(data_a.clone(), store.clone())).await;
+        let mut config = Config::local(data_a.clone(), store.clone());
+        config.compute.flush_interval = std::time::Duration::from_millis(200);
+        let server = Server::start_config(config).await;
         git.run(
             &src,
             &[

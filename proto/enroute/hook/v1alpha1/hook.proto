@@ -190,6 +190,10 @@ message PreReceiveRequest {
   // `Granted.context`, byte for byte, from the `Authorize` that admitted this
   // push.
   bytes context = 4;
+
+  // The client's `git push -o` options, in order. The pusher chose them, so
+  // they are a request, not a decision.
+  repeated string push_options = 5;
 }
 
 // One ref update a push is asking for — git's own unit, the line a
@@ -293,6 +297,9 @@ message PostReceiveRequest {
   // `Granted.context`, byte for byte, from the `Authorize` that admitted this
   // push.
   bytes context = 4;
+
+  // The client's `git push -o` options, as in `PreReceiveRequest`.
+  repeated string push_options = 5;
 }
 
 // Nothing that changes what happened, and something to say about it.

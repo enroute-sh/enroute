@@ -1,8 +1,7 @@
-//! Restarts: local layer copies, sparse or complete, survive a restart and
-//! are checked before use.
+//! Restarts: local disk does not outlive the process, so a restarted node
+//! starts as a fresh one.
 
 #![expect(
-    clippy::multiple_unsafe_ops_per_block,
     clippy::unwrap_used,
     reason = "a test fails by panicking, on values it chose itself"
 )]
@@ -29,7 +28,8 @@ async fn seed(
         )
         .await;
     }
-    let config = own_copies(Config::local(root.join("seed"), store.clone()));
+    let mut config = own_copies(Config::local(root.join("seed"), store.clone()));
+    config.compute.flush_interval = std::time::Duration::from_millis(200);
     let server = Server::start_config(config).await;
     git.run(&src, &["push", "-q", &server.repo_url("r"), "main"])
         .await;
@@ -54,78 +54,44 @@ fn files_with(dir: &std::path::Path, suffix: &str) -> Vec<std::path::PathBuf> {
     out
 }
 
-/// Partial local copies within a disk budget survive a restart.
+/// A restart empties the local disk: local copies, scratch and the
+/// catalog of older versions go, and layers are fetched again.
 ///
-/// The chunk hashes catch damage to them, and the leftovers of a crash are
-/// cleaned up.
+/// The old files are not read, so damage to them does not matter.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[expect(
-    unsafe_code,
-    reason = "the engine reads its test-only tuning from the environment"
-)]
-async fn sparse_copies_survive_restarts() {
-    // SAFETY: set before any thread reads them.
-    unsafe {
-        std::env::set_var("ENROUTE_TIER_CHUNK", "4096");
-        std::env::set_var("ENROUTE_PAGE_SIZE", "4096");
-    }
+async fn a_restart_starts_with_an_empty_local_disk() {
     let git = Git::new();
     let root = tempfile::tempdir().unwrap();
     let store = local_store(root.path());
     let src = seed(&git, root.path(), &store).await;
-
-    let data = root.path().join("node");
-    copy_dir(&root.path().join("seed/log"), &data.join("log"));
-    copy_dir(&root.path().join("seed/state"), &data.join("state"));
-    let config = || {
-        let mut c = own_copies(Config::local(data.clone(), store.clone()));
-        c.disk_cache_bytes = 1 << 20;
-        c
-    };
-    let id;
-    {
-        let server = Server::start_config(config()).await;
-        id = server.node.consensus().unwrap().id;
-        let dst = git.dir("one");
-        git.run(
-            git.home.path(),
-            &["clone", "-q", &server.repo_url("r"), dst.to_str().unwrap()],
-        )
-        .await;
-        assert!(
-            server.node.compute().unwrap().storage().status()["local_copies"]["remote_opens"]
-                .as_u64()
-                .unwrap()
-                > 0
-        );
-    }
+    let data = root.path().join("seed");
     let local = data.join("local");
-    let sparse = files_with(&local, ".layer");
-    assert!(!sparse.is_empty(), "local copies kept on disk");
-    // Damage the start of a recorded chunk, as a crash might (the first
-    // chunk is always present: the header is read at open).
-    {
+    let layers = files_with(&local, ".layer");
+    assert!(!layers.is_empty(), "local copies kept on disk");
+    for l in &layers {
         use std::os::unix::fs::FileExt;
-        let f = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&sparse[0])
-            .unwrap();
-        f.write_all_at(&[0xa5; 64], 100).unwrap();
+        let f = std::fs::OpenOptions::new().write(true).open(l).unwrap();
+        f.write_all_at(&[0x5a; 64], 200).unwrap();
     }
-    // Leftovers of a crash: scratch, and a local copy the catalog never
-    // recorded.
     std::fs::write(local.join("tmp/junk"), b"x").unwrap();
-    let stray = sparse[0].with_file_name("0000.layer");
-    std::fs::write(&stray, b"x").unwrap();
 
-    let server = Server::start_config(config()).await;
-    // The node's identity is its log store: a restart keeps it.
-    assert_eq!(server.node.consensus().unwrap().id, id);
+    let server = Server::start_config(own_copies(Config::local(data, store))).await;
+    assert!(!local.join("tmp/junk").exists(), "scratch removed");
     assert!(
-        !local.join("tmp/junk").exists() && !stray.exists(),
-        "crash leftovers removed"
+        layers.iter().all(|l| !l.exists()),
+        "old local copies moved aside"
     );
-    let dst = git.dir("two");
+    let wiped = || {
+        std::fs::read_dir(&local)
+            .unwrap()
+            .flatten()
+            .all(|e| !e.file_name().to_string_lossy().starts_with("wiped-"))
+    };
+    assert!(
+        common::wait_until(wiped, 10).await,
+        "old local files deleted"
+    );
+    let dst = git.dir("dst");
     git.run(
         git.home.path(),
         &["clone", "-q", &server.repo_url("r"), dst.to_str().unwrap()],
@@ -135,37 +101,9 @@ async fn sparse_copies_survive_restarts() {
     assert_eq!(git.rev(&src, "main").await, git.rev(&dst, "HEAD").await);
     let stats = server.node.compute().unwrap().storage().status();
     assert!(
-        stats["local_copies"]["recovered"].as_u64().unwrap() > 0,
+        stats["local_copies"]["remote_opens"].as_u64().unwrap() > 0,
         "{stats}"
     );
-}
-
-/// A complete local copy from a previous run is reused, chunk by chunk.
-///
-/// Each chunk is checked as it is used, and a damaged one is fetched again.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn complete_copies_are_checked_chunk_by_chunk_after_restart() {
-    let git = Git::new();
-    let root = tempfile::tempdir().unwrap();
-    let store = local_store(root.path());
-    let src = seed(&git, root.path(), &store).await;
-    let data = root.path().join("seed");
-    let layers = files_with(&data.join("local"), ".layer");
-    assert!(!layers.is_empty());
-    for l in &layers {
-        use std::os::unix::fs::FileExt;
-        let f = std::fs::OpenOptions::new().write(true).open(l).unwrap();
-        f.write_all_at(&[0x5a; 64], 200).unwrap();
-    }
-    let server = Server::start_config(own_copies(Config::local(data, store))).await;
-    let dst = git.dir("dst");
-    git.run(
-        git.home.path(),
-        &["clone", "-q", &server.repo_url("r"), dst.to_str().unwrap()],
-    )
-    .await;
-    git.run(&dst, &["fsck", "--strict"]).await;
-    assert_eq!(git.rev(&src, "main").await, git.rev(&dst, "HEAD").await);
 }
 
 /// A fresh node with only the log rebuilds its private state from the store.
@@ -212,8 +150,8 @@ fn layer_files(dir: &std::path::Path) -> Vec<(u64, u64)> {
 /// With a `file://` store on the same filesystem as the node's data, the
 /// local copy of each layer is a hard link to the stored file.
 ///
-/// That holds for flushed and compacted layers, and after a restart, so
-/// the layers are on disk once.
+/// That holds for flushed and compacted layers, and after a restart (which
+/// links them again), so the layers are on disk once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn local_copies_are_links_to_a_local_store() {
     use std::os::unix::fs::MetadataExt;
@@ -240,7 +178,9 @@ async fn local_copies_are_links_to_a_local_store() {
     let linked = |ids: &[String]| {
         for id in ids {
             let local = data.join(format!("local/layers/r/{id}.layer"));
-            let stored = root.path().join(format!("store/repos/r/layers/{id}.layer"));
+            let stored = root
+                .path()
+                .join(format!("store/data/repos/r/layers/{id}.layer"));
             let (local, stored) = (
                 std::fs::metadata(&local).unwrap(),
                 std::fs::metadata(&stored).unwrap(),

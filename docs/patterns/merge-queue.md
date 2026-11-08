@@ -71,7 +71,7 @@ back refused, so the loser is refused rather than served.
 **A rejection is an outcome, not an error.** The RPC returns `OK`. Read
 `outcomes`, which arrive in the order the updates were sent, and treat an
 absent `rejection` as landed. See
-[The contract](../reference/the-contract.md#refs-and-objects).
+[The contract](../reference/the-contract.md#updaterefs).
 
 **`REASON_NON_FAST_FORWARD` needs no repair.** It means only that the trunk
 moved between the read and the write. Show it differently on the page: "the

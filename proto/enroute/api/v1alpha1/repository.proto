@@ -42,6 +42,18 @@ message Repository {
   // Unset until something has been pushed. Present so a caller can build a
   // repository listing without walking refs for a timestamp.
   google.protobuf.Timestamp last_push = 3;
+  // How the repository names its objects: chosen at creation, for good.
+  ObjectFormat object_format = 4;
+}
+
+// The hash a repository's object ids are, as git's `extensions.objectFormat`
+// names it. A git client clones and pushes in the repository's format; one
+// that speaks the other is refused.
+enum ObjectFormat {
+  // On a create, SHA-1. A repository never reports it.
+  OBJECT_FORMAT_UNSPECIFIED = 0;
+  OBJECT_FORMAT_SHA1 = 1;
+  OBJECT_FORMAT_SHA256 = 2;
 }
 
 message CreateRepositoryRequest {
@@ -52,6 +64,11 @@ message CreateRepositoryRequest {
   // What you call this repository. Required, and the name every later call
   // uses — there is no id of ours to store beside your own.
   common.v1alpha1.RepoKey repo = 2;
+
+  // Unspecified is SHA-1. Read only on the create that makes the repository,
+  // as `default_branch` is. A server whose operator has not turned SHA-256
+  // on refuses it with FAILED_PRECONDITION.
+  ObjectFormat object_format = 3;
 }
 
 message CreateRepositoryResponse {

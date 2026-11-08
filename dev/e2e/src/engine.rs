@@ -62,6 +62,8 @@ impl Enroute {
         // and merged layers too, not only inline ones.
         node.compute.flush_interval = Duration::from_millis(100);
         node.compute.merge_factor = 2;
+        // The differential suite runs SHA-256 cases too.
+        node.ledger.allow_sha256 = true;
         let hooks = match app {
             Some(app) => enroute::Endpoint {
                 url: app.endpoint_url.parse().context("a hook endpoint URL")?,
@@ -79,9 +81,15 @@ impl Enroute {
             None => enroute::HostHooks::default(),
         };
         let loopback = SocketAddr::from(([127, 0, 0, 1], 0));
-        let listeners = enroute::Listeners::bind(loopback, loopback, loopback).await?;
-        let git_url = format!("http://{}", listeners.git.local_addr()?);
-        let grpc_url = format!("http://{}", listeners.api.local_addr()?);
+        let listeners = enroute::Listeners::bind(Some(loopback), Some(loopback), loopback).await?;
+        let git_url = format!(
+            "http://{}",
+            listeners.git.as_ref().context("git")?.local_addr()?
+        );
+        let grpc_url = format!(
+            "http://{}",
+            listeners.api.as_ref().context("api")?.local_addr()?
+        );
         // The suite's remotes are plain HTTP on loopback.
         let reach = enroute::Reach { private: true };
         let serving = enroute::Enroute::start(node, hooks, reach)

@@ -1,9 +1,14 @@
 # Maintenance
 
 This page describes the background work on a repository's layers: flushing,
-compaction, and the layer sweep. All of it runs on the compute node that holds
-the maintenance lease of the repository ([Maintenance
-leases](ledger-and-compute.md#maintenance-leases)).
+compaction, and the layer sweep. All of it runs on the compute node that
+maintains the repository ([Maintainers](ledger-and-compute.md#maintainers)).
+
+**The key idea.** Upkeep is an LSM tree's: small layers merge into larger ones
+by size, and a file leaves storage only after nothing has named it for a
+retention period. Every change is a compare-and-swap on the layer list, so two
+nodes doing the same work at once waste effort but never corrupt state, and no
+lock or lease is needed.
 
 ## Compaction
 
@@ -71,8 +76,8 @@ layer files that nothing names and nothing will. These are replaced layers,
 outputs of lost races, and files of crashed or abandoned publishes.
 
 The maintainer runs it every `layers.sweep_interval` (1 h). It lists the layers
-of the repository, then reads the live manifest through a read barrier, and the
-state object. It deletes a listed file only if all three conditions hold.
+of the repository, then reads the live manifest through a read barrier. It
+deletes a listed file only if both conditions hold.
 
 1. **No manifest names it, and none ever will.** The live manifest does not name
    it, and its upload generation (in its id) is out of the window of that state.
@@ -82,19 +87,18 @@ state object. It deletes a listed file only if all three conditions hold.
    Ids are never reused, so a replaced layer cannot come back. These are facts
    about the log. A sweeper with a skewed clock, or one far behind on the log,
    can delay a deletion but never delete a file that something names.
-2. **The state object does not name it.** The state object is the checkpoint
-   that an operator recovers from. It is up to a minute behind the log, and
-   indefinitely behind while checkpoints fail. Neon deletes layer files only
-   after an `index_part.json` that drops them is uploaded, for the same reason.
-3. **It has gone unnamed for `layers.sweep_retention`** (6 h) **by the clock of
+2. **It has gone unnamed for `layers.sweep_retention`** (6 h) **by the clock of
    the object store.** Readers of older states can then finish: compute nodes
    that serve older snapshots, and long queries that read the object store
-   directly. The sweep record (`repos/<repo>/sweep`, replaced by
+   directly. The sweep record (`data/repos/<repo>/sweep`, replaced by
    compare-and-swap) keeps the files seen unnamed and since when. The time is
    the last-modified time of the record write that first listed them, filled in
    by the next sweep. That sweep also takes the last-modified time of the record
    as "now". Both err late. Getting this wrong fails a read, never loses a
-   referenced file.
+   referenced file. The retention also bounds how old the volume snapshots an
+   operator restores the ledger from may be
+   ([Recovery](ledger-and-compute.md#recovery)): a state no older than the
+   retention names only files the sweep has kept.
 
 The sweep advances the upload generation (a log entry) only when a file that
 nothing names is still in the window. A repository with nothing to delete

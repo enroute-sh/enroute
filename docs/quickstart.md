@@ -1,26 +1,209 @@
 # Quickstart
 
-This guide runs Enroute on your machine, pushes a repository to it, and reads
-the repository back. You need Git and the `enroute` binary.
+In about five minutes, you run Enroute on your machine, push a repository to
+it, read the repository back over Git and over the API, and turn on the first
+hook. You need Git, and Linux or macOS on Apple silicon.
 
 ## Install
 
-On Linux or macOS, run the installer:
+Run the installer:
 
 ```sh
 curl -fsSL https://enroute.sh/install | sh
 ```
 
 It downloads the latest release for your platform, checks it against
-`SHA256SUMS`, and puts `enroute` in `~/.local/bin`. To install a different
-release, set `ENROUTE_VERSION`, for example `0.3.0`. To install to a
-different directory, set `ENROUTE_INSTALL_DIR`. Pass the variables to `sh`:
+`SHA256SUMS`, and puts `enroute` in `~/.local/bin`. To install a specific
+release, set `ENROUTE_VERSION`:
 
 ```sh
-curl -fsSL https://enroute.sh/install | ENROUTE_VERSION=0.3.0 sh
+curl -fsSL https://enroute.sh/install | ENROUTE_VERSION=0.4.0 sh
 ```
 
-You can also download the archive for your platform from the
+To install from an archive, build from source, or use the container image, see
+[Other ways to install](#other-ways-to-install).
+
+## Start Enroute
+
+In an empty directory, run:
+
+```sh
+enroute dev
+```
+
+```text
+enroute dev is running. Press Ctrl-C to stop.
+
+  git      http://127.0.0.1:8080
+  api      http://127.0.0.1:50051
+  dir      /home/you/project/.enroute/dev
+  hooks    off (every request may read and push; pass --hooks URL to opt in)
+
+Try:
+  git push http://127.0.0.1:8080/hello.git main
+  enroute repo list
+```
+
+`enroute dev` runs one node with a generated configuration. It keeps its data
+in `.enroute/dev`, and writes a `.gitignore` in `.enroute` so that Git ignores
+it. Every listener binds to `127.0.0.1`. No hook is enabled, so every request
+may read and push.
+
+Leave it running, and open a second terminal for the next steps.
+
+## Push a repository
+
+Make a repository with one commit, and push it:
+
+```sh
+git init -b main hello && cd hello
+echo "# hello" > README.md
+git add README.md && git commit -m "First commit"
+git push http://127.0.0.1:8080/hello.git main
+```
+
+```text
+To http://127.0.0.1:8080/hello.git
+ * [new branch]      main -> main
+```
+
+The push created the repository. Nothing had to exist first: with no
+`authorize` hook, the URL path without `.git` is the repository key, here
+`hello`.
+
+List the repositories:
+
+```sh
+enroute repo list
+```
+
+```text
+hello	refs/heads/main	pushed 2026-11-06T14:19:32Z
+```
+
+Each line is the key, the default branch, and the time of the last push.
+
+## Read it back
+
+Clone the repository into a second directory:
+
+```sh
+cd .. && git clone http://127.0.0.1:8080/hello.git hello-copy
+```
+
+```text
+Cloning into 'hello-copy'...
+```
+
+Now make a commit without a checkout. `enroute commit` calls the
+`CreateCommit` RPC, as your application would:
+
+```sh
+enroute commit hello --branch main -m "Add notes" \
+  --author "You <you@example.com>" --put notes.md="hello"
+```
+
+```text
+commit cd11fc866fc0f7b3d614fe666ae944e8fa650016
+tree   396194106f8aa1ebd739119f51e48c40f90f5d79
+parent 30fbadfa87dba7ee2d3d34385315a675d98ed191
+```
+
+Your IDs differ, because they include the time of the commit. Pull the commit
+into the clone:
+
+```sh
+cd hello-copy && git pull
+```
+
+```text
+Fast-forward
+ notes.md | 1 +
+ 1 file changed, 1 insertion(+)
+ create mode 100644 notes.md
+```
+
+The branch now points to the new commit, whichever way you read it:
+
+```sh
+enroute refs hello
+```
+
+```text
+cd11fc866fc0f7b3d614fe666ae944e8fa650016	refs/heads/main
+```
+
+`enroute repo`, `enroute refs`, and `enroute commit` call the gRPC API on port
+`50051`. You can call it directly with any gRPC client, such as
+[`grpcurl`](https://github.com/fullstorydev/grpcurl). The server answers
+reflection, so you need no proto files to explore it. See the
+[API contract](reference/the-contract.md).
+
+## Turn on a hook
+
+So far, anyone who can reach port `8080` can read and push. Hooks let your
+application decide. Stop `enroute dev` with Ctrl-C, and start it again with a
+hook URL and the `authorize` hook:
+
+```sh
+enroute dev --hooks http://localhost:3000/api/enroute/hooks --enable authorize
+```
+
+```text
+  hooks    authorize -> http://localhost:3000/api/enroute/hooks
+           signing key id UDb6dVdOEUZzCnZ0-HqsSkgGpEM8vdvEfdGvIg6rI70
+           private key /home/you/project/.enroute/dev/hooks-signing-key.pem
+           public key /home/you/project/.enroute/dev/hooks-signing-key.pub.pem:
+```
+
+On the first run, Enroute generates a signing key and keeps it in
+`.enroute/dev`. Your application verifies each hook with the public key.
+Leave out `--enable` to turn on all four hooks.
+
+Nothing answers at that URL yet, so every Git request now fails:
+
+```sh
+git ls-remote http://127.0.0.1:8080/hello.git
+```
+
+```text
+remote: authorization failed
+fatal: unable to access 'http://127.0.0.1:8080/hello.git/': The requested URL returned error: 500
+```
+
+That is the intended behaviour. An enabled hook fails closed: if your
+application does not answer, Enroute serves nothing.
+
+## What just happened
+
+- **Enroute served Git, and nothing else.** It took a push, served a clone,
+  and made a commit, but it does not know who you are. Users, repository
+  names, and permissions belong to your application, which Enroute asks
+  through hooks.
+- **Two interfaces reached one repository.** Git clients use port `8080`. Your
+  application uses the gRPC API on port `50051`, which reads files, history,
+  and diffs, and writes commits, without a Git client. See
+  [Clients and interfaces](concepts/two-callers.md).
+- **Each write was durable when it returned.** The push and the commit were
+  each one entry in the repository's log, synced to disk before Enroute
+  answered. On one node, the log and the objects are both in `.enroute/dev`.
+  In production, the objects go to an object store and the log is replicated.
+  See [Storage](concepts/storage.md).
+
+## Next steps
+
+- [Build a code-hosting application](build/README.md): answer the hooks, and
+  show repositories, files, history, and diffs in a web application.
+- [Concepts](concepts/README.md): what your application holds, what Enroute
+  holds, and how a push moves through both.
+- [Deployment profiles](operate/deployment-profiles.md): run Enroute on more
+  than one machine.
+
+## Other ways to install
+
+### From an archive
+
+Download the archive for your platform from the
 [releases page](https://github.com/enroute-sh/enroute/releases), and put
 `enroute` on your `PATH`:
 
@@ -36,117 +219,23 @@ sudo install enroute-<version>-<target>/enroute /usr/local/bin/
 ```
 
 `SHA256SUMS` on the same page has the checksum of each archive. The Linux
-binaries need glibc 2.36 or later. The macOS binary is not signed. If you
+binaries need glibc 2.28 or later. The macOS binary is not signed. If you
 download it with a browser, macOS blocks it. To let it run, enter
 `xattr -d com.apple.quarantine /usr/local/bin/enroute`.
 
-For a different platform, build `enroute` from a checkout of the repository.
-You need Rust:
+### From source
+
+For another platform, build `enroute` from a checkout of the repository. You
+need Rust:
 
 ```sh
 cargo install --path .
 ```
 
-You can also [run the published image](#run-the-image).
+### Run the image
 
-## Start Enroute
-
-```sh
-enroute dev
-```
-
-`enroute dev` runs one node with a generated configuration. It keeps its data
-in `./.enroute/dev`, and writes a `.gitignore` in `./.enroute` so that Git
-ignores it.
-
-```text
-
-enroute dev is running. Press Ctrl-C to stop.
-
-  git      http://127.0.0.1:8080
-  api      http://127.0.0.1:50051
-  dir      /home/you/project/.enroute/dev
-  hooks    off (every request may read and push; pass --hooks URL to opt in)
-
-Try:
-  git push http://127.0.0.1:8080/hello.git main
-  enroute repo list
-```
-
-All listeners bind to `127.0.0.1`. To bind Git and the API to a different
-address, use `--host`. No hook is enabled, so every request may read and push.
-
-## Push a repository
-
-In another terminal, make a repository and push it:
-
-```sh
-git init -b main hello && cd hello
-echo "# hello" > README.md
-git add README.md && git commit -m "First commit"
-git push http://127.0.0.1:8080/hello.git main
-```
-
-The push creates the repository. Its key is the URL path without `.git`:
-`hello`. See [Repository keys](reference/the-contract.md#repository-keys).
-
-List the repositories:
-
-```sh
-enroute repo list
-```
-
-## Read it back
-
-Clone the repository:
-
-```sh
-git clone http://127.0.0.1:8080/hello.git hello-copy
-```
-
-Make a commit without a checkout. This calls `CreateCommit` on the API, as
-your application does:
-
-```sh
-enroute commit hello --branch main -m "Add notes" \
-  --author "You <you@example.com>" --put notes.md="hello"
-```
-
-Run `git pull` in `hello-copy` to get the commit.
-
-The `repo`, `refs`, and `commit` commands call the gRPC API. To call it
-directly, use a gRPC client such as [`grpcurl`]. The server answers
-reflection.
-
-[`grpcurl`]: https://github.com/fullstorydev/grpcurl
-
-## Opt in to hooks
-
-Hooks let your application decide who may read and push. Every hook is
-opt-in. Stop `enroute dev` with Ctrl-C, and start it with a hook URL:
-
-```sh
-enroute dev --hooks http://localhost:3000/api/enroute/hooks --enable authorize
-```
-
-On the first run, Enroute generates a signing key and keeps it in
-`.enroute/dev`. The banner prints the public key, its key ID, and the path of
-`hooks-signing-key.pub.pem`. Your application verifies each hook with this
-public key. See [Verify the signature](reference/verify-the-signature.md).
-
-With `authorize` enabled, Enroute asks your application about every Git
-request. Your application maps the URL to a repository key, identifies the
-caller, and grants or denies access. Until an endpoint answers at that URL,
-every Git request fails. Leave out `--enable` to enable all four hooks.
-
-To build the endpoint, follow
-[Build a code-hosting application](build/README.md). For every field, see the
-[hook reference](reference/hooks.md).
-
-## Run the image
-
-You can run `enroute dev` from the published image instead of a local build.
-Replace `<version>` with a release, for example `0.3.0`:
+You can run `enroute dev` from the published image. Replace `<version>` with
+a release, for example `0.4.0`:
 
 ```sh
 docker run --rm -p 8080:8080 -p 50051:50051 -v enroute-dev:/data \
@@ -157,11 +246,11 @@ docker run --rm -p 8080:8080 -p 50051:50051 -v enroute-dev:/data \
 because the host cannot reach the loopback address of a container. With no
 `authorize` hook, Enroute logs a warning that anyone who can reach Git can
 read and push. Publish the ports only to a machine that you trust. The
-`enroute-dev` volume keeps the data. To delete the data, run
+`enroute-dev` volume keeps the data. To delete it, run
 `docker volume rm enroute-dev`.
 
-To send hooks to an application on the host, add a hook URL that names
-`host.docker.internal`:
+To send hooks to an application on the host, name `host.docker.internal` in
+the hook URL:
 
 ```sh
 docker run --rm -p 8080:8080 -p 50051:50051 -v enroute-dev:/data \
@@ -171,18 +260,6 @@ docker run --rm -p 8080:8080 -p 50051:50051 -v enroute-dev:/data \
 ```
 
 `--add-host` is necessary on Linux. Docker Desktop resolves
-`host.docker.internal` without it.
-
-The public signing key is in the volume, at
-`/data/hooks-signing-key.pub.pem`. The banner prints the public key. If the container runs in the background, read
-the banner with `docker logs <container>`.
-
-## Next steps
-
-- [Build a code-hosting application](build/README.md) — build an application
-  on Enroute.
-- [Hook reference](reference/hooks.md) — every field of every hook, with
-  payloads.
-- [Concepts](README.md#concepts)
-- [Configuration](operate/configuration.md)
-- [Limitations](reference/limitations.md)
+`host.docker.internal` without it. The public signing key is in the volume, at
+`/data/hooks-signing-key.pub.pem`, and the banner prints it. If the container
+runs in the background, read the banner with `docker logs <container>`.

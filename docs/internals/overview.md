@@ -14,11 +14,13 @@ compute and storage, which modern databases decouple.
 
 Enroute instead:
 
-- keeps repositories as **immutable layers in an object store** (S3 or a local
-  directory), LSM-style, with background compaction;
+- keeps repositories as **immutable layers in an object store** (S3, Google
+  Cloud Storage, Azure Blob Storage, or a local directory), LSM-style, with
+  background compaction;
 - keeps each repository's **refs and layer manifest in its own replicated log**
-  (Raft over one shared, group-committed log store per node, with the state
-  machines on disk in an LSM tree; idle logs go quiet; no external database);
+  (a sequencer appointed by a root Raft log, replicating over one shared,
+  group-committed log store per node, with the state machines on disk in an
+  LSM tree; idle logs cost nothing; no external database);
 - serves fetches from **long-lived in-memory snapshots** (commit graph with
   generation numbers, per-commit object segments as roaring bitmaps), streaming
   stored pack entries verbatim;
@@ -39,7 +41,7 @@ Enroute instead:
 - **Storage and compute are disaggregated** in the style of Neon: the object
   store is the durable store, and nodes are replaceable.
 - **No external database dependency.** Consensus for mutable state is built in
-  (Raft).
+  (a shard log per repository, and a Raft root log).
 
 ## Non-goals
 
@@ -64,27 +66,28 @@ node both roles.
                │ smart HTTP (git port)       │ gRPC (API port)
   ┌────────────▼─────────────────────────────▼──────────────┐
   │ compute: git protocol (upload-pack, receive-pack), API  │
-  │   ingest   serving   maintenance (by lease)             │
+  │   ingest   serving   maintenance (as maintainer)        │
   │   views: immutable snapshots, node-private state        │
   │   followed repositories   storage: files, buffer pool   │──┐
-  └───────────────┬─────────────────────────────────────────┘  │ layers, leases,
-  ledger service  │ activate, propose, read barrier,           │ state objects
+  └───────────────┬─────────────────────────────────────────┘  │ layers
+  ledger service  │ activate, propose, read barrier,           │
     (in-process   │ follow (the internal port)                 │
      or remote)   ▼                                            ▼
   ┌───────────────────────────────────────────────────────┐   object store
-  │ ledger: consensus (a raft log per repository,         │   (S3 / fs)
-  │ state machine: refs + manifest + inline layers),      │──▶ state objects,
-  │ incarnations, voters, checkpoints                     │    node registry
-  └───────────────┬───────────────────────────────────────┘
-       Raft (gRPC,│ batched, the internal port)
+  │ ledger: consensus (a shard log per repository,        │   (S3, GCS, Azure,
+  │ state machine: refs + manifest + inline layers),      │──▶ or a directory):
+  │ root log: incarnations, members                       │    members list,
+  └───────────────┬───────────────────────────────────────┘    trash markers
+       Peer (gRPC,│ batched, the internal port)
                   ▼
           other ledger nodes
 ```
 
-- The **ledger** keeps one Raft log per repository. The state machine of a log
+- The **ledger** keeps one replicated log per repository. The state machine of a log
   is the refs, the `HEAD` branch, and the layer manifest of that repository.
   Logs of all repositories share one group-committed log store on each node.
-  Every ledger node votes in every log. See [Consensus](consensus.md) and
+  Each log has up to three replicas among the ledger nodes, one of them its
+  sequencer, which the root log names. See [Consensus](consensus.md) and
   [Ledger and compute](ledger-and-compute.md).
 - The **compute** does the Git work. It follows the logs, builds in-memory views
   of each repository, and serves Git and the gRPC API from them.
@@ -101,8 +104,8 @@ flushes inline layers to the object store and merges layers. See [Write
 path](write-path.md) and [Maintenance](maintenance.md).
 
 A push with `--atomic` sets the atomic flag on the commit, so every ref lands or
-none does. `UpdateRefs` does not set it. Its updates share one log entry, but
-each one succeeds or fails on its own.
+none does. `UpdateRefs` sets it when the request asks for `atomic`. Otherwise
+its updates share one log entry, but each one succeeds or fails on its own.
 
 ### Reads
 
@@ -140,16 +143,17 @@ push takes the barrier only when its view does not have an object it needs. See 
 
 | Tier | Where | Source of truth? | Contents |
 |---|---|---|---|
-| Replicated | Raft log + state machine, while a repository is active | Yes | Per repo: refs, HEAD, layer manifest, inline layers |
-| Durable shared | Object store | Yes | Immutable layer files; which repositories exist, and each one's state, checkpointed ([Freezing the ledger](ledger-and-compute.md#freezing-the-ledger)); the [node registry](ledger-and-compute.md#node-registry) |
-| Replica-private | Node memory + local disk | **No**: derived, rebuildable | Layer cache (local files read through the buffer pool), dense ids, commit graph, segments, object and entry caches, the node catalog |
+| Replicated | Shard log + state machine, while a repository is active | Yes | Per repo: refs, HEAD, layer manifest, inline layers; the root log: which repositories exist, the members |
+| Durable shared | Object store | Yes | Immutable layer files; the [members list](ledger-and-compute.md#finding-the-ledger) |
+| Replica-private | Node memory + local disk | **No**: derived, rebuildable | Layer cache (local files read through the buffer pool), dense ids, commit graph, segments, object and entry caches |
 
 A node can lose its entire local cache. It rebuilds from the replicated state
 plus the object store. Losing replica-private data costs
 performance, never correctness. A repository's latest state is in its log and
-state store on its voters' disks, which move with their nodes ([Freezing the
+state store on its replicas' disks, which move with their nodes ([Freezing the
 ledger](ledger-and-compute.md#freezing-the-ledger)). If a majority of them are
-lost, an operator must recover it by hand from its last checkpoint.
+lost, an operator restores the ledger from volume snapshots
+([Recovery](ledger-and-compute.md#recovery)).
 
 ## Components
 

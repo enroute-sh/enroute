@@ -120,7 +120,7 @@ impl Segments {
         let n = cx.idx.len();
         Segments {
             out: Some(SegmentsOut {
-                builder: LayerBuilder::new(ws),
+                builder: LayerBuilder::new(ws, cx.snap.format()),
                 assign: TempTable::filled(
                     ws,
                     n,

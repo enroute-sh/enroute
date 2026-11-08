@@ -25,7 +25,7 @@ axum.workspace = true
 bytes.workspace = true
 crc32fast.workspace = true
 crossbeam-queue.workspace = true
-flate2.workspace = true
+ed25519-dalek.workspace = true
 foldhash.workspace = true
 futures.workspace = true
 gix-actor.workspace = true
@@ -34,8 +34,6 @@ gix-hash.workspace = true
 gix-object.workspace = true
 gix-validate.workspace = true
 integer-encoding.workspace = true
-libdeflate-sys.workspace = true
-libdeflater.workspace = true
 rand.workspace = true
 rayon.workspace = true
 object_store.workspace = true
@@ -46,12 +44,14 @@ prost-types.workspace = true
 quick_cache.workspace = true
 reqwest = { workspace = true, features = ["rustls", "stream"] }
 roaring.workspace = true
+rpds.workspace = true
 rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha1.workspace = true
 sha2.workspace = true
 sha1dc.workspace = true
+sirocco.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -64,6 +64,8 @@ zerocopy.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+# Paused time, for timeouts in tests.
+tokio = { workspace = true, features = ["test-util"] }
 
 # `F_PUNCHHOLE`, which rustix does not wrap.
 [target.'cfg(target_os = "macos")'.dependencies]

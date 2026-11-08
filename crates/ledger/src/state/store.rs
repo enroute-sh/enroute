@@ -1,6 +1,6 @@
 //! The ledger's state machines on disk: every repository's refs, HEAD,
 //! layer manifest, counters and where its inline layers are, in one
-//! LSM tree per node (how a repository maps onto it: [`crate::stored`]).
+//! LSM tree per node (how a repository maps onto it: [`crate::state::stored`]).
 //!
 //! **Layout.** Three key spaces in one tree, each under a prefix byte, then
 //! keyed by log id:
@@ -25,16 +25,16 @@
 //! bytes from its log instead ([`Entry::Inline`]); the receiver keeps those
 //! in `inline` until their flush.
 //!
-//! **No write-ahead log.** The Raft log already holds every applied entry,
+//! **No write-ahead log.** The log already holds every applied entry,
 //! so the store keeps writes in memory until a flush writes them to tables,
 //! and a crash loses what was not flushed: recovery replays it from the
-//! Raft log. Writes go through a [`Round`]: a run of applied entries, with
+//! log. Writes go through a [`Round`]: a run of applied entries, with
 //! every touched repository's applied index, in one atomic batch.
 //! Installing a whole state (or deleting one) is one batch too. One tree
 //! holds all three key spaces, so a flush is atomic across them: a root
 //! never gets to disk ahead of the data it names. [`StateStore::flush`]
 //! seals the memtable and writes it on a thread of its own, so writers do
-//! not wait for the disk; [`StateStore::persist`] waits. The Raft log may
+//! not wait for the disk; [`StateStore::persist`] waits. The log may
 //! forget entries only up to what a flush covers.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -53,7 +53,9 @@ use lsm_tree::{AbstractTree, AnyTree, Cache, Config, Guard, SeqNo, SequenceNumbe
 use parking_lot::{Mutex, RwLock};
 use prost::Message as _;
 
-use enroute_shared::proto::Record;
+use enroute_shared::oid::ObjectFormat;
+
+use crate::proto::Record;
 
 /// A repository's log (the id the consensus engine gives it).
 pub(crate) type LogId = u64;
@@ -86,7 +88,7 @@ const DATA: u8 = 0x01;
 const INLINE: u8 = 0x02;
 
 /// Flush at least this often while there are writes in memory: it bounds
-/// how far the Raft log's truncation lags, and what recovery replays. The
+/// how far the log's truncation lags, and what recovery replays. The
 /// engine's tests wait for truncations.
 const FLUSH_EVERY: Duration = if cfg!(test) {
     Duration::from_millis(100)
@@ -117,8 +119,6 @@ pub(crate) struct Root {
     pub version: u64,
     pub repo: String,
     pub epoch: u64,
-    pub voters: Vec<u64>,
-    pub learners: Vec<u64>,
 }
 
 impl Root {
@@ -127,8 +127,6 @@ impl Root {
         Record {
             repo: self.repo.clone(),
             epoch: self.epoch,
-            voters: self.voters.clone(),
-            learners: self.learners.clone(),
             ..Default::default()
         }
     }
@@ -152,8 +150,6 @@ impl Root {
             version: u(16)?,
             repo: identity.repo,
             epoch: identity.epoch,
-            voters: identity.voters,
-            learners: identity.learners,
         })
     }
 }
@@ -170,14 +166,23 @@ pub(crate) struct Counters {
     pub epoch: u64,
     pub deleted: bool,
     pub keep_head: bool,
+    /// The evaluation chain of the last change applied (`RepoMeta.chain`).
+    pub chain: u64,
+    /// How the incarnation names its objects (`RepoMeta.object_format`).
+    pub format: ObjectFormat,
 }
 
 const DELETED: u64 = 1;
 const KEEP_HEAD: u64 = 2;
+/// The incarnation's ids are SHA-256. Unset in every state written before
+/// SHA-256, which are SHA-1.
+const SHA256: u64 = 4;
 
 impl Counters {
     pub(crate) fn encode(&self) -> Vec<u8> {
-        let flags = (u64::from(self.deleted) * DELETED) | (u64::from(self.keep_head) * KEEP_HEAD);
+        let flags = (u64::from(self.deleted) * DELETED)
+            | (u64::from(self.keep_head) * KEEP_HEAD)
+            | (u64::from(self.format == ObjectFormat::Sha256) * SHA256);
         [
             self.version,
             self.upload_gen,
@@ -186,6 +191,7 @@ impl Counters {
             self.last_push_ms,
             self.epoch,
             flags,
+            self.chain,
         ]
         .iter()
         .flat_map(|u| u.to_le_bytes())
@@ -193,7 +199,7 @@ impl Counters {
     }
 
     pub(crate) fn decode(v: &[u8]) -> Result<Counters> {
-        ensure!(v.len() == 56, "bad counters");
+        ensure!(v.len() == 64, "bad counters");
         let u = |i: usize| word(v, i * 8).map(u64::from_le_bytes);
         let flags = u(6)?;
         Ok(Counters {
@@ -205,6 +211,12 @@ impl Counters {
             epoch: u(5)?,
             deleted: flags & DELETED != 0,
             keep_head: flags & KEEP_HEAD != 0,
+            chain: u(7)?,
+            format: if flags & SHA256 == 0 {
+                ObjectFormat::Sha1
+            } else {
+                ObjectFormat::Sha256
+            },
         })
     }
 }
@@ -388,6 +400,11 @@ pub(crate) struct StateStore {
     flusher: Option<(mpsc::SyncSender<Flush>, JoinHandle<()>)>,
     compactor: Option<(mpsc::Sender<()>, JoinHandle<()>)>,
     roots: RwLock<HashMap<LogId, Root>>,
+    /// Each log's pins (index ‖ id, so the first is the oldest), kept with
+    /// every write: a sync asks for the oldest pin of every log it covers,
+    /// and a range read of the tree for each cost the apply thread time
+    /// that grew with the store.
+    pins: Mutex<HashMap<LogId, BTreeSet<Vec<u8>>>>,
     /// Held while open: two stores on one directory would lose writes.
     _lock: File,
 }
@@ -431,6 +448,7 @@ impl StateStore {
             visible: SequenceNumberCounter::new(start),
         });
         let roots = load_roots(&tree, start)?;
+        let pins = load_pins(&tree, roots.keys().copied(), start)?;
         let compactor = spawn_compactor(tree.clone(), snaps.clone())?;
         let flusher = spawn_flusher(tree.clone(), snaps.clone(), compactor.0.clone())?;
         Ok(StateStore {
@@ -445,6 +463,7 @@ impl StateStore {
             flusher: Some(flusher),
             compactor: Some(compactor),
             roots: RwLock::new(roots),
+            pins: Mutex::new(pins),
             _lock: lock,
         })
     }
@@ -461,7 +480,11 @@ impl StateStore {
         let _w = self.write.lock();
         let s = self.seqno.next();
         let mut memtable = None;
+        let mut pins = self.pins.lock();
         for (k, v) in ops {
+            if let Some((log, pin)) = pin_of(&k) {
+                track_pin(&mut pins, log, pin, v.is_some());
+            }
             let (_, size) = match v {
                 Some(v) => self.tree.insert(k, v, s),
                 None => self.tree.remove(k, s),
@@ -552,16 +575,11 @@ impl StateStore {
     /// its log may be truncated below it (and up to what a flush covers),
     /// not past it. None if no inline layer is pinned.
     pub(crate) fn oldest_pin(&self, log: LogId) -> Result<Option<u64>> {
-        let snap = self.snapshot();
-        let mut it = self.tree.range(
-            spaced(DATA, &data_key(log, PIN, &[]))..spaced(DATA, &data_key(log, PIN + 1, &[])),
-            snap.seqno,
-            None,
-        );
-        // Prefix byte, log id, kind: then the index.
-        next(&mut it)?
-            .map(|(k, _)| word(&k, 10).map(u64::from_be_bytes))
-            .transpose()
+        let pins = self.pins.lock();
+        let Some(first) = pins.get(&log).and_then(BTreeSet::first) else {
+            return Ok(None);
+        };
+        Ok(Some(u64::from_be_bytes(word(first, 0)?)))
     }
 
     /// `log`'s whole state at one point: its root, and every entry passed to
@@ -671,6 +689,55 @@ fn lock(path: &Path) -> Result<File> {
     }
 }
 
+/// The log and pin (index ‖ id) of `k`, a stored key, if it is a pin.
+fn pin_of(k: &[u8]) -> Option<(LogId, &[u8])> {
+    let (&[DATA], rest) = k.split_first_chunk::<1>()? else {
+        return None;
+    };
+    let (log, rest) = rest.split_first_chunk::<8>()?;
+    let (&[PIN], pin) = rest.split_first_chunk::<1>()? else {
+        return None;
+    };
+    Some((u64::from_be_bytes(*log), pin))
+}
+
+/// Add (or drop) `log`'s `pin` in `pins`.
+fn track_pin(pins: &mut HashMap<LogId, BTreeSet<Vec<u8>>>, log: LogId, pin: &[u8], add: bool) {
+    let of = pins.entry(log).or_default();
+    if add {
+        of.insert(pin.to_vec());
+    } else {
+        of.remove(pin);
+    }
+    if of.is_empty() {
+        pins.remove(&log);
+    }
+}
+
+/// The pins of `logs`, as [`StateStore::pins`] keeps them.
+fn load_pins(
+    tree: &AnyTree,
+    logs: impl IntoIterator<Item = LogId>,
+    seqno: SeqNo,
+) -> Result<HashMap<LogId, BTreeSet<Vec<u8>>>> {
+    let mut pins = HashMap::new();
+    for log in logs {
+        let from = spaced(DATA, &data_key(log, PIN, &[]));
+        let to = spaced(DATA, &data_key(log, PIN + 1, &[]));
+        let mut it = tree.range(from..to, seqno, None);
+        let mut of = BTreeSet::new();
+        while let Some((k, _)) = next(&mut it)? {
+            if let Some((_, pin)) = pin_of(&k) {
+                of.insert(pin.to_vec());
+            }
+        }
+        if !of.is_empty() {
+            pins.insert(log, of);
+        }
+    }
+    Ok(pins)
+}
+
 /// Every repository's root, as of `seqno`.
 fn load_roots(tree: &AnyTree, seqno: SeqNo) -> Result<HashMap<LogId, Root>> {
     let mut roots = HashMap::new();
@@ -728,7 +795,7 @@ fn spawn_flusher(
 }
 
 impl Drop for StateStore {
-    /// Flush, so the next open has nothing to replay from the Raft log.
+    /// Flush, so the next open has nothing to replay from the log.
     fn drop(&mut self) {
         if let Err(e) = self.persist() {
             tracing::warn!("state store: flushing at shutdown: {e:#}");
@@ -821,21 +888,19 @@ impl Round<'_> {
         Ok(())
     }
 
-    /// Read the refs `keys` names, and the counters of every repository
-    /// they belong to, in one go, from several threads: the round's
-    /// compare-and-swaps then wait for no reads, and the reads overlap
-    /// (a cache miss is a disk read).
-    pub(crate) fn prefetch(&mut self, keys: &[(LogId, &[u8])]) -> Result<()> {
+    /// Read the refs `keys` names and the counters of `logs`, in one go,
+    /// from several threads: the round's compare-and-swaps then wait for
+    /// no reads, and the reads overlap (a cache miss is a disk read).
+    pub(crate) fn prefetch(&mut self, keys: &[(LogId, &[u8])], logs: &[LogId]) -> Result<()> {
         let mut want: Vec<Vec<u8>> = keys
             .iter()
             .map(|(log, name)| data_key(*log, REF, name))
             .filter(|k| !self.overlay.contains_key(k))
             .collect();
         want.extend(
-            keys.iter()
-                .map(|(log, _)| *log)
+            logs.iter()
                 .filter(|log| !self.counters.contains_key(log))
-                .map(|log| data_key(log, COUNTERS, &[])),
+                .map(|log| data_key(*log, COUNTERS, &[])),
         );
         want.sort_unstable();
         want.dedup();
@@ -937,6 +1002,21 @@ impl Round<'_> {
             |_, v| {
                 out = Some(v.to_vec());
                 false
+            },
+        )?;
+        Ok(out)
+    }
+
+    /// The values of every layer of the manifest, in id order, this round's
+    /// writes included.
+    pub(crate) fn layers(&self, log: LogId) -> Result<Vec<Vec<u8>>> {
+        let mut out = Vec::new();
+        self.scan(
+            &data_key(log, LAYER, &[]),
+            &data_key(log, LAYER + 1, &[]),
+            |_, v| {
+                out.push(v.to_vec());
+                true
             },
         )?;
         Ok(out)

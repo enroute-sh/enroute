@@ -6,15 +6,18 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use tracing::Instrument as _;
 
 use enroute_shared::proto::RepoSummary;
 use enroute_shared::roles::{self, LedgerRef};
-use enroute_shared::state::{Command, Commit, DEFAULT_HEAD, LayerMeta, Outcome, Refusal, RepoMeta};
-use enroute_shared::store::Objects;
+use enroute_shared::state::{Command, Commit, DEFAULT_HEAD, LayerMeta, Outcome, Refusal};
+use enroute_shared::store::{IoClass, Objects};
 
+use crate::git::oid::ObjectFormat;
 use crate::git::refname;
 use crate::hooks::HostHooks;
 use crate::maintenance::{self, Maintainer};
+use crate::meta::RepoState;
 use crate::repo::{Repo, Repos};
 use crate::states::{Consistency, States};
 use crate::storage::{Sealed, Storage};
@@ -35,7 +38,11 @@ pub struct ComputeConfig {
     pub max_inline_bytes: u64,
     /// Merge-before-upload: flush a run of inline layers once its oldest
     /// layer is this old, or once it holds `flush_max_layers` (or
-    /// the maintenance module's `FLUSH_BYTES`).
+    /// the maintenance module's `FLUSH_BYTES`). Each flush is a manifest
+    /// swap in the log, so waiting longer lets one swap carry the layers
+    /// of several pushes: with pushes spread over 100k repositories, 30 s
+    /// carried ~4 layers a flush and held ~9.8k pushes/s, against ~2.2k/s
+    /// at 1 s.
     pub flush_interval: std::time::Duration,
     /// Flush a run of inline layers once it holds this many.
     pub flush_max_layers: usize,
@@ -43,10 +50,6 @@ pub struct ComputeConfig {
     /// unused this long (and its inline layers are flushed), and stop
     /// following it.
     pub evict_after: std::time::Duration,
-    /// How long a compute node's maintenance lease on a repository lasts
-    /// (after its holder dies, another takes over within this; see
-    /// [`crate::maintenance`]).
-    pub maintenance_lease: std::time::Duration,
     /// How often the layer sweep runs on each repository this node
     /// maintains (see [`crate::maintenance`]): it advances the upload
     /// generation when that lets it delete something, so a publish has
@@ -61,21 +64,29 @@ pub struct ComputeConfig {
     /// A git push or an API commit to a missing repository creates it.
     /// Without, it is not found, and only [`Compute::create_repo`] creates.
     pub create_on_push: bool,
+    /// How a repository is made to name its objects when its creator does
+    /// not say: a create on push, or [`Compute::create_repo`].
+    pub default_object_format: ObjectFormat,
+    /// A push or an API commit with an object larger than this fails, as
+    /// does a delta that builds one. The check comes before the object is
+    /// inflated, so a size that the pack only declares allocates nothing.
+    pub max_object_bytes: u64,
 }
 
 impl Default for ComputeConfig {
     fn default() -> ComputeConfig {
         ComputeConfig {
-            merge_factor: 8,
+            merge_factor: maintenance::MERGE_FACTOR,
             inline_layer_bytes: 1 << 20,
             max_inline_bytes: 64 << 20,
-            flush_interval: std::time::Duration::from_secs(1),
+            flush_interval: std::time::Duration::from_secs(30),
             flush_max_layers: 256,
             evict_after: std::time::Duration::from_mins(15),
-            maintenance_lease: std::time::Duration::from_secs(30),
             sweep_interval: std::time::Duration::from_secs(3600),
             sweep_retention: std::time::Duration::from_hours(6),
             create_on_push: true,
+            default_object_format: ObjectFormat::Sha1,
+            max_object_bytes: 100 << 20,
         }
     }
 }
@@ -108,15 +119,19 @@ pub struct RepoInfo {
     pub head: String,
     /// When a git push last moved a ref (None: never).
     pub last_push: Option<std::time::SystemTime>,
+    /// How it names its objects.
+    pub format: ObjectFormat,
 }
 
 impl RepoInfo {
     fn of(s: RepoSummary) -> RepoInfo {
+        let format = s.object_format().into();
         RepoInfo {
             name: s.name,
             head: s.head,
             last_push: (s.last_push_ms > 0)
                 .then(|| std::time::UNIX_EPOCH + std::time::Duration::from_millis(s.last_push_ms)),
+            format,
         }
     }
 }
@@ -165,9 +180,10 @@ impl std::fmt::Debug for Compute {
 }
 
 impl Compute {
-    /// Start the compute: maintenance, eviction of idle views, and cleanup of
-    /// local copies left from before a restart. `cache_bytes` caps the
-    /// memory of the repositories' views.
+    /// Start the compute: maintenance and eviction of idle views.
+    /// `cache_bytes` caps the memory of the repositories' views. The node
+    /// is compute node `id`, which shares maintenance with the others the
+    /// ledger hears from.
     pub fn start(
         config: ComputeConfig,
         hooks: HostHooks,
@@ -175,6 +191,7 @@ impl Compute {
         storage: Arc<Storage>,
         cache_bytes: usize,
         ledger: LedgerRef,
+        id: u64,
     ) -> Arc<Compute> {
         let repos = Repos::new(storage.clone(), cache_bytes);
         let states = States::new(repos.clone(), ledger.clone());
@@ -185,6 +202,7 @@ impl Compute {
             storage.clone(),
             objects,
             ledger.clone(),
+            maintenance::owners::Owners::new(id),
         );
         Arc::new(Compute {
             config,
@@ -206,7 +224,7 @@ impl Compute {
     /// The latest state of `repo` this node knows (None: it does not
     /// follow it).
     #[must_use]
-    pub fn state(&self, repo: &str) -> Option<Arc<RepoMeta>> {
+    pub fn state(&self, repo: &str) -> Option<Arc<RepoState>> {
         self.states.get(repo)
     }
 
@@ -235,20 +253,44 @@ impl Compute {
     /// configuration says pushes create (else [`RepoNotFound`]).
     pub(crate) async fn ensure_repo(&self, name: &str) -> Result<Arc<Repo>> {
         self.states
-            .ensure(name, self.config.create_on_push)
+            .ensure(
+                name,
+                self.config
+                    .create_on_push
+                    .then_some(self.config.default_object_format),
+            )
             .await?
             .ok_or_else(|| RepoNotFound(name.to_string()).into())
     }
 
     /// Create `name` with HEAD naming `default_branch` (a branch name or
     /// `refs/heads/...`; empty: `refs/heads/main`), unless it exists. Answers
-    /// with what the repository has (an existing one is left as it is).
+    /// with what the repository has (an existing one is left as it is). A
+    /// new repository is in [`ComputeConfig::default_object_format`]; see
+    /// [`Compute::create_repo_in`].
     ///
     /// # Errors
     ///
     /// Returns an error if the name or default branch is invalid, or if the
     /// ledger refuses the creation.
     pub async fn create_repo(&self, name: &str, default_branch: &str) -> Result<RepoInfo> {
+        self.create_repo_in(name, default_branch, self.config.default_object_format)
+            .await
+    }
+
+    /// [`Compute::create_repo`], with a new repository's objects named in
+    /// `format`.
+    ///
+    /// # Errors
+    ///
+    /// As `create_repo`, and the ledger refuses SHA-256 unless its
+    /// `ledger.allow_sha256` is on.
+    pub async fn create_repo_in(
+        &self,
+        name: &str,
+        default_branch: &str,
+        format: ObjectFormat,
+    ) -> Result<RepoInfo> {
         anyhow::ensure!(
             crate::contract::repo_key::RepoKey::is_valid(name),
             "invalid repository name {name:?}"
@@ -262,7 +304,7 @@ impl Compute {
             refname::valid_branch(&head),
             "invalid default branch {default_branch:?}"
         );
-        roles::create(&*self.ledger, name, &head).await?;
+        roles::create(&*self.ledger, name, &head, format).await?;
         self.get_repo(name)
             .await?
             .ok_or_else(|| RepoNotFound(name.to_string()).into())
@@ -387,14 +429,17 @@ impl Compute {
             commit.updated_at_ms = crate::util::now_ms();
         }
         if let Some((data, objects)) = layer {
+            let publish = self.publish_layer(repo, data, objects);
+            let span = tracing::info_span!("enroute::commit::publish_layer", objects);
             commit
                 .add_layers
-                .push(self.publish_layer(repo, data, objects).await?);
+                .push(IoClass::Commit.scope(publish).instrument(span).await?);
         }
         let published = std::time::Instant::now();
         let propose = |commit: Commit| async move {
             let out = self
                 .propose(Command::commit(repo, commit).at(epoch))
+                .instrument(tracing::info_span!("enroute::commit::propose"))
                 .await?;
             match out.refused() {
                 Some(Refusal::Deleted | Refusal::OtherIncarnation) => {
@@ -417,7 +462,8 @@ impl Compute {
                 let generation = self.states.get(repo).map_or(0, |m| m.upload_gen);
                 for l in commit.add_layers.iter_mut().filter(|l| l.is_stored()) {
                     let id = crate::storage::new_layer_id(generation);
-                    self.storage.copy_layer(repo, &l.id, &id).await?;
+                    let copy = self.storage.copy_layer(repo, &l.id, &id);
+                    IoClass::Commit.scope(copy).await?;
                     tracing::info!(
                         repo,
                         from = l.id,

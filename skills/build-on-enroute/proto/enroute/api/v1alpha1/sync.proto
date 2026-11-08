@@ -4,13 +4,13 @@ package enroute.api.v1alpha1;
 
 import "enroute/common/v1alpha1/common.proto";
 
-// Sending what this repository holds to a git server somewhere else.
+// Moving refs between this repository and a git server somewhere else.
 //
 // The mirror of the rest of the contract: everywhere else Enroute is the git
 // server and something else is the client, and here Enroute is the client. A
-// caller names a remote and the refs to send, and Enroute speaks git to that
-// remote — so an application that mirrors to GitHub holds no repository of
-// its own, runs no `git push`, and builds no packfile.
+// caller names a remote and the refs, and Enroute speaks git to that remote —
+// so an application that mirrors to or from GitHub holds no repository of its
+// own, runs no `git push` or `git fetch`, and handles no packfile.
 //
 // Nothing about a remote is stored. A call carries the URL and the
 // credentials it needs, because a remote is a relationship between an
@@ -24,6 +24,17 @@ service SyncService {
   // others. The call itself fails only when the remote cannot be reached or
   // will not talk git.
   rpc PushToRemote(PushToRemoteRequest) returns (PushToRemoteResponse);
+
+  // Make the refs under some prefixes match a remote's, and report each ref
+  // that changed.
+  //
+  // The objects come in with the checks a push runs, and every ref change
+  // lands in one log entry. No hooks run, as for `RefService.UpdateRefs`:
+  // the caller is the application. A ref this repository refuses is an
+  // outcome, not a call failure. The call fails when the remote cannot be
+  // reached, will not talk git, or sends a pack this repository refuses;
+  // nothing lands then.
+  rpc FetchFromRemote(FetchFromRemoteRequest) returns (FetchFromRemoteResponse);
 }
 
 // A git server somewhere else, and what proves a push may land there.
@@ -110,5 +121,45 @@ message RefPushOutcome {
     STATUS_UP_TO_DATE = 3;
     // See `message`.
     STATUS_REJECTED = 4;
+  }
+}
+
+message FetchFromRemoteRequest {
+  common.v1alpha1.RepoKey repo = 1;
+  // The remote's credentials need only let it be read.
+  Remote remote = 2;
+  // Ref name prefixes, e.g. `refs/heads/` and `refs/tags/`. Under each one,
+  // every ref of the remote is created or moved here to the remote's value,
+  // rewinds included, and every ref the remote does not hold is deleted.
+  // Refs outside them are not touched. Empty is refused rather than meaning
+  // every ref: a remote's `refs/pull/` can hold more refs than a caller
+  // wants.
+  repeated string prefixes = 3;
+}
+
+message FetchFromRemoteResponse {
+  // One per ref that this call changed or tried to change, in name order. A
+  // ref that already matched the remote is not listed.
+  repeated RefFetchOutcome outcomes = 1;
+}
+
+message RefFetchOutcome {
+  // The ref in this repository.
+  string name = 1;
+  // What it held before, and what the remote holds. Unset for a ref that did
+  // not exist here, or that the remote does not hold.
+  common.v1alpha1.ObjectId old_object_id = 2;
+  common.v1alpha1.ObjectId new_object_id = 3;
+  Status status = 4;
+  // Why, for `STATUS_REJECTED`.
+  string message = 5;
+
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    // The ref was created or moved.
+    STATUS_UPDATED = 1;
+    STATUS_DELETED = 2;
+    // See `message`: for example, the ref moved here while the call ran.
+    STATUS_REJECTED = 3;
   }
 }

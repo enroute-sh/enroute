@@ -1,14 +1,17 @@
 use std::cell::RefCell;
 
 use anyhow::{Context, Result, anyhow, ensure};
-use libdeflater::{CompressionLvl, Compressor, Decompressor};
+use sirocco::{
+    Format,
+    deflate::{self, Encoder, Flush, Level},
+    inflate::Decoder,
+};
 
 thread_local! {
-    // A new coder allocates its state; reuse keeps that off the per-object path.
-    static ENCODER: RefCell<Compressor> = RefCell::new(Compressor::new(CompressionLvl::default()));
-    // Level 0: stored blocks only.
-    static STORED: RefCell<Compressor> = RefCell::new(Compressor::new(CompressionLvl::fastest()));
-    static DECODER: RefCell<Decompressor> = RefCell::new(Decompressor::new());
+    // The encoder's tables are about 340 KiB; reuse keeps that allocation
+    // off the per-object path. An encoder over them costs nothing to make.
+    static TABLES: RefCell<Box<[u16]>> = RefCell::new(vec![0; deflate::TABLES_LEN].into_boxed_slice());
+    pub(super) static DECODER: RefCell<Decoder> = const { RefCell::new(Decoder::new(Format::Zlib)) };
 }
 
 /// Inputs below this size go in a stored block: deflate makes them larger,
@@ -17,21 +20,25 @@ const STORED_BELOW: usize = 64;
 
 /// Append the zlib stream of `data` to `out`.
 pub(crate) fn compress(data: &[u8], out: &mut Vec<u8>) {
-    let encoder = if data.len() < STORED_BELOW {
-        &STORED
+    let level = if data.len() < STORED_BELOW {
+        Level::NONE
     } else {
-        &ENCODER
+        Level::DEFAULT
     };
-    encoder.with_borrow_mut(|c| {
+    TABLES.with_borrow_mut(|tables| {
+        let mut e = Encoder::with_tables(Format::Zlib, level, &mut tables[..]);
         let start = out.len();
-        out.resize(start + c.zlib_compress_bound(data.len()), 0);
-        #[expect(
-            clippy::expect_used,
-            reason = "the buffer is at the compress bound, so it cannot be too small"
-        )]
-        let n = c
-            .zlib_compress(data, out.get_mut(start..).unwrap_or_default())
-            .expect("in-memory compress");
+        out.resize(start + deflate::compress_bound(Format::Zlib, data.len()), 0);
+        let p = e.compress(
+            data,
+            out.get_mut(start..).unwrap_or_default(),
+            Flush::Finish,
+        );
+        assert!(
+            p.done,
+            "the buffer is at the compress bound, so it cannot be too small"
+        );
+        let n = p.output.len();
         out.truncate(start + n);
     });
 }
@@ -40,11 +47,22 @@ pub(crate) fn compress(data: &[u8], out: &mut Vec<u8>) {
 pub(crate) fn decompress(data: &[u8], expected: usize) -> Result<Vec<u8>> {
     DECODER.with_borrow_mut(|d| {
         let mut out = vec![0; expected];
-        let n = d
-            .zlib_decompress(data, &mut out)
-            .map_err(|e| anyhow!("{e}"))
-            .context("inflate")?;
-        ensure!(n == expected, "zlib size mismatch: {n} != {expected}");
+        let n = match d.decompress(data, &mut out, true) {
+            Ok(p) if p.done => Some(p.output.len()),
+            // Not done with all of the input: the output is longer.
+            Ok(_) | Err(sirocco::inflate::Error::BufferFull) => None,
+            Err(e) => {
+                d.reset();
+                return Err(anyhow!("{e}")).context("inflate");
+            }
+        };
+        if n != Some(expected) {
+            d.reset();
+        }
+        ensure!(
+            n == Some(expected),
+            "zlib size mismatch: {n:?} != {expected}"
+        );
         Ok(out)
     })
 }

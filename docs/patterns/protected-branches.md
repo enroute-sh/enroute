@@ -238,5 +238,5 @@ caller is your app.
   evidence.
 - [`pre_receive`](../reference/hooks.md#pre_receive) — every field this hook
   carries, with payloads.
-- [The contract](../reference/the-contract.md#refs-and-objects) — `UpdateRefs`, which is
+- [The contract](../reference/the-contract.md#updaterefs) — `UpdateRefs`, which is
   how a merge lands once direct pushes are closed.

@@ -21,16 +21,34 @@ fn config(data: &Path, store: &Store, role: Role) -> Config {
     let mut c = Config::local(data.to_path_buf(), store.clone());
     c.role = role;
     c.compute.flush_interval = Duration::from_millis(200);
-    c.compute.maintenance_lease = Duration::from_secs(2);
     c
 }
 
-/// A ledger node of a cluster, advertised on a port of its own.
-async fn ledger(data: &Path, store: &Store) -> Server {
+/// A free port for a ledger node that starts later: until then, calls to
+/// it are refused, as a stopped node's are.
+fn port() -> std::net::SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap()
+}
+
+/// A ledger node of a cluster, advertised on `at`.
+async fn ledger(data: &Path, store: &Store, at: std::net::SocketAddr) -> Server {
+    let listener = common::rebind(at).await;
     let mut c = config(data, store, Role::Ledger);
     c.ledger.advertise = Some(format!("http://{}", listener.local_addr().unwrap()));
     Server::start_on(c, listener).await
+}
+
+/// Whether `enroute members` comes to print `want` within 20 s (a node
+/// becomes a member once it joins).
+async fn members_become(root: &Path, want: &[u64]) -> bool {
+    for _ in 0..80 {
+        if members_cli(root).await == want {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    false
 }
 
 /// `enroute members` against the store under `root`: the member ids it prints.
@@ -75,7 +93,7 @@ async fn members_cli(root: &Path) -> Vec<u64> {
     ids
 }
 
-/// Push `src`'s main to `url`, retrying while the ledger elects leaders
+/// Push `src`'s main to `url`, retrying while the ledger appoints sequencers
 /// (a refused push is not acknowledged, so a retry is the same write).
 async fn push_retrying(git: &Git, src: &Path, url: &str) {
     for attempt in 0.. {
@@ -132,7 +150,7 @@ impl Acked {
     }
 
     /// Commit `text` through the API of `compute`, retrying while the ledger
-    /// elects leaders.
+    /// appoints sequencers.
     async fn api_commit(&mut self, compute: &Server, text: &str) {
         let mut api = compute.api_client();
         for attempt in 0.. {
@@ -196,21 +214,27 @@ async fn one_node_grows_into_a_replicated_ledger() {
     let mut acked = single_node(&git, &single).await;
     assert!(
         members_cli(root.path()).await.is_empty(),
-        "a standalone node is in no registry"
+        "a standalone node is in no cluster"
     );
     single.node.shutdown().await;
     drop(single);
 
-    // Model 2: the same data directory as a ledger node, and a compute node.
-    let a = ledger(&a_data, &store).await;
+    // Model 2: the same data directory as a ledger node, and a compute node,
+    // which finds the ledger's members in the store as they change.
+    let [la, lb, lc] = [port(), port(), port()];
+    let compute_config = |dir: &str| config(&root.path().join(dir), &store, Role::Compute);
+    let a = ledger(&a_data, &store, la).await;
     assert_eq!(a.node.consensus().unwrap().id, id_a, "the same node");
-    assert_eq!(members_cli(root.path()).await, vec![id_a]);
-    let compute = Server::start_config(config(&root.path().join("f"), &store, Role::Compute)).await;
+    assert!(
+        members_become(root.path(), &[id_a]).await,
+        "node a is the member"
+    );
+    let compute = Server::start_config(compute_config("f")).await;
     acked.check(&git, &compute, "ledger").await;
     for (repo, _) in &acked.pushed {
-        assert_eq!(common::voters(&a, repo), vec![id_a], "{repo}");
+        assert_eq!(common::replicas(&a, repo), vec![id_a], "{repo}");
     }
-    // No write to r0 and r2: idle logs without a leader must join too.
+    // No write to r0 and r2: idle logs without a sequencer must join too.
     push_commits(&git, &acked.pushed[1].1, &compute.repo_url("r1"), 100, 2).await;
     let src = git.init("src3").await;
     push_commits(&git, &src, &compute.repo_url("r3"), 200, 2).await;
@@ -218,16 +242,19 @@ async fn one_node_grows_into_a_replicated_ledger() {
     acked.api_commit(&compute, "two\n").await;
     acked.check(&git, &compute, "ledger-writes").await;
 
-    // Model 3: two more ledger nodes join every log as voters.
-    let b = ledger(&root.path().join("b"), &store).await;
-    let c = ledger(&root.path().join("c"), &store).await;
+    // Model 3: two more ledger nodes join, and every log grows onto them.
+    let b = ledger(&root.path().join("b"), &store, lb).await;
+    let c = ledger(&root.path().join("c"), &store, lc).await;
     let mut ids = vec![
         id_a,
         b.node.consensus().unwrap().id,
         c.node.consensus().unwrap().id,
     ];
     ids.sort_unstable();
-    assert_eq!(members_cli(root.path()).await, ids);
+    assert!(
+        members_become(root.path(), &ids).await,
+        "a, b and c are the members"
+    );
     let repos: Vec<String> = acked
         .pushed
         .iter()
@@ -237,18 +264,18 @@ async fn one_node_grows_into_a_replicated_ledger() {
     let settled = || {
         [&a, &b, &c]
             .iter()
-            .all(|s| repos.iter().all(|r| common::voters(s, r) == ids))
+            .all(|s| repos.iter().all(|r| common::replicas(s, r) == ids))
     };
     assert!(
         wait_until(settled, 60).await,
-        "not every log has every member as a voter: {:?}",
+        "not every log has every member as a replica: {:?}",
         repos
             .iter()
-            .map(|r| (r, common::voters(&b, r)))
+            .map(|r| (r, common::replicas(&b, r)))
             .collect::<Vec<_>>()
     );
 
-    // The original node fails: two of three voters still commit.
+    // The original node fails: two of three replicas still commit.
     a.node.shutdown().await;
     drop(a);
     let src2 = &acked.pushed[2].1;
@@ -263,6 +290,6 @@ async fn one_node_grows_into_a_replicated_ledger() {
 
     // Every acknowledged write of every phase, through a new compute too.
     acked.check(&git, &compute, "ha").await;
-    let fresh = Server::start_config(config(&root.path().join("g"), &store, Role::Compute)).await;
+    let fresh = Server::start_config(compute_config("g")).await;
     acked.check(&git, &fresh, "ha-fresh").await;
 }

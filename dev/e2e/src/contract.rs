@@ -15,15 +15,18 @@ use tonic::transport::Channel;
 use enroute_api::api::v1alpha1::commit_service_client::CommitServiceClient;
 use enroute_api::api::v1alpha1::object_service_client::ObjectServiceClient;
 use enroute_api::api::v1alpha1::ref_service_client::RefServiceClient;
+use enroute_api::api::v1alpha1::ref_update_outcome::Rejection;
+use enroute_api::api::v1alpha1::ref_update_outcome::rejection::Reason;
 use enroute_api::api::v1alpha1::repository_service_client::RepositoryServiceClient;
 use enroute_api::api::v1alpha1::sync_service_client::SyncServiceClient;
 use enroute_api::api::v1alpha1::{
     Commit, CreateCommitRequest, CreateCommitResponse, CreateRepositoryRequest,
-    DeleteRepositoryRequest, DiffCommitRequest, FileChange, FindMergeBasesRequest,
-    FindMergeBasesResponse, GetObjectRequest, GetRepositoryRequest, IsAncestorRequest,
-    ListCommitsRequest, ListRefsRequest, ListRefsResponse, ListRepositoriesRequest,
-    ListTreeRequest, ObjectKind, PushToRemoteRequest, RefPushOutcome, RefSpec, RefUpdate, Remote,
-    Repository, TreeEntry, UpdateRefsRequest, get_object_response,
+    DeleteRepositoryRequest, DiffCommitRequest, FetchFromRemoteRequest, FileChange,
+    FindMergeBasesRequest, FindMergeBasesResponse, GetObjectRequest, GetRepositoryRequest,
+    IsAncestorRequest, ListCommitsRequest, ListRefsRequest, ListRefsResponse,
+    ListRepositoriesRequest, ListTreeRequest, ObjectFormat, ObjectKind, PushToRemoteRequest,
+    RefFetchOutcome, RefPushOutcome, RefSpec, RefUpdate, Remote, Repository, TreeEntry,
+    UpdateRefsRequest, get_object_response,
 };
 use enroute_api::common::v1alpha1::{ObjectId, RepoKey};
 
@@ -128,6 +131,34 @@ impl Client {
             .outcomes)
     }
 
+    /// Make `repo` match the remote at `url` under `prefixes`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the call fails.
+    pub(crate) async fn fetch_from_remote(
+        &self,
+        repo: &str,
+        url: &str,
+        prefixes: &[&str],
+    ) -> Result<Vec<RefFetchOutcome>> {
+        Ok(self
+            .sync
+            .clone()
+            .fetch_from_remote(FetchFromRemoteRequest {
+                repo: Some(repo_key(repo)),
+                remote: Some(Remote {
+                    url: url.to_string(),
+                    credentials: None,
+                }),
+                prefixes: prefixes.iter().map(|&prefix| prefix.to_owned()).collect(),
+            })
+            .await
+            .context("calling fetch_from_remote")?
+            .into_inner()
+            .outcomes)
+    }
+
     /// Create a repository under a key no other test will pick.
     ///
     /// An empty `default_branch` means `refs/heads/main`.
@@ -153,11 +184,28 @@ impl Client {
         key: &str,
         default_branch: &str,
     ) -> Result<Repository> {
+        self.create_repository_in(key, default_branch, ObjectFormat::Unspecified)
+            .await
+    }
+
+    /// Creates one under the key the test chose, naming its objects in
+    /// `format`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the call fails or answers with no repository.
+    pub(crate) async fn create_repository_in(
+        &self,
+        key: &str,
+        default_branch: &str,
+        format: ObjectFormat,
+    ) -> Result<Repository> {
         self.repositories
             .clone()
             .create_repository(CreateRepositoryRequest {
                 default_branch: default_branch.to_string(),
                 repo: Some(repo_key(key)),
+                object_format: format.into(),
             })
             .await?
             .into_inner()
@@ -338,12 +386,27 @@ impl Client {
         repo: &str,
         updates: Vec<RefUpdate>,
     ) -> Result<Vec<RefOutcome>> {
+        self.update_refs_with(repo, updates, false).await
+    }
+
+    /// [`Self::update_refs`], all or none if `atomic`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the call fails.
+    pub(crate) async fn update_refs_with(
+        &self,
+        repo: &str,
+        updates: Vec<RefUpdate>,
+        atomic: bool,
+    ) -> Result<Vec<RefOutcome>> {
         let response = self
             .refs
             .clone()
             .update_refs(UpdateRefsRequest {
                 repo: Some(repo_key(repo)),
                 updates,
+                atomic,
             })
             .await
             .context("calling update_refs")?
@@ -354,6 +417,7 @@ impl Client {
             .into_iter()
             .map(|outcome| RefOutcome {
                 refname: outcome.refname,
+                reason: outcome.rejection.as_ref().map(Rejection::reason),
                 rejection: outcome.rejection.map(|rejection| rejection.message),
             })
             .collect())
@@ -499,6 +563,8 @@ pub(crate) struct RefOutcome {
     /// `None` if it landed, else what the client is told — which for a hook's
     /// refusal is the reason the hook gave, verbatim.
     pub(crate) rejection: Option<String>,
+    /// Why it did not land, if it did not.
+    pub(crate) reason: Option<Reason>,
 }
 
 /// A resolved repository, as the contract describes it.

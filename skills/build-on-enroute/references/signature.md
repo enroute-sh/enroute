@@ -144,9 +144,6 @@ algorithm argument is `null`, because the key carries it.
 `ed25519.PublicKey`, and `ed25519.Verify(key, base, sig)` returns a bool.
 
 **Rust.** `ed25519-dalek` with `DecodePublicKey::from_public_key_pem`.
-[`crates/api/signature`] in the Enroute repository is the reference
-implementation of both halves, and the stub in `dev/e2e/src/hooks.rs` is a
-verifier to read.
 
 **Java.** JDK 15 and later: `Signature.getInstance("Ed25519")`, with the key
 read by `KeyFactory.getInstance("Ed25519")` from an `X509EncodedKeySpec`.
@@ -164,7 +161,7 @@ code generated it.
 | Key       | RFC 9421's `test-key-ed25519`, below |
 | Method    | `POST`                               |
 | Authority | `forge.example.com`                  |
-| Path      | `/enroute/hooks`                     |
+| Path      | `/enroute/hooks`, a fixed test value |
 | Body      | The five ASCII bytes `hello`         |
 | `created` | `1700000000`                         |
 
@@ -194,4 +191,3 @@ Test three things, not one:
 The skew check needs the clock, so pass the current time into the verifier
 instead of reading it inside. That is what makes the vector testable.
 
-[`crates/api/signature`]: https://github.com/enroute-sh/enroute/tree/HEAD/crates/api/signature

@@ -2,31 +2,53 @@
 //! (`proto/ledger.proto`): the ledger implements its generated trait
 //! ([`ledger_server::Ledger`]); in a node running both roles the compute
 //! calls it in-process, and a compute-only node through gRPC (an
-//! implementation of the same trait that forwards to ledger nodes). This
-//! module has the trait object the compute holds, and plain-typed calls on it.
+//! implementation of the same trait that forwards to ledger nodes). Following
+//! a repository is [`Follow`], one subscription of the service's `Watch`
+//! call. This module has the trait object the compute holds, and plain-typed
+//! calls on it.
 
 use std::sync::Arc;
 
 use futures::StreamExt;
 use futures::stream::BoxStream;
 
+use crate::oid::ObjectFormat;
 use crate::proto::{
-    ActivateRequest, DeleteRequest, DescribeRequest, FollowRequest, ListRequest, ListResponse,
-    ReadBarrierRequest, RepoSummary, Update, ledger_server,
+    ActivateRequest, DeleteRequest, DescribeRequest, ListRequest, ListResponse, PendingRepo,
+    PendingRequest, PendingResponse, ReadBarrierRequest, RepoSummary, Update, WatchEvent,
+    ledger_server,
 };
 use crate::state::{Command, Outcome};
 
-/// A subscription's stream, as the service returns it.
+/// One subscription's updates.
 pub type FollowStream = BoxStream<'static, Result<Update, tonic::Status>>;
 
+/// The response stream of the service's `Watch` call.
+pub type WatchStream = BoxStream<'static, Result<WatchEvent, tonic::Status>>;
+
+/// Follow one repository, as one subscription of the `Watch` call.
+///
+/// The compute calls it on the ledger in its own process directly, and a
+/// remote ledger subscribes on a shared `Watch` stream.
+#[tonic::async_trait]
+pub trait Follow: Send + Sync + 'static {
+    /// The state of `repo` (its log must be live), then every change to it.
+    async fn follow(&self, repo: &str) -> Result<FollowStream, tonic::Status>;
+}
+
+/// The `Ledger` service, and [`Follow`].
+pub trait Role: ledger_server::Ledger<WatchStream = WatchStream> + Follow {}
+
+impl<T: ledger_server::Ledger<WatchStream = WatchStream> + Follow> Role for T {}
+
 /// A ledger, in-process or remote.
-pub type DynLedger = dyn ledger_server::Ledger<FollowStream = FollowStream>;
+pub type DynLedger = dyn Role;
 
 /// A subscription's updates (see [`follow`]).
 pub type Updates = BoxStream<'static, anyhow::Result<Update>>;
 
 /// The error of a request for a repository whose log the ledger node asked
-/// does not host, or for whose incarnation it is not a voter: another node
+/// does not host, or for whose incarnation it is not a replica: another node
 /// may serve it.
 #[derive(Debug, Clone, Copy)]
 pub struct NotHosted;
@@ -63,6 +85,29 @@ pub fn not_hosted_status(s: &tonic::Status) -> bool {
     s.code() == NOT_HOSTED
 }
 
+/// The metadata key of a [`not_sequencer_status`]: the sequencer's internal URL.
+const SEQUENCER: &str = "enroute-sequencer";
+
+/// The refusal of a request only the sequencer of the repository's log serves
+/// (a proposal, a deletion), by another node: unavailable (the request did
+/// not reach the log), naming the internal URL of the `sequencer` this node
+/// knows (empty: none).
+#[must_use]
+pub fn not_sequencer_status(message: String, sequencer: &str) -> tonic::Status {
+    let mut s = tonic::Status::unavailable(message);
+    if let Ok(v) = sequencer.parse() {
+        s.metadata_mut().insert(SEQUENCER, v);
+    }
+    s
+}
+
+/// The sequencer a [`not_sequencer_status`] names (empty: none known); None for
+/// any other status.
+#[must_use]
+pub fn sequencer_named(s: &tonic::Status) -> Option<String> {
+    Some(s.metadata().get(SEQUENCER)?.to_str().ok()?.to_string())
+}
+
 /// Whether `e` says the ledger node asked does not host the repository,
 /// in this process ([`NotHosted`]) or across gRPC (its status).
 #[must_use]
@@ -88,11 +133,16 @@ pub fn error(s: tonic::Status) -> anyhow::Error {
 /// # Errors
 ///
 /// Returns an error if the ledger request fails.
-pub async fn activate(ledger: &DynLedger, repo: &str, create: bool) -> anyhow::Result<bool> {
+pub async fn activate(
+    ledger: &DynLedger,
+    repo: &str,
+    create: Option<ObjectFormat>,
+) -> anyhow::Result<bool> {
     let req = ActivateRequest {
         repo: repo.to_string(),
-        create,
+        create: create.is_some(),
         head: None,
+        object_format: crate::proto::ObjectFormat::from(create.unwrap_or_default()).into(),
     };
     Ok(ledger
         .activate(tonic::Request::new(req))
@@ -102,17 +152,23 @@ pub async fn activate(ledger: &DynLedger, repo: &str, create: bool) -> anyhow::R
         .exists)
 }
 
-/// Create `repo` with HEAD `head` unless it exists (then it is left as it
-/// is).
+/// Create `repo` with HEAD `head`, its objects named in `format`, unless it
+/// exists (then it is left as it is).
 ///
 /// # Errors
 ///
 /// Returns an error if the ledger request fails.
-pub async fn create(ledger: &DynLedger, repo: &str, head: &str) -> anyhow::Result<()> {
+pub async fn create(
+    ledger: &DynLedger,
+    repo: &str,
+    head: &str,
+    format: ObjectFormat,
+) -> anyhow::Result<()> {
     let req = ActivateRequest {
         repo: repo.to_string(),
         create: true,
         head: Some(head.to_string()),
+        object_format: crate::proto::ObjectFormat::from(format).into(),
     };
     ledger
         .activate(tonic::Request::new(req))
@@ -179,6 +235,26 @@ pub async fn list(
         .into_inner())
 }
 
+/// Repositories that may need maintenance and that compute node `compute`
+/// maintains, after settling `settled`, and the live computes (see
+/// `Pending` in `ledger.proto`).
+///
+/// # Errors
+///
+/// Returns an error if the ledger request fails.
+pub async fn pending(
+    ledger: &DynLedger,
+    compute: u64,
+    settled: Vec<PendingRepo>,
+) -> anyhow::Result<PendingResponse> {
+    let req = PendingRequest { compute, settled };
+    Ok(ledger
+        .pending(tonic::Request::new(req))
+        .await
+        .map_err(error)?
+        .into_inner())
+}
+
 /// Order and apply `cmd` in its repository's log; resolves with the outcome
 /// once applied.
 ///
@@ -218,14 +294,7 @@ pub async fn read_barrier(ledger: &DynLedger, repo: &str) -> anyhow::Result<u64>
 ///
 /// Returns an error if the ledger request fails.
 pub async fn follow(ledger: &DynLedger, repo: &str) -> anyhow::Result<Updates> {
-    let req = FollowRequest {
-        repo: repo.to_string(),
-    };
-    let stream = ledger
-        .follow(tonic::Request::new(req))
-        .await
-        .map_err(error)?
-        .into_inner();
+    let stream = Follow::follow(ledger, repo).await.map_err(error)?;
     Ok(stream.map(|u| u.map_err(error)).boxed())
 }
 
@@ -238,12 +307,16 @@ mod tests {
 
     #[test]
     fn not_hosted_keeps_its_type_across_grpc() {
-        let e = anyhow::Error::new(NotHosted).context("not a voter of incarnation 3");
+        let e = anyhow::Error::new(NotHosted).context("not a replica of incarnation 3");
         assert!(not_hosted(&e));
         let s = status(e);
         assert!(not_hosted_status(&s));
-        assert!(s.message().contains("not a voter"), "{s:?}");
+        assert!(s.message().contains("not a replica"), "{s:?}");
         assert!(not_hosted(&error(s)));
+        let s = not_sequencer_status("not the sequencer".into(), "http://l2:7400");
+        assert_eq!(s.code(), tonic::Code::Unavailable);
+        assert_eq!(sequencer_named(&s).as_deref(), Some("http://l2:7400"));
+        assert_eq!(sequencer_named(&tonic::Status::unavailable("down")), None);
         let other = status(anyhow::anyhow!("disk full"));
         assert_eq!(other.code(), tonic::Code::Internal);
         assert!(!not_hosted(&error(other)));

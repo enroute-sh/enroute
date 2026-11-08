@@ -4,9 +4,9 @@
 //! tier.
 //!
 //! Every local copy is one file and a bitmap of the chunks present in it: a
-//! copy written here has every chunk, a file opened from the object store
-//! starts with none, and a copy found after a restart has those the node
-//! catalog recorded (checked against their hashes before first use).
+//! copy written here has every chunk, and a file opened from the object
+//! store starts with none. Local disk does not outlive the process, so the
+//! bitmap is the only record of the chunks.
 //!
 //! **Nothing synchronous ever waits on a remote tier.** Synchronous reads (the pool's page loads) only ever read the local file:
 //! bytes in a chunk that is not present yet fail with [`NotResident`],
@@ -33,7 +33,6 @@ use parking_lot::Mutex;
 use sha2::Digest;
 use tokio::sync::watch;
 
-use super::catalog::Journal;
 use super::handles::{Handle, Handles};
 use super::pool::{Access, PageSource, to_u64, to_usize};
 
@@ -335,20 +334,18 @@ impl ChunkHashes {
 }
 
 /// A local copy as it is when opened.
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 pub(super) struct LocalCopy {
     pub len: u64,
-    /// The chunks present (none: a new copy, created empty). A linked copy
-    /// has all.
-    pub chunks: Vec<u64>,
+    /// Every chunk is present (else none: a new copy, created empty).
+    pub complete: bool,
     /// A hard link to the file in the object store: it has every chunk.
     /// It shares that file's inode, so it is opened read-only and kept out
     /// of the disk budget: an eviction would punch the store's file, and a
     /// repair would write into it.
     pub linked: bool,
-    /// Written or checked by this process. Other chunks are checked
-    /// against their hashes before first use: a copy found after a restart
-    /// may be torn.
+    /// Written and checked by this process. The chunks of a linked copy
+    /// are checked against their hashes before first use.
     pub trusted: bool,
 }
 
@@ -409,33 +406,21 @@ pub(super) struct TieredSource {
     hashes: std::sync::OnceLock<ChunkHashes>,
     /// One bit per chunk: present and checked against its hash.
     verified: AtomicBits,
-    journal: Option<Journal>,
 }
 
 impl TieredSource {
     /// A source for the file held by `remote`, backed by the local `copy`
-    /// at `path` (created if it has no chunks), reporting chunk changes to
-    /// `journal` and charging them to `cache` (None: outside the disk
-    /// budget, never evicted).
+    /// at `path` (created if it has no chunks), charging its chunks to
+    /// `cache` (None: outside the disk budget, never evicted).
     pub(super) fn open(
         handles: &Arc<Handles>,
         remote: Arc<dyn RangeFetch>,
         path: PathBuf,
         cache: Option<Arc<DiskCache>>,
-        journal: Option<Journal>,
         copy: LocalCopy,
     ) -> Result<Arc<TieredSource>> {
         let len = copy.len;
-        let file = if !copy.linked && copy.chunks.is_empty() {
-            let f = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&path)?;
-            f.set_len(len)?;
-            f
-        } else {
+        let file = if copy.complete {
             let f = std::fs::OpenOptions::new()
                 .read(true)
                 .write(!copy.linked)
@@ -445,6 +430,15 @@ impl TieredSource {
                 "{} has the wrong length",
                 path.display()
             );
+            f
+        } else {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)?;
+            f.set_len(len)?;
             f
         };
         let file = handles.register(&path, copy.linked, file)?;
@@ -466,22 +460,16 @@ impl TieredSource {
             epoch: AtomicU64::new(0),
             hashes: std::sync::OnceLock::new(),
             verified: AtomicBits::new(n),
-            journal,
         });
-        let chunks: Vec<u64> = if copy.linked {
-            (0..n).collect()
-        } else {
-            copy.chunks.into_iter().filter(|&c| c < n).collect()
-        };
-        for &c in &chunks {
-            src.mark(c..c + 1);
-            if copy.trusted {
-                src.verified.set(c, Ordering::Release);
+        if copy.complete {
+            src.mark(0..n);
+            if let Some(cache) = &src.cache {
+                cache.admit(&src, 0..n);
             }
         }
-        if let Some(cache) = &src.cache {
-            for &c in &chunks {
-                cache.admit(&src, c..c + 1);
+        if copy.complete && copy.trusted {
+            for c in 0..n {
+                src.verified.set(c, Ordering::Release);
             }
         }
         Ok(src)
@@ -522,13 +510,10 @@ impl TieredSource {
         if let Some(cache) = &self.cache {
             cache.used.fetch_sub(self.chunk_len(c), Ordering::Relaxed);
         }
-        if let Some(j) = &self.journal {
-            j.evicted(c);
-        }
     }
 
     /// Learn the file's chunk hashes. Chunks present but not checked yet
-    /// (loaded before the hashes could be read, or recovered) are checked
+    /// (loaded before the hashes could be read, or linked) are checked
     /// before they are first read.
     pub(super) fn set_chunk_hashes(&self, hashes: ChunkHashes) {
         // Already known: the first set wins.
@@ -698,7 +683,7 @@ impl TieredSource {
     }
 }
 
-/// Closing a file keeps its local copy (the catalog may reopen it, or it
+/// Closing a file keeps its local copy (a later open may reuse it, or it
 /// is removed when the file is released); its chunks leave the disk
 /// budget's accounting.
 impl Drop for TieredSource {
@@ -758,9 +743,6 @@ impl Claim {
             }
         }
         src.mark(self.chunks.clone());
-        if let Some(j) = &src.journal {
-            j.present(self.chunks.clone());
-        }
         if let Some(cache) = &src.cache {
             cache.admit(&src, self.chunks.clone());
         }
@@ -790,8 +772,8 @@ impl TieredSource {
             // punching its hole: a read that may have seen the hole sees the
             // epoch move, and tries again.
             let epoch = self.epoch.load(Ordering::SeqCst);
-            // Chunks not checked yet (recovered after a restart) are checked
-            // on first use.
+            // Chunks not checked yet (loaded before the hashes were known, or
+            // linked) are checked on first use.
             let ok = self.chunks(&range).try_fold(true, |ok, c| {
                 Ok::<_, std::io::Error>(ok && self.has(c) && self.verify_present(c)?)
             })?;
@@ -909,7 +891,6 @@ mod tests {
             remote.clone(),
             dir.path().join("f.part"),
             None,
-            None,
             LocalCopy {
                 len: u(n),
                 ..Default::default()
@@ -983,7 +964,6 @@ mod tests {
             remote.clone(),
             dir.path().join("f.part"),
             Some(cache.clone()),
-            None,
             LocalCopy {
                 len: u(n),
                 ..Default::default()
@@ -1104,7 +1084,6 @@ mod tests {
             remote,
             dir.path().join("f.part"),
             None,
-            None,
             LocalCopy {
                 len: u(n),
                 ..Default::default()
@@ -1150,10 +1129,9 @@ mod tests {
             remote.clone(),
             path,
             None,
-            None,
             LocalCopy {
                 len: 2 * CHUNK,
-                chunks: vec![0, 1],
+                complete: true,
                 linked: false,
                 trusted: true,
             },
@@ -1165,43 +1143,6 @@ mod tests {
         src.read_at(0, &mut buf).unwrap();
         assert_eq!(buf, remote.data);
         assert_eq!(remote.gets.load(Ordering::Relaxed), gets, "nothing fetched");
-        drop(dir);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn recovered_chunks_are_checked_before_use() {
-        let (dir, remote, src) = setup(4 * us(CHUNK));
-        src.load(0..4 * CHUNK, Access::Hot).await.unwrap();
-        let path = src.path().to_path_buf();
-        drop(src);
-        // Corrupt chunk 1 on disk, as a crash might leave it.
-        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        f.write_all_at(&[0xff; 16], CHUNK + 10).unwrap();
-        let src = TieredSource::open(
-            &test_handles(),
-            remote.clone(),
-            path,
-            None,
-            None,
-            LocalCopy {
-                len: 4 * CHUNK,
-                chunks: (0..4).collect(),
-                linked: false,
-                trusted: false,
-            },
-        )
-        .unwrap();
-        src.set_chunk_hashes(hashes_of(&remote.data, 4 * CHUNK));
-        let mut b = vec![0u8; 32];
-        src.read_at(0, &mut b).unwrap();
-        let e = anyhow::Error::from(src.read_at(CHUNK, &mut b).unwrap_err());
-        NotResident::find(&e)
-            .unwrap()
-            .load(Access::Hot)
-            .await
-            .unwrap();
-        src.read_at(CHUNK + 10, &mut b).unwrap();
-        assert_eq!(&b[..], &remote.data[us(CHUNK) + 10..us(CHUNK) + 42]);
         drop(dir);
     }
 
@@ -1237,12 +1178,11 @@ mod tests {
             Arc::new(FileFetch(path.clone())),
             path.clone(),
             Some(cache.clone()),
-            None,
             LocalCopy {
                 len: 4 * CHUNK,
+                complete: true,
                 linked: true,
                 trusted: false,
-                ..Default::default()
             },
         )
         .unwrap();

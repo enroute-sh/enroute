@@ -17,7 +17,7 @@ use anyhow::Result;
 use clap::{CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
 
 use enroute::config::{Config, ObjectUri};
-use enroute_shared::registry;
+use enroute_ledger::cluster;
 
 /// Under load, the system allocator costs a compute much of its CPU.
 #[global_allocator]
@@ -69,7 +69,7 @@ enum Command {
     /// List the ledger's members, or remove one for good.
     ///
     /// Remove a node whose disk is lost, or that is retired: every log then
-    /// drops it. The members are in the configuration's `bucket`.
+    /// drops it. Run it on a ledger node: it signs with that node's key.
     Members {
         /// The node id to remove.
         #[arg(long, value_name = "ID")]
@@ -152,16 +152,20 @@ pub(crate) async fn run(
     console: &str,
     ready: impl FnOnce(),
 ) -> Result<()> {
-    enroute::telemetry::init(config.telemetry.as_ref(), console)?;
+    let _flush = enroute::telemetry::init(config.telemetry.as_ref(), Some(&config.node), console)?;
     if let Some(uri) = uri {
         tracing::info!(%uri, "read the configuration");
     }
 
+    // A ledger node serves only the internal listener, so binds nothing else.
+    let public = config.node.role.compute().then_some(&config.listen);
     // Loud, because it is the whole of what stands between a stranger and this
     // deployment's repositories.
-    if !config.listen.api.ip().is_loopback() {
+    if let Some(listen) = public
+        && !listen.api.ip().is_loopback()
+    {
         tracing::warn!(
-            api = %config.listen.api,
+            api = %listen.api,
             "the contract listener authenticates nobody; it must not be reachable \
              except by the application"
         );
@@ -171,8 +175,8 @@ pub(crate) async fn run(
         private: config.git.allow_private_remotes,
     };
     let listeners = enroute::Listeners::bind(
-        config.listen.api,
-        config.listen.git,
+        public.map(|l| l.api),
+        public.map(|l| l.git),
         config.node.internal_listen,
     )
     .await?;
@@ -217,16 +221,11 @@ async fn stop_signal() {
 /// Print the ledger's members, after removing `remove` if it names one.
 async fn members(uri: &ObjectUri, remove: Option<u64>, force: bool, json: bool) -> Result<()> {
     let config = Config::read(uri).await?;
-    enroute::telemetry::init(None, "info")?;
+    let _flush = enroute::telemetry::init(None, None, "info")?;
     let objects = config.bucket.store()?.objects();
     let members = match remove {
-        Some(id) => {
-            if !force {
-                registry::check_removal(&objects, id).await?;
-            }
-            registry::remove_member(&objects, id).await?
-        }
-        None => registry::members(&objects).await?,
+        Some(id) => cluster::remove(&objects, &config.node.data_dir, id, force).await?,
+        None => cluster::members(&objects).await?,
     };
     if json {
         return cli::print_json(&serde_json::json!({

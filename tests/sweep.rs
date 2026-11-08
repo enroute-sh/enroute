@@ -12,7 +12,7 @@ use enroute_shared::state::{Command, Commit, UPLOAD_GEN_WINDOW, layer_gen};
 
 /// The ids of `repo`'s layer files in the (file) object store under `root`.
 fn files(root: &Path, repo: &str) -> HashSet<String> {
-    let dir = root.join("store").join("repos").join(repo).join("layers");
+    let dir = root.join("store/data/repos").join(repo).join("layers");
     std::fs::read_dir(dir)
         .map(|d| {
             d.flatten()
@@ -55,7 +55,7 @@ async fn stale_publishes_are_republished() {
     // A layer published now (generation 0): the pushed layer's bytes again.
     let path = root
         .path()
-        .join("store/repos/slow/layers")
+        .join("store/data/repos/slow/layers")
         .join(format!("{}.layer", pushed.id));
     let sealed = enroute_compute::testing::Sealed::of(std::fs::read(path).unwrap().into()).unwrap();
     let layer = compute

@@ -115,16 +115,12 @@ fn kill(p: &mut Proc) {
 }
 
 async fn wait_ready(client: &reqwest::Client, procs: &[Proc]) {
-    // Ready: every live node answers (repositories elect their leaders when
+    // Ready: every live node answers (repositories get their sequencers when
     // they become active).
     for _ in 0..300 {
         let mut up = true;
         for p in procs.iter().filter(|p| p.child.is_some()) {
-            up &= client
-                .get(format!("http://127.0.0.1:{}/status", p.internal))
-                .send()
-                .await
-                .is_ok_and(|r| r.status().is_success())
+            up &= answers(client, p, "/status").await
                 && tokio::net::TcpStream::connect(("127.0.0.1", p.api))
                     .await
                     .is_ok();
@@ -169,6 +165,9 @@ async fn acknowledged_writes_survive_sigkill() {
         .collect();
     let mut first = apis[0].clone();
     first.create_repo("crash").await.unwrap();
+    // Every node hosts the log, so one node down leaves its replicas a
+    // quorum (a repository made before all joined has fewer at first).
+    hosted_everywhere(&client, &procs).await;
     first
         .create_commit(common::commit(
             "crash",
@@ -214,7 +213,7 @@ async fn acknowledged_writes_survive_sigkill() {
 
     let phase = |secs: u64| tokio::time::sleep(Duration::from_secs(secs));
     phase(2).await;
-    kill(&mut procs[0]); // the repo's leader, mid-write
+    kill(&mut procs[0]); // the repo's sequencer, mid-write
     phase(2).await;
     spawn(&mut procs[0], &store, &endpoint);
     phase(2).await;
@@ -266,6 +265,30 @@ async fn acknowledged_writes_survive_sigkill() {
     for p in &mut procs {
         kill(p);
     }
+}
+
+/// Whether `p` answers `GET path` on its internal port with a success.
+async fn answers(client: &reqwest::Client, p: &Proc, path: &str) -> bool {
+    client
+        .get(format!("http://127.0.0.1:{}{path}", p.internal))
+        .send()
+        .await
+        .is_ok_and(|r| r.status().is_success())
+}
+
+/// Wait until every node hosts the repository's log.
+async fn hosted_everywhere(client: &reqwest::Client, procs: &[Proc]) {
+    for _ in 0..300 {
+        let mut all = true;
+        for p in procs {
+            all &= answers(client, p, "/status/repos/crash").await;
+        }
+        if all {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("not every node came to host the repository's log");
 }
 
 /// Each branch contains its last acknowledged commit.

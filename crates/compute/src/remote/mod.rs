@@ -1,8 +1,10 @@
-//! Pushing this repository's refs to a git server somewhere else.
+//! Pushing this repository's refs to a git server somewhere else, and
+//! fetching that server's refs into it.
 //!
 //! The one place Enroute is a git *client*: everything else here terminates
-//! somebody's connection, and this dials out, with a pack built by the same
-//! code that answers a fetch. Nothing about a remote is kept, because a
+//! somebody's connection, and this dials out. A push sends a pack built by
+//! the same code that answers a fetch; a fetch lands its pack through the
+//! same checks as a push. Nothing about a remote is kept, because a
 //! remote is a relationship between an application's repository and somebody
 //! else's, and this layer holds neither — so a caller brings the URL, the
 //! credentials and the refs with the call.
@@ -10,6 +12,7 @@
 mod advertise;
 mod commands;
 mod endpoint;
+mod fetch;
 mod report;
 
 use std::sync::Arc;
@@ -20,7 +23,7 @@ use futures::StreamExt as _;
 use reqwest::RequestBuilder;
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
 
-use crate::git::oid::Oid;
+use crate::git::oid::{ObjectFormat, Oid};
 use crate::protocol::AGENT;
 use crate::protocol::pktline::{self, Pkt, Reader};
 use crate::query::{self, PushPack};
@@ -30,6 +33,7 @@ use self::advertise::Advertisement;
 use self::commands::{Command, Step, plan};
 use self::endpoint::Endpoint;
 pub use self::endpoint::Reach;
+pub(crate) use self::fetch::{FetchRequest, Fetched};
 
 /// The largest advertisement this reads, and the largest report.
 ///
@@ -186,14 +190,9 @@ fn packets(body: &[u8]) -> impl Iterator<Item = Result<Pkt<'_>, Error>> {
     Reader::new(body).map(|packet| packet.map_err(|error| Error::Protocol(format!("{error:#}"))))
 }
 
-/// A line's payload without the newline git puts on the end of most of them.
-fn trim_lf(line: &[u8]) -> &[u8] {
-    line.strip_suffix(b"\n").unwrap_or(line)
-}
-
 /// A line's payload as text, lossy: a garbled report reads better than none.
 fn text(line: &[u8]) -> String {
-    String::from_utf8_lossy(trim_lf(line)).into_owned()
+    String::from_utf8_lossy(pktline::chomp(line)).into_owned()
 }
 
 /// Enroute as a git client.
@@ -214,13 +213,16 @@ impl Client {
     /// Returns an error if the HTTP client cannot be built, which is the TLS
     /// backend failing to start.
     pub fn new(reach: Reach) -> Result<Self, Error> {
-        let http = reqwest::Client::builder()
+        let mut http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             // A redirect is refused rather than followed: it is a URL the
             // caller did not name, and their credentials are on the request.
             .redirect(reqwest::redirect::Policy::none())
-            .user_agent(AGENT)
-            .build()?;
+            .user_agent(AGENT);
+        if !reach.private {
+            http = http.dns_resolver(Arc::new(endpoint::PublicOnly));
+        }
+        let http = http.build()?;
         Ok(Self { http, reach })
     }
 
@@ -251,9 +253,10 @@ impl Client {
             return Err(Error::Request("a push names no refs".into()));
         }
         let credentials = request.remote.credentials.as_ref();
-        let endpoint = Endpoint::parse(&request.remote.url, self.reach).await?;
+        let endpoint = Endpoint::parse(&request.remote.url, self.reach)?;
         tracing::Span::current().record("remote", tracing::field::display(endpoint.url()));
-        let advertisement = self.discover(&endpoint, credentials).await?;
+        let format = snap.format();
+        let advertisement = self.discover(&endpoint, credentials, format).await?;
 
         if request.atomic && !advertisement.offers("atomic") {
             return Err(Error::Unsupported("atomic".into()));
@@ -262,7 +265,7 @@ impl Client {
             return Err(Error::Unsupported("report-status".into()));
         }
 
-        let steps = plan(&request.refs, &snap.meta.refs, &advertisement)?;
+        let steps = plan(format, &request.refs, &snap.meta.refs, &advertisement)?;
         let steps = fast_forward_only(snap, steps).await?;
         // The remote applies what it is sent, all or nothing. A ref refused
         // on this side is never in that set, so an atomic push holding one
@@ -303,6 +306,7 @@ impl Client {
         &self,
         endpoint: &Endpoint,
         credentials: Option<&Credentials>,
+        format: ObjectFormat,
     ) -> Result<Advertisement, Error> {
         let response = authorize(self.http.get(endpoint.advertisement()?), credentials)
             .header(ACCEPT, "application/x-git-receive-pack-advertisement")
@@ -313,7 +317,7 @@ impl Client {
         refuse_redirect(&response)?;
         check_status(&response)?;
         let body = read_capped(response, MAX_ADVERTISEMENT).await?;
-        advertise::parse(&body)
+        advertise::parse(format, &body)
     }
 
     /// Send the commands and the pack they need, and read the report.
@@ -326,7 +330,14 @@ impl Client {
         request: &PushRequest,
         advertisement: &Advertisement,
     ) -> Result<report::Report, Error> {
-        let head = request_head(commands, &capabilities(request.atomic))?;
+        // As git: the format is named when the remote names one (it is the
+        // repository's, or the advertisement was refused).
+        let format = advertisement
+            .capabilities
+            .iter()
+            .any(|c| c.starts_with("object-format="))
+            .then(|| snap.format());
+        let head = request_head(commands, &capabilities(request.atomic, format))?;
         let wants: Vec<Oid> = commands
             .iter()
             .filter(|command| !command.deletes())
@@ -340,16 +351,10 @@ impl Client {
         } else {
             // The haves are everything the remote advertised. What it does
             // not hold, it did not advertise; what this repository does not
-            // hold is dropped by the walk. Thin unless the remote refuses it,
-            // as git's own send-pack does.
-            let pack = query::pack_for_push(
-                snap,
-                &wants,
-                &advertisement.tips,
-                !advertisement.offers("no-thin"),
-            )
-            .await
-            .map_err(|error| Error::Storage(anyhow::anyhow!("{error}")))?;
+            // hold is dropped by the walk.
+            let pack = query::pack_for_push(snap, &wants, &advertisement.tips)
+                .await
+                .map_err(|error| Error::Storage(anyhow::anyhow!("{error}")))?;
             let pack = stream(pack);
             let head = futures::stream::once(async move { Ok(Bytes::from(head)) });
             reqwest::Body::wrap_stream(head.chain(pack))
@@ -380,7 +385,7 @@ impl Client {
 }
 
 /// A pack's bytes, as they go on the wire.
-type PackStream = futures::stream::BoxStream<'static, Result<Bytes, std::io::Error>>;
+pub(crate) type PackStream = futures::stream::BoxStream<'static, Result<Bytes, std::io::Error>>;
 
 /// `pack`, written on its own task while the remote reads it.
 fn stream(pack: PushPack) -> PackStream {
@@ -502,11 +507,15 @@ fn reported(steps: Vec<Step>, report: &report::Report) -> Vec<RefOutcome> {
         .collect()
 }
 
-/// What this push asks the remote for.
-fn capabilities(atomic: bool) -> String {
+/// What this push asks the remote for, naming `format` if given.
+fn capabilities(atomic: bool, format: Option<ObjectFormat>) -> String {
     let mut capabilities = String::from("report-status");
     if atomic {
         capabilities.push_str(" atomic");
+    }
+    if let Some(format) = format {
+        capabilities.push_str(" object-format=");
+        capabilities.push_str(format.name());
     }
     capabilities.push_str(" agent=");
     capabilities.push_str(AGENT);
@@ -593,10 +602,7 @@ async fn read_capped(mut response: reqwest::Response, limit: usize) -> Result<Ve
     // Bounded per read rather than over the whole answer: a large
     // advertisement is allowed to take its time, and a remote that has gone
     // quiet is not.
-    while let Some(chunk) = tokio::time::timeout(STALL_TIMEOUT, response.chunk())
-        .await
-        .map_err(|_elapsed| Error::Remote("the remote stopped answering".into()))??
-    {
+    while let Some(chunk) = next_chunk(&mut response).await? {
         if body.len().saturating_add(chunk.len()) > limit {
             return Err(Error::Protocol(format!(
                 "the remote answered with more than {limit} bytes"
@@ -605,6 +611,14 @@ async fn read_capped(mut response: reqwest::Response, limit: usize) -> Result<Ve
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+/// The next piece of a response body, failing if the remote goes quiet for
+/// `STALL_TIMEOUT`.
+async fn next_chunk(response: &mut reqwest::Response) -> Result<Option<Bytes>, Error> {
+    Ok(tokio::time::timeout(STALL_TIMEOUT, response.chunk())
+        .await
+        .map_err(|_elapsed| Error::Remote("the remote stopped answering".into()))??)
 }
 
 #[cfg(test)]
@@ -641,9 +655,9 @@ mod tests {
 
     #[test]
     fn atomic_is_asked_for_only_when_it_was_requested() {
-        assert!(capabilities(true).contains("atomic"));
-        assert!(!capabilities(false).contains("atomic"));
-        assert!(capabilities(false).starts_with("report-status"));
+        assert!(capabilities(true, None).contains("atomic"));
+        assert!(!capabilities(false, None).contains("atomic"));
+        assert!(capabilities(false, None).starts_with("report-status"));
     }
 
     #[test]

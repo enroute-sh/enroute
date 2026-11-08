@@ -1,123 +1,140 @@
-//! The ledger: repositories' logs, who votes in them, and their state in
-//! the object store. It creates a repository (its log's first and only
-//! incarnation, with the ledger's members as its voters) and checkpoints
-//! its state to the object store. The compute
-//! reaches it through the `Ledger` service (`enroute_shared::roles`), which it
-//! implements.
-//!
-//! The objects it keeps per repository are described in
-//! [`enroute_shared::repo_state`].
-//!
-//! The state object is the only one that changes, always by
-//! compare-and-swap on its version, so of concurrent writers exactly one
-//! succeeds. **Creating** a repository is a conditional create of it;
-//! **checkpointing** is a swap from the state its writer last saw, so a
-//! leader whose incarnation was superseded (by an operator's recovery)
-//! finds out at its next checkpoint, and stops hosting it.
-//!
-//! **Checkpoints** follow what changed, not the number of repositories:
-//! the engine reports repositories whose state changed or whose log this
-//! node started leading (`Events`), and each is
-//! checkpointed by its leader within `checkpoint_age` (at a random point
-//! in it, so a burst of them, after a restart or a change of leaders, is
-//! spread out), at once after [`CHECKPOINT_ENTRIES`] entries, or as soon as
-//! its log goes quiet, so an idle repository's latest state is in the
-//! object store. An idle repository costs nothing here.
+//! The ledger: repositories' logs, and the root log that says which
+//! repositories exist and who the members are (see `consensus::root`). The
+//! compute reaches it through the `Ledger` service
+//! (`enroute_shared::roles`), which it implements.
 //!
 //! **Activation.** A request for a repository this node does not host
-//! reads its state. If there is none and the request creates it, this node
-//! claims incarnation 1 (after a deletion, the next one), with the
-//! ledger's members as its voters
-//! ([`enroute_shared::registry`]; as they change, each log's leader changes its
-//! voters): it records its initial state, hosts it durably, swaps it into
-//! the state object, then announces it and campaigns. Any other member
-//! joins from the initial state (Raft catches it up). A live incarnation is
-//! never taken over: its voters resume it, and if a majority of them lost
-//! their logs, recovering it from its last checkpoint is an operator's
-//! decision.
+//! reads the directory, after a read barrier on the root log, so it sees
+//! every create and deletion committed before it. A live incarnation is
+//! hosted from the initial state the directory implies (its sequencer then
+//! catches the log up). Without one, a request that creates the repository
+//! proposes its next incarnation to the root, which places it on (up to)
+//! three replicas and appoints one sequencer; the replicas host it as they
+//! apply the entry. A live incarnation is never taken over: its replicas
+//! resume it, and if a majority of them lost their logs, recovering it is
+//! an operator's decision (see "Recovery" in
+//! `docs/internals/ledger-and-compute.md`).
 //!
-//! **Deletion** commits a tombstone to the repository's log, then marks
-//! the state object deleted at that incarnation (after a trash marker for
-//! its layer files, which the compute reclaims). The tombstoned log stays
-//! hosted, quiet, until a new incarnation supersedes it.
+//! **Deletion** commits a tombstone to the repository's log, writes a
+//! trash marker for its layer files (which the compute reclaims), then ends
+//! the incarnation in the root log, whose members then drop its log. An
+//! incarnation that ended is never hosted again, and a new one has a new log.
 //!
-//! A repository is never dropped from its voters while it exists: idle
-//! logs go quiet and cost no ticks or messages. Taking a whole ledger down
-//! and back up (on other machines, say) is done by stopping its nodes and
-//! moving their disks: a node's identity is its log store (see
-//! "Freezing the ledger" in ARCHITECTURE.md).
+//! **Members** are the root log's too, with their addresses and token
+//! keys: a node joins and an operator removes one through it (see
+//! [`crate::cluster`]), and the root's controller moves the replicas of
+//! logs on removed members to others.
+//!
+//! Nothing here is in the object store but the trash markers and what
+//! `crate::cluster` keeps under `cluster/`. Taking a whole ledger down and back up (on other
+//! machines, say) is done by stopping its nodes and moving their disks: a
+//! node's identity is its log store (see "Freezing the ledger" there).
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
-use futures::StreamExt;
-use tokio::sync::mpsc;
+use anyhow::{Result, bail};
+use jsonwebtoken::DecodingKey;
 use tonic::{Request, Response, Status};
+use tracing::Instrument as _;
 
+use enroute_shared::auth::{Bearer, Token};
+use enroute_shared::nodes;
+use enroute_shared::oid::ObjectFormat;
 use enroute_shared::proto::{
     ActivateRequest, ActivateResponse, DeleteRequest, DeleteResponse, DescribeRequest,
-    DescribeResponse, FollowRequest, ListRequest, ListResponse, ReadBarrierRequest,
-    ReadBarrierResponse, RepoSummary, ledger_server,
+    DescribeResponse, ListRequest, ListResponse, PendingRepo, PendingRequest, PendingResponse,
+    ReadBarrierRequest, ReadBarrierResponse, RepoSummary, WatchRequest, ledger_server,
 };
-use enroute_shared::registry::Registry;
-use enroute_shared::repo_state::{Record, Trash, epoch_path, state_path, trash_path};
-use enroute_shared::roles::{FollowStream, NotHosted, not_hosted, status};
-use enroute_shared::state::{Command, Outcome, Refusal, RepoMeta, UPLOAD_GEN_WINDOW};
-use enroute_shared::store::{ObjectVersion, Objects};
+use enroute_shared::repo_state::{Trash, trash_path};
+use enroute_shared::roles::{
+    Follow, FollowStream, NotHosted, WatchStream, not_hosted, not_sequencer_status,
+};
+use enroute_shared::state::{Command, Outcome, Refusal};
+use enroute_shared::store::Objects;
 
-use crate::consensus::Engine;
+use crate::cluster;
+use crate::consensus::Located;
+use crate::consensus::{Engine, NotSequencer};
 use crate::logdb;
-use crate::state_store::StateStore;
+use crate::proto::{Delete, Member, root_entry};
+use crate::state::store::StateStore;
+use crate::token::{self, Claims, Issuer, Refused, Verifier};
 
 /// Settings for a ledger node.
 #[derive(Clone, Debug)]
 pub struct LedgerConfig {
     /// This node's address for its peers; None: a standalone node, the
-    /// only voter of its logs (no registry, no transport).
+    /// only replica of its logs (no registry, no transport).
     pub advertise: Option<String>,
+    /// This node's failure domain, such as an availability zone (empty:
+    /// none): a repository's log has its replicas in distinct zones where
+    /// it can.
+    pub zone: String,
     /// Snapshot each log (dropping older entries) every N applied entries.
     pub snapshot_every: u64,
     /// The state store's memory: its block cache and memtables.
     pub state_memory_bytes: usize,
-    /// Checkpoint a repository's state at most this long after it changed
-    /// (or after [`CHECKPOINT_ENTRIES`] entries, or once its log is quiet).
-    pub checkpoint_age: Duration,
-    /// Checkpoints written at once.
-    pub checkpoint_concurrency: usize,
+    /// The largest layer whose bytes may travel in the proposal.
+    ///
+    /// A larger layer must be in the object store before a command names
+    /// it. 0: no repository content passes through the ledger.
+    pub max_inline_layer_bytes: u64,
+    /// Create repositories whose objects are named in SHA-256.
+    ///
+    /// Off until every node of the deployment runs a release that knows
+    /// SHA-256: an older node cannot read such a repository's state.
+    pub allow_sha256: bool,
+    /// How long the tokens this node gives joining nodes last (see
+    /// `Membership` in `proto/ledger.proto`).
+    pub token_ttl: Duration,
 }
 
 impl Default for LedgerConfig {
     fn default() -> Self {
         LedgerConfig {
             advertise: None,
+            zone: String::new(),
             snapshot_every: 1000,
             state_memory_bytes: 512 << 20,
-            checkpoint_age: Duration::from_secs(60),
-            checkpoint_concurrency: 8,
+            max_inline_layer_bytes: 1 << 20,
+            allow_sha256: false,
+            token_ttl: token::TOKEN_TTL,
         }
     }
 }
 
-/// A ledger node: its repositories' logs and their checkpoints.
+/// A ledger node: its repositories' logs and the root log.
 pub struct Ledger {
-    /// Checkpoint tuning.
+    /// Its settings.
     pub config: LedgerConfig,
     /// The consensus engine that hosts the logs.
     pub engine: Arc<Engine>,
-    /// The object store that holds the checkpoints.
+    /// The object store that holds the trash markers.
     pub objects: Arc<Objects>,
-    /// The node registry (None for a standalone node).
-    pub registry: Option<Arc<Registry>>,
+    /// Signs the tokens this node gives.
+    issuer: Arc<Issuer>,
+    /// Tokens checked, until they expire.
+    verifier: Verifier,
+    /// The members as this node last wrote them to the object store (see
+    /// `cluster::publish`).
+    published: tokio::sync::Mutex<Vec<Member>>,
+    /// This node's own token, for its calls to its peers (None for a
+    /// standalone node).
+    token: Option<Token>,
+    /// Challenges given and not answered yet (see `crate::membership`).
+    pub(crate) challenges: parking_lot::Mutex<HashMap<String, crate::membership::Pending>>,
     /// Activations in progress, one at a time per repository.
     activating: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// Per repository: what this node last wrote to its state object.
-    written: parking_lot::Mutex<HashMap<String, Written>>,
-    /// Repositories whose state changed since their last checkpoint, and
-    /// when the next one is due.
-    due: parking_lot::Mutex<HashMap<String, Instant>>,
+    /// Repositories whose log this node leads that may need maintenance
+    /// (see `Pending` in `ledger.proto`).
+    pending: parking_lot::Mutex<HashMap<String, Work>>,
+    /// When each compute last asked which repositories it maintains.
+    computes: parking_lot::Mutex<HashMap<u64, Instant>>,
+    /// Itself, for the subscriptions of a `Watch` call, which outlive it.
+    me: std::sync::Weak<Ledger>,
 }
 
 impl std::fmt::Debug for Ledger {
@@ -128,35 +145,61 @@ impl std::fmt::Debug for Ledger {
     }
 }
 
-/// A state this node wrote: for which incarnation, the object's version
-/// then (checkpoints swap from it), and its log index.
-struct Written {
-    epoch: u64,
-    version: ObjectVersion,
-    index: u64,
+/// Lifecycle rounds run this often.
+const ROUND_EVERY: Duration = Duration::from_secs(1);
+
+/// An error as a status: [`NotSequencer`] is unavailable (the request did not
+/// reach the log) and names the sequencer's internal URL, for the compute to ask
+/// it; the rest as for any role ([`enroute_shared::roles::status`]).
+fn status(e: anyhow::Error) -> Status {
+    if e.chain().any(<dyn std::error::Error>::is::<Sha256Off>) {
+        return Status::failed_precondition(format!("{e:#}"));
+    }
+    match e.chain().find_map(|c| c.downcast_ref::<NotSequencer>()) {
+        Some(NotSequencer { url, .. }) => not_sequencer_status(format!("{e:#}"), url),
+        None => enroute_shared::roles::status(e),
+    }
 }
 
-/// A checkpoint that failed is tried again after this long.
-const CHECKPOINT_RETRY: Duration = Duration::from_secs(5);
+impl Ledger {
+    /// The error naming node `sequencer` as the repository's sequencer.
+    fn not_sequencer(&self, sequencer: u64) -> anyhow::Error {
+        NotSequencer {
+            sequencer,
+            url: self.engine.url(sequencer),
+        }
+        .into()
+    }
+}
 
-/// Checkpoint at least this often (entries), and when a state worth one
-/// has not been checkpointed for [`LedgerConfig::checkpoint_age`].
-const CHECKPOINT_ENTRIES: u64 = 1000;
+/// A SHA-256 repository to create on a ledger without `allow_sha256`.
+#[derive(Debug)]
+struct Sha256Off;
+
+impl std::fmt::Display for Sha256Off {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SHA-256 repositories are off on this ledger (ledger.allow_sha256)")
+    }
+}
+
+impl std::error::Error for Sha256Off {}
+
+fn not_member() -> anyhow::Error {
+    anyhow::Error::new(NotHosted).context("this node is not a member of the ledger")
+}
 
 impl Ledger {
     /// Open the ledger on `data_dir` and start it. Its log store's id is the
-    /// node's Raft id. In a cluster (`advertise`), it registers under
-    /// that id and finds its peers in the registry.
+    /// node's id in the ledger. In a cluster (`advertise`), it announces
+    /// itself under that id and joins (see `crate::cluster`); a new
+    /// cluster's first node starts the root log.
     ///
-    /// Then it drops incarnations superseded while this node was away, runs
-    /// lifecycle rounds (checkpoints) every second (or every half
-    /// `checkpoint_age`, if shorter), and joins the incarnations that peers
-    /// announce.
+    /// Then it runs lifecycle rounds every second.
     ///
     /// # Errors
     ///
-    /// Returns an error if the log store, the state store, the registry or
-    /// the engine fails to start.
+    /// Returns an error if the log store, the state store, the object
+    /// store or the engine fails to start, or the node was removed.
     pub async fn open(
         data_dir: &Path,
         config: LedgerConfig,
@@ -164,32 +207,87 @@ impl Ledger {
     ) -> Result<Arc<Ledger>> {
         let db = logdb::open(&data_dir.join("log"))?;
         let id = logdb::store_id(&db)?;
-        let registry = match &config.advertise {
-            Some(url) => Some(Registry::join(objects.clone(), id, url.clone()).await?),
-            None => None,
-        };
-        let addresses = registry.as_ref().map(|r| r.addresses.clone());
+        let issuer = Arc::new(Issuer::load_or_create(&data_dir.join(token::KEY_FILE), id)?);
+        let bootstrap = cluster::bootstraps(&db, &objects, id, config.advertise.is_some()).await?;
+        let me = config.advertise.as_ref().map(|url| Member {
+            id,
+            url: url.clone(),
+            key: token::encode_key(&issuer.public()),
+            zone: config.zone.clone(),
+        });
+        if let Some(me) = &me {
+            cluster::announce(&objects, me).await?;
+        }
+        let token = me
+            .as_ref()
+            .map(|_| token::self_issued(issuer.clone(), config.token_ttl));
+        let peers = token
+            .clone()
+            .map(|t| (crate::consensus::Addresses::default(), Bearer::new(t)));
         let state = Arc::new(StateStore::open(
             &data_dir.join("state"),
             config.state_memory_bytes,
         )?);
-        let (announced, joins) = mpsc::unbounded_channel();
-        let engine = Engine::start(db, state, config.snapshot_every, id, addresses, announced)?;
-        let every =
-            (config.checkpoint_age / 2).clamp(Duration::from_millis(50), Duration::from_secs(1));
-        let ledger = Arc::new(Ledger {
+        let engine = Engine::start(db, state, config.snapshot_every, id, peers, bootstrap)?;
+        if let Some(me) = me {
+            tokio::spawn(cluster::join(Arc::downgrade(&engine), objects.clone(), me));
+        }
+        let ledger = Arc::new_cyclic(|me| Ledger {
             config,
             engine,
             objects,
-            registry,
+            issuer,
+            verifier: Verifier::default(),
+            published: tokio::sync::Mutex::default(),
+            token,
+            challenges: parking_lot::Mutex::default(),
             activating: parking_lot::Mutex::default(),
-            written: parking_lot::Mutex::default(),
-            due: parking_lot::Mutex::default(),
+            pending: parking_lot::Mutex::default(),
+            computes: parking_lot::Mutex::default(),
+            me: me.clone(),
         });
-        tokio::spawn(lifecycle_loop(Arc::downgrade(&ledger), every));
-        // Weak: the ledger owns the engine, which feeds this task.
-        tokio::spawn(join_loop(Arc::downgrade(&ledger), joins));
+        tokio::spawn(lifecycle_loop(Arc::downgrade(&ledger)));
         Ok(ledger)
+    }
+
+    /// The key that checks ledger node `id`'s tokens: this node's own, or
+    /// a peer's as the directory has it (or as it was introduced, before
+    /// this node has the directory).
+    fn key_of(&self, id: u64) -> Option<DecodingKey> {
+        if id == self.issuer.id() {
+            return Some(self.issuer.decoding_key().clone());
+        }
+        token::decoding_key(&self.engine.known(id)?.key)
+    }
+
+    /// Check a token presented to this node (see `Membership` in
+    /// `proto/ledger.proto`).
+    ///
+    /// # Errors
+    ///
+    /// Returns why the token is refused.
+    pub fn authenticate(&self, token: &str) -> Result<Arc<Claims>, Refused> {
+        if let Some(checked) = self.verifier.cached(token, token::now()) {
+            return checked;
+        }
+        let id = token::issuer(token).ok_or(token::MALFORMED)?;
+        let key = self.key_of(id).ok_or(token::UNKNOWN_ISSUER)?;
+        let claims = Arc::new(token::verify(token, id, &key)?);
+        self.verifier.insert(token, claims.clone());
+        Ok(claims)
+    }
+
+    /// A token for `sub`, signed by this node, lasting `token_ttl`.
+    #[must_use]
+    pub fn issue(&self, sub: &str) -> String {
+        self.issuer.issue(sub, self.config.token_ttl)
+    }
+
+    /// This node's own token for its peers, which a compute in the same
+    /// process presents too (None for a standalone node).
+    #[must_use]
+    pub fn token(&self) -> Option<Token> {
+        self.token.clone()
     }
 
     /// Whether this node hosts `repo`'s log, and has not applied its
@@ -198,11 +296,18 @@ impl Ledger {
         self.engine.hosted(repo).is_some_and(|h| !h.deleted)
     }
 
-    /// Make `repo` active on this node (hosting its log): join it if this
-    /// node is one of its voters, or create it (`create`, with HEAD `head`
-    /// if given; see `ActivateRequest`). Returns whether it is active
-    /// (false: it does not exist).
-    async fn activate(&self, repo: &str, create: bool, head: Option<&str>) -> Result<bool> {
+    /// Make `repo` active on this node (hosting its log): host its live
+    /// incarnation if this node is a member, or create it (`create`, in
+    /// that format, with HEAD `head` if given; see `ActivateRequest`). Returns whether it is
+    /// active (false: it does not exist). An explicit create (`head`)
+    /// always consults the root, so a node that missed a deletion does not
+    /// answer with the deleted repository.
+    async fn activate(
+        &self,
+        repo: &str,
+        create: Option<ObjectFormat>,
+        head: Option<&str>,
+    ) -> Result<bool> {
         if head.is_none() && self.live_here(repo) {
             return Ok(true);
         }
@@ -224,73 +329,75 @@ impl Ledger {
         activated
     }
 
-    async fn activate_now(&self, repo: &str, create: bool, head: Option<&str>) -> Result<bool> {
-        for attempt in 0..100 {
-            if head.is_none() && self.live_here(repo) {
-                return Ok(true);
-            }
-            if attempt > 0 {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            let found = enroute_shared::repo_state::latest(&self.objects, repo).await?;
-            let rec = match found {
-                Some((rec, _)) if !is_deleted(&rec) => rec,
-                prior => match self.claim_next(repo, create, head, prior).await? {
-                    Some(active) => return Ok(active),
-                    None => continue,
-                },
-            };
-            match self.engine.hosted(repo) {
-                // The state object is behind a deletion applied here.
-                Some(h) if h.epoch == rec.epoch && h.deleted => self.mark_deleted(repo).await?,
-                Some(h) if h.epoch >= rec.epoch && !h.deleted => return Ok(true),
-                _ => self.join_incarnation(repo, rec.epoch).await?,
-            }
-        }
-        bail!("could not activate {repo}")
-    }
-
-    /// Claims the first incarnation of `repo`, or the one after the deleted
-    /// `prior`, if `create`. `Some` is the final answer of the activation;
-    /// `None`: another node won the claim, so try again.
-    async fn claim_next(
+    async fn activate_now(
         &self,
         repo: &str,
-        create: bool,
+        create: Option<ObjectFormat>,
         head: Option<&str>,
-        prior: Option<(Record, ObjectVersion)>,
-    ) -> Result<Option<bool>> {
-        if !create {
-            return Ok(Some(false));
+    ) -> Result<bool> {
+        let mut root_down = None;
+        for attempt in 0..10 {
+            if (head.is_none() || attempt > 0) && self.live_here(repo) {
+                return Ok(true);
+            }
+            // A deletion that stopped after its tombstone: finish it first.
+            if self.engine.hosted(repo).is_some_and(|h| h.deleted) {
+                self.end_incarnation(repo).await?;
+            }
+            // The root log may be electing a leader: wait for it.
+            if let Err(e) = self.engine.root_barrier().await {
+                root_down = Some(e);
+                continue;
+            }
+            match self.engine.locate(repo).await? {
+                Located::Here => {}
+                // Its sequencer serves it.
+                Located::Elsewhere(sequencer) => return Err(self.not_sequencer(sequencer)),
+                Located::Absent if create.is_none() => return Ok(false),
+                Located::Absent if !self.engine.members().0.contains(&self.engine.id) => {
+                    return Err(not_member());
+                }
+                Located::Absent
+                    if create == Some(ObjectFormat::Sha256) && !self.config.allow_sha256 =>
+                {
+                    return Err(Sha256Off.into());
+                }
+                Located::Absent => {
+                    let format =
+                        enroute_shared::proto::ObjectFormat::from(create.unwrap_or_default());
+                    let create = self
+                        .engine
+                        .create(repo, head.map(str::to_string), format.into());
+                    let entry = root_entry::Change::Create(create).into();
+                    root_down = self.engine.propose_root(entry).await.err();
+                }
+            }
         }
-        // Incarnation 1, empty, for a new repository.
-        let epoch = prior.as_ref().map_or(1, |(rec, _)| rec.epoch + 1);
-        let meta = initial(epoch, head, prior.as_ref().map(|(rec, _)| rec));
-        let claimed = self.claim(repo, epoch, meta, prior.map(|(_, v)| v)).await?;
-        Ok(claimed.then_some(true))
+        Err(root_down
+            .unwrap_or_else(|| anyhow::anyhow!("the repository kept changing"))
+            .context(format!("could not activate {repo}")))
     }
 
-    /// Delete `repo`: commit its tombstone, then mark the state object
-    /// deleted (see `Delete` in `ledger.proto`).
+    /// Delete `repo`: commit its tombstone, then end its incarnation (see
+    /// `Delete` in `ledger.proto`).
     async fn delete(&self, repo: &str) -> Result<()> {
         for _ in 0..10 {
-            let Some((rec, _)) = enroute_shared::repo_state::latest(&self.objects, repo).await?
-            else {
+            self.engine.root_barrier().await?;
+            let Some(inc) = self.engine.incarnation(repo).filter(|i| !i.deleted) else {
                 return Ok(());
             };
-            if is_deleted(&rec) {
-                return Ok(());
+            if let Located::Elsewhere(sequencer) = self.engine.locate(repo).await? {
+                return Err(self.not_sequencer(sequencer));
             }
-            self.join_incarnation(repo, rec.epoch).await?;
             // Answered once applied here, so the tombstone is in the state
-            // this node marks.
+            // this node reads.
             let out = self
                 .engine
-                .propose(Command::delete(repo).at(rec.epoch))
+                .propose(Command::delete(repo).at(inc.epoch))
                 .await?;
             match out.refused() {
-                None | Some(Refusal::Deleted) => return self.mark_deleted(repo).await,
-                // The state object was behind a newer incarnation.
+                None | Some(Refusal::Deleted) => return self.end_incarnation(repo).await,
+                // The directory here was behind a newer incarnation.
                 Some(Refusal::OtherIncarnation) => {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
@@ -302,27 +409,47 @@ impl Ledger {
         bail!("could not delete {repo}")
     }
 
-    /// Swap the deleted state this node applied into the state object (a
-    /// checkpoint, which writes the trash marker first).
-    async fn mark_deleted(&self, repo: &str) -> Result<()> {
+    /// End the incarnation of `repo` whose deletion this node applied: write
+    /// the trash marker for its files, then the root entry that ends it
+    /// (nodes then drop its log).
+    async fn end_incarnation(&self, repo: &str) -> Result<()> {
         let name = repo.to_string();
         let rec = self
             .blocking(move |e| e.record(&name))
             .await?
             .ok_or(NotHosted)?;
-        anyhow::ensure!(is_deleted(&rec), "{repo} is not deleted here");
-        self.checkpoint(repo, &rec).await
+        let meta = rec.meta.unwrap_or_default();
+        anyhow::ensure!(meta.deleted, "{repo} is not deleted here");
+        // Before the incarnation ends: no deletion leaves files that nobody
+        // reclaims.
+        let trash = Trash {
+            upload_gen: meta.upload_gen,
+            ..Default::default()
+        };
+        let data = serde_json::to_vec(&trash)?.into();
+        self.objects
+            .put_if(&trash_path(repo, rec.epoch), data, None)
+            .await?;
+        let delete = Delete {
+            repo: repo.to_string(),
+            epoch: rec.epoch,
+            version: meta.version,
+            upload_gen: meta.upload_gen,
+        };
+        self.engine
+            .propose_root(root_entry::Change::Delete(delete).into())
+            .await
     }
 
     /// `repo` as of everything committed before the call, if it exists.
     async fn describe(&self, repo: &str) -> Result<Option<RepoSummary>> {
         for _ in 0..3 {
-            if !self.activate(repo, false, None).await? {
+            if !self.activate(repo, None, None).await? {
                 return Ok(None);
             }
             match self.engine.read_barrier(repo).await {
                 Ok(()) => {}
-                // No longer hosted here (superseded): activate again.
+                // No longer hosted here (it ended): activate again.
                 Err(e) if not_hosted(&e) => continue,
                 Err(e) => return Err(e),
             }
@@ -344,450 +471,163 @@ impl Ledger {
         tokio::task::spawn_blocking(move || f(&engine)).await?
     }
 
-    /// Claim incarnation `epoch` of `repo` starting from `meta`: record it
-    /// as the incarnation's initial state, host it durably, create the
-    /// state object, then announce it and campaign. False if another node
-    /// created the state first.
-    ///
-    /// The initial state of `epoch` is the same whoever claims it (`meta`,
-    /// and the voters of the first claimant to record it), so it is
-    /// written before the claim, and a node that lost the race for the
-    /// same incarnation keeps hosting it as a replica.
-    ///
-    /// After a deletion, `expected` is the version of the deleted state the
-    /// claim swaps out.
-    async fn claim(
-        &self,
-        repo: &str,
-        epoch: u64,
-        meta: RepoMeta,
-        mut expected: Option<ObjectVersion>,
-    ) -> Result<bool> {
-        let voters = self.voters_for_claim().await?;
-        let mut rec = Record {
-            repo: repo.to_string(),
-            epoch,
-            voters,
-            meta: Some(meta),
-            ..Default::default()
-        };
-        let mut data = rec.to_bytes();
-        // Each claimant sees its own set of live voters: the first to record
-        // the initial state decides them, and the others adopt it.
-        if self
-            .objects
-            .put_if(&epoch_path(repo, epoch), data.clone(), None)
-            .await?
-            .is_none()
-        {
-            data = self
-                .objects
-                .get_object(&epoch_path(repo, epoch))
-                .await?
-                .context("initial state vanished")?;
-            rec = Record::from_bytes(&data)?;
-        }
-        if !rec.voters.contains(&self.engine.id) {
-            return Err(anyhow::Error::new(NotHosted).context(format!(
-                "this node is not a voter of incarnation {epoch} of {repo}"
-            )));
-        }
-        self.engine
-            .host(repo, epoch, rec.meta.unwrap_or_default(), rec.voters)
-            .await?;
-        let version = loop {
-            if let Some(v) = self
-                .objects
-                .put_if(&state_path(repo), data.clone(), expected.as_ref())
-                .await?
-            {
-                break v;
-            }
-            match enroute_shared::repo_state::latest(&self.objects, repo).await? {
-                // Another claimant won it: this node is a replica.
-                Some((r, _)) if r.epoch == epoch && !is_deleted(&r) => return Ok(true),
-                // The deleted state was checkpointed again.
-                Some((r, v)) if r.epoch < epoch && is_deleted(&r) && expected.is_some() => {
-                    expected = Some(v);
-                }
-                // Deleted already: a later activation supersedes it.
-                Some((r, _)) if r.epoch == epoch => return Ok(false),
-                _ => {
-                    self.engine.unhost(repo, epoch);
-                    return Ok(false);
-                }
-            }
-        };
-        self.written.lock().insert(
-            repo.to_string(),
-            Written {
-                epoch,
-                version,
-                index: 0,
-            },
-        );
-        self.engine.lead(repo, epoch);
-        tracing::debug!(repo, epoch, "repository active");
-        Ok(true)
-    }
-
-    /// Host incarnation `epoch` of `repo` (live on a peer) from its initial
-    /// state, if this node is a member. It never acknowledged anything in it
-    /// (a node that lost its log has a new id, and a removed node never
-    /// comes back), so Raft's guarantees hold.
-    async fn join_incarnation(&self, repo: &str, epoch: u64) -> Result<()> {
-        if self.engine.hosted(repo).is_some_and(|h| h.epoch >= epoch) {
-            return Ok(());
-        }
-        anyhow::ensure!(self.is_member(), "this node is not a member of the ledger");
-        let data = self
-            .objects
-            .get_object(&epoch_path(repo, epoch))
-            .await?
-            .context("incarnation without an initial state")?;
-        let rec = Record::from_bytes(&data)?;
-        self.engine
-            .host(repo, epoch, rec.meta.unwrap_or_default(), rec.voters)
-            .await
-    }
-
-    /// Join incarnation `epoch` of `repo`, which a peer announced, unless it
-    /// ended. An ended incarnation is never joined: this node would vote in
-    /// it from a fresh state, though it may have voted in it before.
-    async fn join_announced(&self, repo: &str, epoch: u64) -> Result<()> {
-        if let Some((rec, _)) = enroute_shared::repo_state::latest(&self.objects, repo).await?
-            && (rec.epoch > epoch || rec.epoch == epoch && is_deleted(&rec))
-        {
-            return Ok(());
-        }
-        self.join_incarnation(repo, epoch).await
-    }
-
-    /// The voters of a new incarnation: the members, read now (the claimant
-    /// among them, so a claimed incarnation always has a host).
-    async fn voters_for_claim(&self) -> Result<Vec<u64>> {
-        let Some(registry) = &self.registry else {
-            return Ok(vec![self.engine.id]);
-        };
-        let members = enroute_shared::registry::members(&self.objects)
-            .await?
-            .members;
-        anyhow::ensure!(
-            members.contains(&self.engine.id),
-            "this node is not a member of the ledger"
-        );
-        // Its announcement must reach them all.
-        if members.iter().any(|&m| registry.address(m).is_none()) {
-            registry.round().await?;
-        }
-        Ok(members)
-    }
-
-    fn is_member(&self) -> bool {
-        self.registry
-            .as_ref()
-            .is_none_or(|r| r.members().members.contains(&self.engine.id))
-    }
-
-    /// One round of lifecycle work, on what happened since the last (see
-    /// `Events`): write the checkpoints that are due,
-    /// and pass the members on to the engine.
+    /// One round of lifecycle work: write the members to the object store
+    /// if they changed (the root's leader does), and track what the
+    /// repositories that changed may need.
     async fn lifecycle_round(&self) {
-        if let Some(r) = &self.registry {
-            let m = r.members();
-            if m.removed.contains(&self.engine.id) {
-                self.retire();
-            }
-            self.engine.set_members(m.members, m.removed);
+        if self.token.is_some() && self.engine.leads_root() {
+            let mut last = self.published.lock().await;
+            cluster::publish(&self.engine, &self.objects, &mut last).await;
         }
-        let events = self.engine.take_events();
-        let due = self.take_due(events.changed, &events.quiet, Instant::now());
-        futures::stream::iter(due)
-            .for_each_concurrent(
-                self.config.checkpoint_concurrency.max(1),
-                |repo| async move {
-                    if let Err(e) = self.checkpoint_changed(&repo).await {
-                        tracing::warn!(repo, "checkpoint: {e:#}");
-                        self.due
-                            .lock()
-                            .insert(repo, Instant::now() + CHECKPOINT_RETRY);
-                    }
-                },
-            )
-            .await;
+        self.track_pending(self.engine.take_events()).await;
     }
 
-    /// Schedule the `changed` repositories, and remove (and return) those
-    /// whose checkpoint is due at `now`. A `quiet` repository is due at once.
-    fn take_due(
-        &self,
-        changed: HashSet<String>,
-        quiet: &HashSet<String>,
-        now: Instant,
-    ) -> Vec<String> {
-        let mut due = self.due.lock();
-        for repo in changed {
-            let jitter = self
-                .config
-                .checkpoint_age
-                .mul_f64(rand::random_range(0.5..1.0));
-            due.entry(repo).or_insert(now + jitter);
+    /// Whether this node leads `repo`'s live log.
+    fn leads(&self, repo: &str) -> bool {
+        self.engine
+            .hosted(repo)
+            .is_some_and(|h| h.leading && !h.deleted)
+    }
+
+    /// Note what the `changed` repositories may need, and forget those this
+    /// node no longer leads. Only a log's sequencer tracks it: a new sequencer
+    /// hears of it as changed.
+    async fn track_pending(&self, changed: HashSet<String>) {
+        self.pending.lock().retain(|repo, _| self.leads(repo));
+        let repos: Vec<String> = changed.into_iter().filter(|r| self.leads(r)).collect();
+        if repos.is_empty() {
+            return;
         }
-        // A quiet log's latest state goes to the object store now.
-        for repo in quiet {
-            if let Some(at) = due.get_mut(repo) {
-                *at = now;
+        let work = match self.blocking(move |e| work(e, repos)).await {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!("tracking repositories that need maintenance: {e:#}");
+                return;
             }
-        }
-        let written = self.written.lock();
-        let lagging = |repo: &str| {
-            let index = written.get(repo).map_or(0, |w| w.index);
-            self.engine
-                .hosted(repo)
-                .is_some_and(|h| h.applied >= index + CHECKPOINT_ENTRIES)
         };
-        let ready: Vec<String> = due
-            .iter()
-            .filter(|(repo, at)| **at <= now || lagging(repo))
-            .map(|(r, _)| r.clone())
-            .collect();
-        for r in &ready {
-            due.remove(r);
-        }
-        ready
-    }
-
-    /// Checkpoint `repo` if this node leads it and its state moved past the
-    /// last checkpoint written here. (A follower does not: if it becomes
-    /// leader, the engine reports the repository again.)
-    async fn checkpoint_changed(&self, repo: &str) -> Result<()> {
-        let Some(h) = self.engine.hosted(repo) else {
-            return Ok(());
-        };
-        if !h.leading {
-            return Ok(());
-        }
-        let index = self
-            .written
-            .lock()
-            .get(repo)
-            .filter(|w| w.epoch == h.epoch)
-            .map_or(0, |w| w.index);
-        if h.applied <= index {
-            return Ok(());
-        }
-        // Read from the state store (and the log, for inline layers).
-        let name = repo.to_string();
-        let Some(state) = self.blocking(move |e| e.record(&name)).await? else {
-            return Ok(());
-        };
-        if state.epoch != h.epoch {
-            return Ok(());
-        }
-        self.checkpoint(repo, &state).await
-    }
-
-    /// Swap `state` (of `repo`, at a log index of an incarnation) into the
-    /// state object. Fails if the incarnation was superseded (and stops
-    /// hosting it).
-    async fn checkpoint(&self, repo: &str, state: &Record) -> Result<()> {
-        let (epoch, index) = (state.epoch, state.index);
-        if let Some(m) = state.meta.as_ref().filter(|m| m.deleted) {
-            // Before the state object says deleted: no deletion leaves
-            // files that nobody reclaims.
-            let trash = Trash {
-                upload_gen: m.upload_gen,
-                ..Default::default()
-            };
-            let data = serde_json::to_vec(&trash)?.into();
-            self.objects
-                .put_if(&trash_path(repo, epoch), data, None)
-                .await?;
-        }
-        let data = state.to_bytes();
-        let mut from = self
-            .written
-            .lock()
-            .get(repo)
-            .filter(|w| w.epoch == epoch)
-            .map(|w| w.version.clone());
-        for _ in 0..3 {
-            let version = if let Some(v) = from.take() {
-                Some(v)
-            } else {
-                self.current_version(repo, epoch, index).await?
-            };
-            let Some(version) = version else {
-                return Ok(()); // a newer leader got further
-            };
-            if let Some(version) = self
-                .objects
-                .put_if(&state_path(repo), data.clone(), Some(&version))
-                .await?
-            {
-                self.written.lock().insert(
-                    repo.to_string(),
-                    Written {
-                        epoch,
-                        version,
-                        index,
-                    },
-                );
-                return Ok(());
-            }
-        }
-        bail!("checkpointing {repo}: the state kept changing")
-    }
-
-    /// The version of `repo`'s state object, to swap from. `None`: it is
-    /// already at or past log index `index`. Fails if incarnation `epoch`
-    /// was superseded (and stops hosting it).
-    async fn current_version(
-        &self,
-        repo: &str,
-        epoch: u64,
-        index: u64,
-    ) -> Result<Option<ObjectVersion>> {
-        let (cur, v) = enroute_shared::repo_state::latest(&self.objects, repo)
-            .await?
-            .context("repository state vanished")?;
-        if cur.epoch != epoch {
-            tracing::warn!(
-                repo,
-                epoch,
-                current = cur.epoch,
-                "incarnation superseded; no longer hosting it"
-            );
-            self.engine.unhost(repo, epoch);
-            self.forget(repo);
-            bail!(
-                "incarnation {epoch} of {repo} was superseded by {}",
-                cur.epoch
-            );
-        }
-        Ok((cur.index < index).then_some(v))
-    }
-
-    /// Drop what this node keeps about `repo` for its lifecycle (its log
-    /// is no longer hosted here).
-    fn forget(&self, repo: &str) {
-        self.written.lock().remove(repo);
-        self.due.lock().remove(repo);
-    }
-
-    /// This node was removed from the ledger, for good: drop every log it
-    /// still hosts (one whose leader removed it may never hear so).
-    fn retire(&self) {
-        let repos = self.engine.repos();
-        if !repos.is_empty() {
-            tracing::warn!(
-                logs = repos.len(),
-                "this node was removed from the ledger: dropping its logs"
-            );
-        }
-        for repo in repos {
-            if let Some(h) = self.engine.hosted(&repo) {
-                self.engine.unhost(&repo, h.epoch);
-                self.forget(&repo);
-            }
-        }
-    }
-
-    /// After a restart: drop local incarnations a newer one superseded, and
-    /// those deleted elsewhere while this node was away. The state object
-    /// is marked deleted only once the tombstone is committed, so every
-    /// later leader has it; and an ended incarnation is never joined again.
-    async fn drop_superseded(&self) {
-        for repo in self.engine.repos() {
-            let Some(h) = self.engine.hosted(&repo) else {
-                continue;
-            };
-            let epoch = h.epoch;
-            match enroute_shared::repo_state::latest(&self.objects, &repo).await {
-                Ok(Some((rec, _)))
-                    if rec.epoch > epoch
-                        || rec.epoch == epoch && is_deleted(&rec) && !h.deleted =>
-                {
-                    tracing::info!(
-                        repo,
-                        epoch,
-                        current = rec.epoch,
-                        "dropping a superseded incarnation"
-                    );
-                    self.engine.unhost(&repo, epoch);
-                    self.forget(&repo);
+        let mut pending = self.pending.lock();
+        for (repo, w) in work {
+            match w {
+                // The same layers: a settled repository stays settled.
+                Some(w) if pending.get(&repo).is_some_and(|p| p.layers == w.layers) => {}
+                Some(w) => {
+                    pending.insert(repo, w);
                 }
-                Ok(_) => {}
-                Err(e) => tracing::warn!(repo, "checking incarnation: {e:#}"),
+                None => {
+                    pending.remove(&repo);
+                }
+            }
+        }
+    }
+
+    /// Compute `compute` asked now: the computes heard from within
+    /// [`nodes::ALIVE`], sorted. In memory only, as a cluster controller's
+    /// failure monitor: who maintains what is advisory, since every
+    /// maintenance step is a compare-and-swap.
+    fn heard(&self, compute: u64) -> Vec<u64> {
+        let now = Instant::now();
+        let mut heard = self.computes.lock();
+        heard.insert(compute, now);
+        heard.retain(|_, at| now.duration_since(*at) < nodes::ALIVE);
+        let mut live: Vec<u64> = heard.keys().copied().collect();
+        live.sort_unstable();
+        live
+    }
+
+    /// The repositories this node leads that are not settled and whose
+    /// first compute in rendezvous order among `computes` is `compute`.
+    fn pending(&self, computes: &[u64], compute: u64) -> Vec<PendingRepo> {
+        self.pending
+            .lock()
+            .iter()
+            .filter(|(repo, w)| !w.settled && nodes::first(repo, computes) == Some(compute))
+            .map(|(repo, w)| PendingRepo {
+                repo: repo.clone(),
+                version: w.version,
+            })
+            .collect()
+    }
+
+    /// Settle each of `repos` still pending as of the version given.
+    fn settle(&self, repos: Vec<PendingRepo>) {
+        let mut pending = self.pending.lock();
+        for r in repos {
+            if let Some(w) = pending.get_mut(&r.repo)
+                && w.version == r.version
+            {
+                w.settled = true;
             }
         }
     }
 }
 
-/// Runs the lifecycle rounds every `every` until the ledger is gone.
-async fn lifecycle_loop(weak: std::sync::Weak<Ledger>, every: Duration) {
-    if let Some(v) = weak.upgrade() {
-        v.drop_superseded().await;
-    }
+/// Runs the lifecycle rounds until the ledger is gone.
+async fn lifecycle_loop(weak: std::sync::Weak<Ledger>) {
     loop {
-        tokio::time::sleep(every).await;
+        tokio::time::sleep(ROUND_EVERY).await;
         let Some(v) = weak.upgrade() else { return };
         v.lifecycle_round().await;
     }
 }
 
-/// Joins each announced incarnation until the ledger is gone.
-async fn join_loop(
-    weak: std::sync::Weak<Ledger>,
-    mut joins: mpsc::UnboundedReceiver<(String, u64)>,
-) {
-    while let Some((repo, epoch)) = joins.recv().await {
-        let Some(ledger) = weak.upgrade() else { return };
-        tokio::spawn(async move {
-            if let Err(e) = ledger.join_announced(&repo, epoch).await {
-                tracing::warn!(repo, epoch, "joining an incarnation: {e:#}");
+/// A repository whose layers may need maintenance, which the compute
+/// decides (see `Pending` in `ledger.proto`).
+struct Work {
+    /// A hash of its layers (ids, and which are inline).
+    layers: u64,
+    /// Its version, read after its layers.
+    version: u64,
+    /// A compute found nothing to do on these layers.
+    settled: bool,
+}
+
+/// What each of `repos` may need (None: nothing, whatever the policy).
+fn work(engine: &Engine, repos: Vec<String>) -> Result<Vec<(String, Option<Work>)>> {
+    use std::hash::{Hash, Hasher};
+    repos
+        .into_iter()
+        .map(|repo| {
+            let layers = engine.layers(&repo)?.unwrap_or_default();
+            // After the layers: a compute that settles from a state this new
+            // has seen them.
+            let version = engine.hosted(&repo).map_or(0, |h| h.version);
+            let inline = layers.iter().any(|l| !l.is_stored());
+            // Nothing to flush, and a merge takes two layers at least.
+            if !inline && layers.len() < 2 {
+                return Ok((repo, None));
             }
-        });
-    }
-}
-
-/// Whether a state is a deleted repository's.
-fn is_deleted(rec: &Record) -> bool {
-    rec.meta.as_ref().is_some_and(|m| m.deleted)
-}
-
-/// The initial state of incarnation `epoch`, with HEAD `head` if given
-/// (kept, see `keep_head`). After the deleted incarnation `prev`, versions go
-/// on increasing, and upload generations start past the window of every
-/// file an older incarnation could name, so none is ever committed here.
-fn initial(epoch: u64, head: Option<&str>, prev: Option<&Record>) -> RepoMeta {
-    let mut m = RepoMeta::new();
-    m.epoch = epoch;
-    if let Some(head) = head {
-        (m.head, m.keep_head) = (head.to_string(), true);
-    }
-    if let Some(p) = prev.and_then(|p| p.meta.as_ref()) {
-        m.version = p.version + 1;
-        m.upload_gen = p.upload_gen + UPLOAD_GEN_WINDOW + 1;
-    }
-    m
+            let mut h = std::hash::DefaultHasher::new();
+            for l in &layers {
+                (&l.id, l.is_stored()).hash(&mut h);
+            }
+            let w = Work {
+                layers: h.finish(),
+                version,
+                settled: false,
+            };
+            Ok((repo, Some(w)))
+        })
+        .collect()
 }
 
 /// The `Ledger` service (`proto/ledger.proto`): what the compute calls, in
 /// this process or over gRPC.
 #[tonic::async_trait]
 impl ledger_server::Ledger for Ledger {
+    #[tracing::instrument(name = "enroute::ledger::activate", skip_all, fields(repo = %req.get_ref().repo))]
     async fn activate(
         &self,
         req: Request<ActivateRequest>,
     ) -> Result<Response<ActivateResponse>, Status> {
         let r = req.into_inner();
-        let exists = Ledger::activate(self, &r.repo, r.create, r.head.as_deref())
+        let create = r.create.then(|| r.object_format().into());
+        let exists = Ledger::activate(self, &r.repo, create, r.head.as_deref())
             .await
             .map_err(status)?;
         Ok(Response::new(ActivateResponse { exists }))
     }
 
+    #[tracing::instrument(name = "enroute::ledger::delete", skip_all, fields(repo = %req.get_ref().repo))]
     async fn delete(
         &self,
         req: Request<DeleteRequest>,
@@ -798,6 +638,7 @@ impl ledger_server::Ledger for Ledger {
         Ok(Response::new(DeleteResponse {}))
     }
 
+    #[tracing::instrument(name = "enroute::ledger::describe", skip_all, fields(repo = %req.get_ref().repo))]
     async fn describe(
         &self,
         req: Request<DescribeRequest>,
@@ -814,6 +655,8 @@ impl ledger_server::Ledger for Ledger {
         let limit = usize::try_from(r.limit)
             .unwrap_or(usize::MAX)
             .clamp(1, 1000);
+        // Linearizable, as `describe` is: a follower's directory may lag.
+        self.engine.root_barrier().await.map_err(status)?;
         let (repos, more) = self
             .blocking(move |e| e.list(&r.prefix, &r.after, limit))
             .await
@@ -821,14 +664,43 @@ impl ledger_server::Ledger for Ledger {
         Ok(Response::new(ListResponse { repos, more }))
     }
 
+    async fn pending(
+        &self,
+        req: Request<PendingRequest>,
+    ) -> Result<Response<PendingResponse>, Status> {
+        let r = req.into_inner();
+        self.settle(r.settled);
+        let computes = self.heard(r.compute);
+        Ok(Response::new(PendingResponse {
+            repos: Ledger::pending(self, &computes, r.compute),
+            computes,
+        }))
+    }
+
+    #[tracing::instrument(name = "enroute::ledger::propose", skip_all, fields(repo = %req.get_ref().repo))]
     async fn propose(&self, req: Request<Command>) -> Result<Response<Outcome>, Status> {
         let t0 = Instant::now();
         let sent = enroute_shared::call_timing::sent(&req);
-        let out = self
-            .engine
-            .propose(req.into_inner())
-            .await
-            .map_err(status)?;
+        let cmd = req.into_inner();
+        let limit = self.config.max_inline_layer_bytes;
+        let out = if cmd
+            .largest_inline_layer()
+            .is_some_and(|bytes| bytes > limit)
+        {
+            let mut out = Outcome::default();
+            out.refuse_invalid(format!(
+                "this ledger takes inline layers of at most {limit} bytes: \
+                 upload larger layers to the object store first"
+            ));
+            out
+        } else {
+            let replicate = tracing::info_span!("enroute::ledger::replicate");
+            self.engine
+                .propose(cmd)
+                .instrument(replicate)
+                .await
+                .map_err(status)?
+        };
         Ok(enroute_shared::call_timing::stamp(
             Response::new(out),
             sent,
@@ -836,6 +708,7 @@ impl ledger_server::Ledger for Ledger {
         ))
     }
 
+    #[tracing::instrument(name = "enroute::ledger::read_barrier", skip_all, fields(repo = %req.get_ref().repo))]
     async fn read_barrier(
         &self,
         req: Request<ReadBarrierRequest>,
@@ -852,17 +725,33 @@ impl ledger_server::Ledger for Ledger {
         ))
     }
 
-    type FollowStream = FollowStream;
+    type WatchStream = WatchStream;
 
-    async fn follow(&self, req: Request<FollowRequest>) -> Result<Response<FollowStream>, Status> {
+    async fn watch(
+        &self,
+        req: Request<tonic::Streaming<WatchRequest>>,
+    ) -> Result<Response<WatchStream>, Status> {
+        let me = self
+            .me
+            .upgrade()
+            .ok_or_else(|| Status::unavailable("the ledger has stopped"))?;
+        let expires = req.extensions().get::<Arc<Claims>>().map(|c| c.exp);
+        Ok(Response::new(crate::watch::serve(
+            me,
+            req.into_inner(),
+            self.engine.stopping(),
+            expires,
+        )))
+    }
+}
+
+#[tonic::async_trait]
+impl Follow for Ledger {
+    async fn follow(&self, repo: &str) -> Result<FollowStream, Status> {
         use futures::StreamExt;
-        let rx = self
-            .engine
-            .follow(&req.into_inner().repo)
-            .await
-            .map_err(status)?;
+        let rx = self.engine.follow(repo).await.map_err(status)?;
         let updates =
             futures::stream::unfold(rx, |mut rx| async move { Some((Ok(rx.recv().await?), rx)) });
-        Ok(Response::new(updates.boxed()))
+        Ok(updates.boxed())
     }
 }

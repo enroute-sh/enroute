@@ -1,10 +1,11 @@
 //! Background maintenance on a compute node: flushes and compaction
 //! ([`compact`]), the layer sweep ([`sweep`]), both on the repositories
-//! whose maintenance lease ([`lease`]) this node holds; eviction of idle
-//! views; and, after a restart, removal of local copies nothing references.
+//! this node maintains ([`owners`]); following those of them that the
+//! ledger says need work; and eviction of idle views.
 
 mod compact;
-mod lease;
+pub(crate) mod owners;
+mod policy;
 mod sweep;
 
 use std::sync::Arc;
@@ -13,19 +14,28 @@ use std::time::Duration;
 use anyhow::Result;
 use enroute_shared::roles::{self, LedgerRef};
 use enroute_shared::state::{Command, Outcome};
-use enroute_shared::store::Objects;
+use enroute_shared::store::{IoClass, Objects};
+use futures::StreamExt;
 
 use crate::compute::ComputeConfig;
 use crate::repo::{Repo, Repos};
 use crate::states::{Consistency, States};
 use crate::storage::Storage;
 use compact::Maintenance;
-use lease::Leases;
+use owners::Owners;
 
 pub use compact::settled;
+pub use owners::compute_id;
+pub(crate) use policy::MERGE_FACTOR;
 
 /// How often idle views are evicted.
 const EVICT_EVERY: Duration = Duration::from_secs(1);
+/// How often the ledger is asked which repositories need this node's
+/// maintenance. Only those are ticked, so a repository's flush age starts
+/// up to this long after its first inline layer.
+const ADOPT_EVERY: Duration = Duration::from_secs(2);
+/// Repositories followed at once to maintain them.
+const ADOPT_CONCURRENCY: usize = 16;
 
 /// This node's maintenance. Its loops stop once it is dropped.
 pub(crate) struct Maintainer {
@@ -36,7 +46,7 @@ pub(crate) struct Maintainer {
     /// Maintenance proposes its own commands, outside the commit path.
     ledger: LedgerRef,
     /// Which repositories this node maintains.
-    leases: Leases,
+    owners: Arc<Owners>,
     /// Flushes and compactions in flight here.
     in_flight: Arc<Maintenance>,
     config: ComputeConfig,
@@ -54,25 +64,41 @@ impl Maintainer {
         self.states.open(repo, Consistency::Latest).await
     }
 
-    /// After a restart: drop local copies of layers no manifest references
-    /// any more.
-    fn reconcile_local(self: &Arc<Self>) {
-        let node = self.clone();
-        tokio::spawn(async move {
-            let referenced = |repo: &str, id: &str| {
-                node.states
-                    .get(repo)
-                    .is_none_or(|m| m.layers.iter().any(|l| l.id == id))
-            };
-            let removed = node.storage.sweep_local_layers(referenced).await;
-            if removed > 0 {
-                tracing::info!(removed, "removed local copies of unreferenced layers");
+    /// Follow the repositories that need this node's maintenance, so that
+    /// it sees their work (it may serve none of their requests).
+    async fn adopt(&self) {
+        let settled = self.in_flight.take_settled();
+        let asked = roles::pending(&*self.ledger, self.owners.me(), settled.clone());
+        let pending = match asked.await {
+            Ok(p) => {
+                self.owners.set_live(p.computes);
+                p.repos
             }
-        });
+            Err(e) => {
+                tracing::warn!("asking which repositories need maintenance: {e:#}");
+                self.in_flight.keep_settled(settled);
+                return;
+            }
+        };
+        let new: Vec<String> = pending
+            .iter()
+            .filter(|r| !self.states.following(&r.repo))
+            .map(|r| r.repo.clone())
+            .collect();
+        self.in_flight.set_pending(pending);
+        futures::stream::iter(new)
+            .for_each_concurrent(ADOPT_CONCURRENCY, |repo| async move {
+                if let Err(e) = self.states.follow_active(&repo).await {
+                    tracing::warn!(repo, "following a repository to maintain it: {e:#}");
+                }
+            })
+            .await;
     }
 
     fn evict_idle(&self) {
-        let evicted = self.states.evict(self.config.evict_after);
+        // Its maintainer keeps a repository until its work is done.
+        let keep = |repo: &str| self.in_flight.holds(repo);
+        let evicted = self.states.evict(self.config.evict_after, keep);
         if evicted > 0 {
             tracing::debug!(evicted, "evicted idle repositories");
         }
@@ -97,14 +123,15 @@ fn every<P, W>(
             };
             wait.await;
             let Some(node) = weak.upgrade() else { return };
-            work(node).await;
+            IoClass::Background.scope(work(node)).await;
         }
     });
 }
 
 /// Start maintenance: flushing inline layers, compaction, layer sweeps,
 /// eviction of idle views, and cleanup of local copies left from before a
-/// restart. It runs while the returned handle lives.
+/// restart, on the repositories that `owners` gives this node. It runs
+/// while the returned handle lives.
 pub(crate) fn start(
     config: &ComputeConfig,
     states: Arc<States>,
@@ -112,27 +139,29 @@ pub(crate) fn start(
     storage: Arc<Storage>,
     objects: Arc<Objects>,
     ledger: LedgerRef,
+    owners: Arc<Owners>,
 ) -> Arc<Maintainer> {
-    // Leases need only an owner unique to this process: a restarted
-    // compute waits out its old leases.
-    let leases = Leases::new(objects.clone(), rand::random(), config.maintenance_lease);
     let node = Arc::new(Maintainer {
         states,
         repos,
         storage,
         objects,
         ledger,
-        leases,
+        owners,
         in_flight: Arc::default(),
         config: config.clone(),
     });
     compact::spawn(&node);
     sweep::spawn(&node);
-    node.reconcile_local();
     every(
         &node,
         |_| tokio::time::sleep(EVICT_EVERY),
         |n| async move { n.evict_idle() },
+    );
+    every(
+        &node,
+        |_| tokio::time::sleep(ADOPT_EVERY),
+        |n| async move { n.adopt().await },
     );
     node
 }

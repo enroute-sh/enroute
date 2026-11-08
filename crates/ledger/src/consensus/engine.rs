@@ -1,25 +1,38 @@
-//! The consensus engine: one replicated log per repository, all driven by
-//! one event loop on top of the node's log store ([`crate::logdb`]).
+//! The consensus engine: one replicated log per repository, plus the root
+//! log, all driven by one event loop on top of the node's log store
+//! ([`crate::logdb`]).
 //!
-//! **Incarnations.** Incarnation `epoch` of a repository's log is hosted
-//! from an initial state in the object store (see the ledger,
-//! `enroute-ledger`): an empty one when the repository is created (epoch 1).
-//! Its log id is derived from (repo, epoch), and its identity is part of
-//! its snapshot data, so a recovering node knows which log is which. Peers
-//! learn of a new incarnation from a `Host` frame. A newer incarnation
-//! supersedes an older one hosted here, which is dropped.
+//! **Repository logs** replicate as [`super::repo`] describes: each has
+//! (up to) three replicas, one of them its sequencer, which the root log's
+//! directory names along with the log's term. A node hosts the logs it is
+//! a replica of. Nothing runs for an idle log: no ticks, no heartbeats; a
+//! sequencer resends only to replicas that lag, and only while they are
+//! alive. The root's leader hands a log to a new sequencer when its
+//! sequencer fails (see [`super::control`]).
+//!
+//! **Incarnations.** Incarnation `epoch` of a repository's log starts when
+//! the root log ([`root`]) applies its creation: its replicas host it from
+//! the initial state the directory implies, and its first sequencer (the
+//! proposer) opens term 1. Its log id is derived from (repo, epoch), and its
+//! identity is part of its state, so a recovering node knows which log is
+//! which. As the root applies an incarnation's end (or a newer one, or new
+//! replicas without this node), nodes drop its log; a restarting node drops
+//! those its directory says ended or are not its own.
+//!
+//! **The root log** is a raft-rs group under a reserved id, hosted by every
+//! node; its entries are applied by the loop itself, into the directory in
+//! memory and in the log store (see [`root`]).
 //!
 //! Each loop iteration takes whatever inputs are pending (proposals, peer
-//! messages, read requests, ticks), collects the `Ready` of every log that
-//! was touched, makes all of their changes durable with one log store
-//! write (group commit), sends messages batched per peer, applies committed
-//! entries, and answers proposers. Inputs that arrive during the fsync are
-//! batched into the next iteration. Each log is a raft group in the log
-//! store: its entries, plus its hard state and where it starts (its latest
-//! snapshot's metadata) as key-value pairs.
+//! frames, read requests, ticks), makes every change they made durable
+//! with one log store write (group commit), then sends the answers that
+//! required it, applies committed entries, and answers proposers. Entries
+//! committed and written before the round apply before its write, which
+//! holds at most their commit point. Inputs that arrive during the fsync
+//! are batched into the next iteration.
 //!
 //! **State machines on disk.** Every log's state machine is in the node's
-//! state store ([`crate::state_store`], laid out by [`crate::stored`]):
+//! state store ([`crate::state::store`], laid out by [`crate::state::stored`]):
 //! committed entries are applied in atomic batches that also record them
 //! as applied, unsynced, on the apply thread ([`super::apply`]), which
 //! also answers proposers. Nothing of a repository's state stays in
@@ -30,7 +43,7 @@
 //! - nor past an inline layer's entry until the layer is flushed (its bytes
 //!   are only there; see `stored`), as of that same durable point;
 //! - on restart, each log replays its committed entries after the state's
-//!   applied index. A snapshot installed from a leader (or a new log's
+//!   applied index. A state installed from a sequencer (or a new log's
 //!   initial state) is durable in the state store before the log is reset
 //!   to it (or created): a crash in between leaves the state ahead of the
 //!   log, which recovery resets (or a state without a log, dropped).
@@ -38,31 +51,19 @@
 //! A round that needs the latter waits, before its log write, for the
 //! apply thread to have applied and synced everything handed to it.
 //!
-//! Raft snapshots are made when needed, from the state store. Whole states
-//! (a new subscriber's, a checkpoint's) are read from it too.
-//!
-//! **Membership.** A log's leader moves its voters toward the ledger's
-//! members ([`Engine::set_members`]), one change at a time (see
-//! `reconcile`). The apply thread records each change with the state.
-//!
-//! **Quiet logs.** Only recently active logs are ticked. Real traffic
-//! (proposals, appends, votes) keeps a log active; heartbeats do not. A
-//! leader keeps ticking (heartbeating) for longer after activity than
-//! followers keep their election timers running, so an idle log goes quiet
-//! without spurious elections, and pre-vote protects against stragglers. A
-//! node with work for a log whose leader it does not know sends a *wake*
-//! frame so the quiet leader resumes and reveals itself.
-//!
-//! **Proposals** are tagged with a node-unique id in the entry context.
-//! Followers forward them to the leader (raft-rs does this), and since every
-//! node applies every entry, the node that accepted the request answers it
-//! when it applies the entry.
+//! **Proposals** are evaluated by the log's sequencer, which appends their
+//! effect (see [`super::apply`]); another node answers [`NotSequencer`],
+//! which names the sequencer for the compute to ask. A proposal is
+//! answered when its entry applies, on whichever node it waits; one whose
+//! position another term's entry took is evaluated again (and so told the
+//! new sequencer).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
 use prost::Message as _;
 use raft::prelude::*;
@@ -70,65 +71,108 @@ use raft::{Config as RaftCfg, RawNode, StateRole};
 use raft_engine::LogBatch;
 use tokio::sync::{mpsc, oneshot};
 
-use enroute_shared::proto::{Record, RepoSummary, Update};
-use enroute_shared::registry::Addresses;
+use enroute_shared::auth::Bearer;
+use enroute_shared::proto::{RepoSummary, Update};
 use enroute_shared::roles::NotHosted;
-use enroute_shared::state::{Command, Outcome, RepoMeta};
+use enroute_shared::state::{Command, LayerMeta, Outcome, RepoMeta};
 
 use crate::logdb::{LogDb, WeakLogDb, is_log};
-use crate::state_machine::{self, count};
-use crate::state_store::StateStore;
-use crate::stored;
+use crate::proto::{Member, Record, RootEntry, Start, frame, root_entry};
+use crate::state::machine::{self, count};
+use crate::state::store::StateStore;
+use crate::state::stored;
 
-use super::apply::{Applier, Job, Progress};
-use super::codec::{Entries, Prost};
+use super::apply::{Applier, Job, Progress, Proposal};
+use super::codec::{Cells, Entries, Prost, Proto};
+use super::control::{Controller, Liveness};
 use super::log_id;
-use super::logstore::{LogMeta, LogStore, decode, fetch, load};
+use super::repo::load;
+use super::repo::{self, Config, LedgerStore, RepoLog};
+use super::root::{self, Change, Directory, ROOT, ROOT_START, SharedRoot, hosts};
+use super::root_store::{LogMeta, LogStore, fetch};
+use super::shardlog::{Request, Store as _, Synced, Terms};
 use super::stats::{Window, pct, per, rate};
-use super::transport::{Frame, Transport};
+use super::transport::{
+    Addresses, Frame, Transport, frame as framed, root_frame, root_message, url_of,
+};
 
 const TICK: Duration = Duration::from_millis(100);
 const ELECTION_TICKS: usize = 10;
 const HEARTBEAT_TICKS: usize = 2;
-/// How long a follower keeps ticking after real activity.
-const FOLLOWER_ACTIVE: Duration = Duration::from_secs(3);
-/// How long a leader keeps ticking (heartbeating) after real activity.
-const LEADER_ACTIVE: Duration = Duration::from_secs(6);
 const PROPOSAL_TIMEOUT: Duration = Duration::from_secs(30);
-/// Re-issue an unanswered read index request after this long.
+/// How long a root proposal or read waits: its callers try again.
+const ROOT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a caller waits for the loop to answer a root call (which it
+/// does within `ROOT_TIMEOUT`).
+const ROOT_CALL_TIMEOUT: Duration = Duration::from_secs(6);
+/// Re-issue an unanswered root read index request after this long.
 const READ_RETRY: Duration = Duration::from_millis(500);
+/// Resend to a lagging replica, or a read's checks, after this long.
+const RESEND: Duration = Duration::from_millis(300);
+/// Ask the root again to end a replica change after this long.
+const ACTIVATE_RETRY: Duration = Duration::from_secs(3);
+/// How often a deposed sequencer the root still names tells its leader.
+const DEPOSED_RETRY: Duration = Duration::from_secs(1);
+/// A root learner this close to the commit index is caught up.
+const CATCH_UP: u64 = 100;
 /// Keys of a log's state in the log store.
 const SNAPSHOT_KEY: &[u8] = b"snapshot";
 const HARD_STATE_KEY: &[u8] = b"hard_state";
 /// How often old log store files are purged.
 const PURGE_EVERY: Duration = Duration::from_secs(10);
-/// Updates a subscriber may fall behind before it is dropped.
+/// Updates a subscriber may fall behind before its changes are merged
+/// until it catches up.
 const FOLLOW_QUEUE: usize = 256;
-/// Leaders re-announce their active logs every this many ticks.
-const ANNOUNCE_TICKS: u64 = 20;
-/// Logs the membership sweep visits per tick.
-const RECONCILE_PER_TICK: usize = 100;
-/// A learner this close to the commit index is caught up.
-const CATCH_UP: u64 = 100;
+
+/// The error of a request to a node that does not sequence the
+/// repository's log: the sequencer evaluates proposals and serves reads.
+/// It names the sequencer, by id and by internal URL (empty: none known,
+/// or no address).
+#[derive(Debug, Clone)]
+pub struct NotSequencer {
+    /// The sequencer's id.
+    pub sequencer: u64,
+    /// The sequencer's internal URL.
+    pub url: String,
+}
+
+impl std::fmt::Display for NotSequencer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "not the sequencer of the repository's log (node {:x} is)",
+            self.sequencer
+        )
+    }
+}
+
+impl std::error::Error for NotSequencer {}
 
 pub(super) enum Input {
     Propose(Command, oneshot::Sender<Result<Outcome>>),
+    /// From the apply thread: a proposal evaluated, and its log entry.
+    Evaluated(u64, Vec<u8>, Proposal),
+    /// From the apply thread: a proposal evaluated to an outcome that
+    /// changes nothing, against the log's state at this version.
+    Confirm(u64, u64, Proposal),
+    /// From the apply thread: a proposal whose effect was skipped.
+    Reevaluate(u64, Proposal),
     ReadIndex(u64, oneshot::Sender<Result<u64>>),
-    Frames(Vec<Frame>),
-    Unreachable(u64, Vec<u64>),
-    /// The ledger's members, and the nodes removed from it.
-    Members(Vec<u64>, Vec<u64>),
-    Host {
-        repo: String,
-        epoch: u64,
-        meta: RepoMeta,
-        voters: Vec<u64>,
-        resp: oneshot::Sender<Result<()>>,
-    },
-    Start(String, u64),
-    Unhost(String, u64),
+    /// Frames from a peer.
+    Frames(u64, Vec<Frame>),
+    /// A peer could not be sent root log messages.
+    Unreachable(u64),
+    /// Where `repo`'s live log is (see [`Engine::locate`]).
+    Locate(String, oneshot::Sender<Result<Located>>),
+    /// Propose an entry to the root log (see [`Engine::propose_root`]).
+    ProposeRoot(Vec<u8>, oneshot::Sender<Result<()>>),
+    /// A peer refused this node as removed, its logs moved off it: drop
+    /// every repository's log it still hosts.
+    Retire,
     /// Subscribe to a hosted repository's log (see [`Engine::follow`]).
-    Follow(String, mpsc::Sender<Update>, oneshot::Sender<Result<()>>),
+    Follow(String, mpsc::Sender<Update>, oneshot::Sender<Result<u64>>),
+    /// A subscription to this log ended (see [`Subscription`]).
+    Unfollow(u64),
     /// Purging old log store files is held back by these logs: compact them
     /// (or drop them, if not hosted).
     Purge(Vec<u64>),
@@ -137,21 +181,28 @@ pub(super) enum Input {
     /// From the apply thread, after a sync: logs durably applied up to
     /// these indexes, and their oldest pinned entry then.
     Durable(Vec<(u64, u64, Option<u64>)>),
+    /// From the apply thread: the states these logs start from (see
+    /// `Loop::settling`) are durable.
+    Settled(Vec<u64>),
     Stop,
 }
 
-/// What happened to this node's logs since the ledger last looked (see
-/// [`Engine::take_events`]): what its lifecycle work (checkpoints) acts
-/// on, instead of visiting every hosted repository.
-#[derive(Default, Debug)]
-pub(crate) struct Events {
-    /// Repositories whose state changed, or whose log this node started
-    /// leading.
-    pub(crate) changed: HashSet<String>,
-    /// Repositories whose log went quiet (stopped ticking: no traffic for a
-    /// few seconds).
-    pub(crate) quiet: HashSet<String>,
+/// Where a repository's live log is (see [`Engine::locate`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Located {
+    /// Hosted here (now, durably).
+    Here,
+    /// Hosted by other nodes: its sequencer.
+    Elsewhere(u64),
+    /// The repository has no live incarnation.
+    Absent,
 }
+
+/// What happened to this node's logs since the ledger last looked (see
+/// [`Engine::take_events`]): the repositories whose state changed, or whose
+/// log this node started sequencing. Maintenance tracking acts on them,
+/// instead of visiting every hosted repository.
+pub(crate) type Events = HashSet<String>;
 
 /// A hosted repository, as readers outside the loop see it (see
 /// [`Engine::hosted`]). Its state is in the state store.
@@ -163,27 +214,27 @@ pub struct Hosted {
     pub epoch: u64,
     /// Its state's version.
     pub version: u64,
-    /// The log index its state is at.
+    /// The log position its state is at.
     pub applied: u64,
-    /// Whether this node leads its log.
+    /// Whether this node sequences its log (and committed its term's
+    /// first entry).
     pub leading: bool,
-    /// The leader this node knows of (0: none), and its term. A paused or
-    /// cut-off leader still names itself until it hears of a newer term.
-    pub leader: u64,
-    /// The term of that leader.
+    /// The sequencer the directory here names (0: none), and its term.
+    pub sequencer: u64,
+    /// The term of that sequencer.
     pub term: u64,
     /// Whether its state is a tombstone (the repository was deleted).
     pub deleted: bool,
 }
 
 /// A hosted log's published entry. Only the loop writes the map, `leading`,
-/// `leader` and `term`, and only the apply thread writes `progress`, so
+/// `sequencer` and `term`, and only the apply thread writes `progress`, so
 /// neither checks that a log is still its repository's.
 struct Published {
     log: u64,
     epoch: u64,
     leading: bool,
-    leader: u64,
+    sequencer: u64,
     term: u64,
     progress: Arc<Mutex<Progress>>,
 }
@@ -197,7 +248,7 @@ impl Published {
             version: p.version,
             applied: p.applied,
             leading: self.leading,
-            leader: self.leader,
+            sequencer: self.sequencer,
             term: self.term,
             deleted: p.deleted,
         }
@@ -209,21 +260,33 @@ impl Published {
 pub struct Stats {
     /// Hosted logs.
     pub logs: usize,
-    /// Logs that are ticking (recent traffic).
-    pub active_logs: usize,
-    /// Raft messages sent to peers.
+    /// Logs whose sequencer here resends to a lagging replica.
+    pub lagging_logs: usize,
+    /// Frames sent to peers.
     pub messages_sent: u64,
+    /// Of those, repository logs' (not the root's, nor pings).
+    pub log_messages: u64,
     /// Writes to the log store.
     pub log_writes: u64,
     /// Bytes written to the log store.
     pub log_bytes: u64,
-    /// Snapshots installed from a leader (a follower too far behind).
+    /// States installed from a sequencer (a replica behind its log's start).
     pub snapshots_installed: u64,
-    /// Log truncations (compactions).
+    /// Root log snapshots installed from the root's leader.
+    pub root_snapshots: u64,
+    /// Repository log truncations (compactions).
     pub compactions: u64,
+    /// Root log snapshots taken, which truncate it.
+    pub root_compactions: u64,
+    /// Logs this node sequences.
+    pub leading: usize,
+    /// Logs the controller sealed for a new term (on the root's leader).
+    pub seals: u64,
+    /// Appointments it proposed.
+    pub appointments: u64,
 }
 
-/// This node's consensus engine: one Raft group per hosted repository.
+/// This node's consensus engine.
 pub struct Engine {
     tx: mpsc::UnboundedSender<Input>,
     /// The stores, owned by the loop (so they close once it has stopped).
@@ -232,10 +295,18 @@ pub struct Engine {
     /// True once the loop and the apply thread have stopped, closing the
     /// stores.
     stopped: tokio::sync::watch::Receiver<bool>,
+    /// True once asked to stop.
+    stopping: tokio::sync::watch::Sender<bool>,
     hosted: Arc<RwLock<BTreeMap<String, Published>>>,
+    root: SharedRoot,
     events: Arc<Mutex<Events>>,
     stats: Arc<RwLock<Stats>>,
-    /// This node's Raft id (its store id).
+    addresses: Option<Addresses>,
+    /// Nodes learned of outside the directory (see [`Engine::introduce`]).
+    introduced: RwLock<HashMap<u64, Member>>,
+    /// This start's boot (see [`Liveness`]).
+    boot: u64,
+    /// This node's id (its store id).
     pub id: u64,
 }
 
@@ -247,41 +318,8 @@ impl std::fmt::Debug for Engine {
     }
 }
 
-struct Log {
-    raw: RawNode<LogStore>,
-    repo: String,
-    epoch: u64,
-    /// As the apply thread publishes it (also in [`Published`]).
-    progress: Arc<Mutex<Progress>>,
-    /// The last entry durably applied, and the oldest entry pinned by an
-    /// inline layer then: how far the log may be truncated.
-    durable: (u64, Option<u64>),
-    /// Ticked until then (see `Loop::ticking`).
-    active_until: Instant,
-    /// The term last published to `hosted`. A hard state comes with most
-    /// commits, but its term changes seldom.
-    published_term: u64,
-}
-
-impl Log {
-    /// The log's other voters and learners: whom to send to.
-    fn peers(&self, me: u64) -> Vec<u64> {
-        let conf = self.raw.raft.prs().conf().to_conf_state();
-        conf.voters
-            .into_iter()
-            .chain(conf.learners)
-            .filter(|&p| p != me)
-            .collect()
-    }
-
-    /// Whether this node is the log's only voter (it can lead alone).
-    fn solo(&self) -> bool {
-        let voters = self.raw.raft.prs().conf().voters().ids();
-        voters.len() == 1 && voters.contains(self.raw.raft.id)
-    }
-}
-
-/// A proposal, or a read barrier, waiting for its log to know a leader.
+/// A proposal, or a read barrier, waiting for its log's sequencer to be
+/// ready (or the root's leader to be known).
 struct Waiting {
     log: u64,
     deadline: Instant,
@@ -289,74 +327,93 @@ struct Waiting {
 }
 
 enum Wait {
-    Propose {
+    /// A proposal to evaluate, once this node sequences the log.
+    Evaluate(Proposal),
+    Read(Reader),
+    /// A root entry, proposed by any node (followers forward it).
+    Root {
         pid: u64,
         data: Vec<u8>,
-        resp: oneshot::Sender<Result<Outcome>>,
+        resp: oneshot::Sender<Result<()>>,
     },
-    Read(oneshot::Sender<Result<u64>>),
 }
 
-struct Pending {
-    resp: oneshot::Sender<Result<Outcome>>,
-    deadline: Instant,
+/// Who waits for a read.
+pub(super) enum Reader {
+    /// A read barrier, told the index.
+    Barrier(oneshot::Sender<Result<u64>>),
+    /// A proposal evaluated to an outcome that changes nothing, at this
+    /// version (see [`Loop::on_confirm`]).
+    Confirm(u64, Box<Proposal>),
 }
 
-/// A read index request issued to raft.
-struct Read {
-    log: u64,
-    resp: oneshot::Sender<Result<u64>>,
-    issued: Instant,
-    deadline: Instant,
+impl Reader {
+    fn fail(self, e: anyhow::Error) {
+        match self {
+            Reader::Barrier(resp) => drop(resp.send(Err(e))),
+            Reader::Confirm(_, proposal) => drop(proposal.resp.send(Err(e))),
+        }
+    }
 }
 
 struct Loop {
     node_id: u64,
+    /// This start's boot (see [`Liveness`]).
+    boot: u64,
     db: LogDb,
     state: Arc<StateStore>,
     snapshot_every: u64,
-    /// Writes for the next round beyond its `Ready`s (compactions, dropped
-    /// logs).
+    /// Writes for the next round beyond the logs' own (compactions, dropped
+    /// logs, installed states, new logs' starts).
     batch: LogBatch,
     /// The apply thread's queue.
     applier: std::sync::mpsc::Sender<Job>,
-    /// Whether `batch` may only be written once the apply thread has
-    /// applied and synced everything handed to it: it starts logs (hosted,
-    /// or reset to a snapshot) whose state was just handed over.
-    barrier: bool,
+    /// Logs started (hosted, or reset to a snapshot) from states handed to
+    /// the apply thread since the last round: one sync makes those durable.
+    settling: Vec<u64>,
+    /// Logs whose writes wait for the state they start from to be durable,
+    /// with the syncs they wait for. A log store write must not start a log
+    /// from a state that a crash could lose, and waiting only these logs
+    /// keeps the others' rounds from waiting for a full state flush.
+    unsettled: HashMap<u64, u32>,
     transport: Option<Transport>,
-    logs: HashMap<u64, Log>,
+    /// Peers' internal URLs, to name a log's sequencer by.
+    addresses: Option<Addresses>,
+    root_log: RootLog,
+    repos: HashMap<u64, RepoLog>,
     /// What readers outside the loop see; also the hosted logs by repository.
     hosted: Arc<RwLock<BTreeMap<String, Published>>>,
     /// For the ledger's lifecycle work.
     events: Arc<Mutex<Events>>,
-    /// Logs being ticked (their `active_until` not passed when last
-    /// ticked): the only ones a tick visits. A quiet log costs nothing per
-    /// tick.
-    ticking: HashSet<u64>,
-    /// Incarnations a peer announced without their state: the ledger loads
-    /// it from the object store, then hosts them.
-    announced: mpsc::UnboundedSender<(String, u64)>,
-    /// Logs hosted since the last write, whose identity (initial snapshot)
-    /// must be written with their first entries.
-    fresh: Vec<u64>,
-    /// The ledger's members, the nodes removed from it, and the logs the
-    /// sweep has yet to visit.
+    /// The root log's state.
+    root: SharedRoot,
+    /// The ledger's members and the nodes removed from it, as of the root's
+    /// last entry applied.
     members: Vec<u64>,
     removed: Vec<u64>,
-    to_reconcile: std::collections::VecDeque<u64>,
-    /// Callers of `host` to answer once the hosted log is durable.
-    hosted_replies: Vec<oneshot::Sender<Result<()>>>,
-    pending: HashMap<u64, Pending>,
+    liveness: Liveness,
+    /// Nodes alive at the last tick.
+    up: HashSet<u64>,
+    controller: Controller,
+    /// Callers to answer once this round's changes are durable (logs
+    /// hosted, root entries applied).
+    replies: Vec<oneshot::Sender<Result<()>>>,
+    /// Callers to answer once these logs' starts are durable.
+    located: Vec<(u64, oneshot::Sender<Result<Located>>)>,
     waiting: Vec<Waiting>,
-    /// Read index requests in flight.
-    reads: HashMap<u64, Read>,
-    /// Read barriers with their read index, until applied here.
-    read_applied: Vec<(u64, u64, oneshot::Sender<Result<u64>>)>,
-    next_id: u64,
+    /// Reads with their index, until applied here.
+    read_applied: Vec<(u64, u64, Reader)>,
+    /// Logs with changes to write or answers to send this round.
     dirty: HashSet<u64>,
-    ticks: u64,
-    logger: slog::Logger,
+    /// Logs whose sequencer here has replicas to catch up.
+    lagging: HashSet<u64>,
+    /// Logs this node sequences (or did: an entry whose log no longer has
+    /// a sequencer here is dropped when next looked at), so a tick looks at
+    /// them, not at every log.
+    sequencing: HashSet<u64>,
+    /// Frames to this node itself, handled as if received.
+    inbox: VecDeque<Frame>,
+    next_id: u64,
     stats: Stats,
     shared_stats: Arc<RwLock<Stats>>,
     /// Round statistics since they were last logged (`enroute::ledger_timing`).
@@ -374,37 +431,15 @@ struct Rounds {
     logs: u64,
 }
 
-fn raft_config(node_id: u64, applied: u64) -> RaftCfg {
-    RaftCfg {
-        id: node_id,
-        election_tick: ELECTION_TICKS,
-        heartbeat_tick: HEARTBEAT_TICKS,
-        applied,
-        pre_vote: true,
-        check_quorum: true,
-        max_size_per_msg: 1 << 20,
-        max_inflight_msgs: 256,
-        ..Default::default()
-    }
-}
-
-fn is_real_traffic(m: &Message) -> bool {
-    !matches!(
-        m.get_msg_type(),
-        MessageType::MsgHeartbeat | MessageType::MsgHeartbeatResponse
-    )
-}
-
 fn stopped<T>(_: T) -> anyhow::Error {
     anyhow::anyhow!("consensus engine stopped")
 }
 
 /// The logs recovered at start.
 struct RecoveredLogs {
-    logs: HashMap<u64, Log>,
+    repos: HashMap<u64, RepoLog>,
     hosted: BTreeMap<String, Published>,
     batch: LogBatch,
-    unapplied: HashSet<u64>,
 }
 
 impl RecoveredLogs {
@@ -413,78 +448,97 @@ impl RecoveredLogs {
         state.delete(log)
     }
 
-    /// Recover log `log` from what was `read` of it, or drop it.
+    /// Recover log `log` from what was `read` of it, or drop it (also if
+    /// the directory `dir` says its incarnation ended, or that this node
+    /// `me` is not one of its replicas).
     fn add(
         &mut self,
-        db: &LogDb,
-        state: &Arc<StateStore>,
-        node: u64,
-        logger: &slog::Logger,
+        (db, state): (&LogDb, &Arc<StateStore>),
+        dir: &Directory,
+        me: u64,
         log: u64,
-        read: (Option<Snapshot>, Vec<Entry>),
+        read: repo::StoredLog,
     ) -> Result<()> {
-        let (snapshot, entries) = read;
-        let Some(r) = recover(db, state, log, node, snapshot, entries, &mut self.batch)
-            .with_context(|| format!("recovering log {log:x}"))?
+        let Some(root) = state.root(log) else {
+            return self.drop_log(state, log);
+        };
+        let applied = (root.applied_index, root.applied_term);
+        let Some((store, cells)) =
+            LedgerStore::recover(log, (db, state), read, applied, &mut self.batch)
+                .with_context(|| format!("recovering log {log:x}"))?
         else {
             return self.drop_log(state, log);
         };
-        if self.hosted.get(&r.repo).is_some_and(|p| p.epoch > r.epoch) {
+        let inc = dir.live(&root.repo).filter(|i| i.epoch == root.epoch);
+        let Some(inc) = inc.filter(|i| hosts(i, me)) else {
             return self.drop_log(state, log);
-        }
-        if r.applied < r.meta.hard_state.commit.min(r.meta.last_index()) {
-            self.unapplied.insert(log);
-        }
+        };
+        let config = Config::of(inc);
+        let sole = inc.replicas == [me] && inc.joint.is_empty();
         let progress = Arc::new(Mutex::new(Progress {
-            version: state.root(log).map_or(0, |root| root.version),
-            applied: r.applied,
+            version: root.version,
+            applied: 0,
             deleted: state.round().counters(log)?.deleted,
         }));
+        let mut repo = RepoLog::new(
+            root.repo.clone(),
+            root.epoch,
+            store,
+            progress.clone(),
+            config.clone(),
+            me,
+        );
+        repo.node.restart::<Bytes>(root.applied_index, sole);
+        // Bring the state machine up to the commit point.
+        let commit = repo.store().commit();
+        let mut round = state.round();
+        repo.handed = root.applied_index;
+        for c in cells.iter().filter(|c| c.index <= commit) {
+            stored::apply(
+                &mut round,
+                log,
+                c.index,
+                c.term,
+                repo::effect(log, c).as_ref(),
+            )?;
+            repo.handed = c.index;
+        }
+        round.commit()?;
+        {
+            let mut p = progress.lock();
+            p.applied = repo.handed;
+            p.version = state.root(log).map_or(root.version, |r| r.version);
+        }
         let published = Published {
             log,
-            epoch: r.epoch,
+            epoch: root.epoch,
             leading: false,
-            leader: 0,
-            term: 0,
-            progress: progress.clone(),
+            sequencer: config.sequencer,
+            term: config.term,
+            progress,
         };
-        if let Some(old) = self.hosted.insert(r.repo.clone(), published) {
-            self.logs.remove(&old.log);
+        if let Some(old) = self.hosted.insert(root.repo.clone(), published) {
+            self.repos.remove(&old.log);
             self.drop_log(state, old.log)?;
         }
-        let store = LogStore::new(log, db.clone(), state.clone(), r.meta);
-        self.logs.insert(
-            log,
-            Log {
-                raw: RawNode::new(&raft_config(node, r.applied), store, logger)?,
-                repo: r.repo,
-                epoch: r.epoch,
-                progress,
-                // Nothing replayed counts until the apply thread's first sync.
-                durable: (0, None),
-                active_until: Instant::now(),
-                published_term: 0,
-            },
-        );
+        self.repos.insert(log, repo);
         Ok(())
     }
 }
 
-/// Recover every log in the log store, applying its committed entries
-/// synchronously (raft hands over those from a membership change on). Logs
-/// whose incarnation ended (or that are not repository logs) are not
-/// hosted again, and dropped.
+/// Recover every repository log in the log store, applying its committed
+/// entries synchronously. Logs whose incarnation ended, or that are not
+/// this node's (`me`), as far as the directory `dir` knows, are dropped.
 fn recover_all(
     db: &LogDb,
     state: &Arc<StateStore>,
-    node: u64,
-    logger: &slog::Logger,
+    me: u64,
+    dir: &Directory,
 ) -> Result<RecoveredLogs> {
     let mut rec = RecoveredLogs {
-        logs: HashMap::new(),
+        repos: HashMap::new(),
         hosted: BTreeMap::new(),
         batch: LogBatch::default(),
-        unapplied: HashSet::new(),
     };
     let groups: Vec<u64> = db
         .raft_groups()
@@ -494,19 +548,19 @@ fn recover_all(
     // Entries are read on the store's reader thread, many logs at a time.
     for chunk in groups.chunks(RECOVER_CHUNK) {
         let ids = chunk.to_vec();
-        let mut read: HashMap<u64, (Option<Snapshot>, Vec<Entry>)> = db.read(move |db| {
+        let mut read: HashMap<u64, repo::StoredLog> = db.read(move |db| {
             ids.into_iter()
-                .map(|log| Ok((log, read_log(db, log)?)))
+                .map(|log| Ok((log, repo::read_log(db, log)?)))
                 .collect::<raft_engine::Result<_>>()
         })?;
         for &log in chunk {
             let entries = read.remove(&log).unwrap_or_default();
-            rec.add(db, state, node, logger, log, entries)?;
+            rec.add((db, state), dir, me, log, entries)?;
         }
     }
     // States without a log: hosting or unhosting was interrupted.
     for log in state.logs() {
-        if !rec.logs.contains_key(&log) {
+        if !rec.repos.contains_key(&log) {
             state.delete(log)?;
         }
     }
@@ -547,73 +601,95 @@ async fn purge_pass(db: &WeakLogDb, tx: &mpsc::UnboundedSender<Input>) -> bool {
 impl Engine {
     /// Start the engine on `db` (the log store) and `state` (the state
     /// store) as node `id`, snapshotting each log every `snapshot_every`
-    /// applied entries; `addresses`: peers' addresses (None for a
-    /// standalone node, the only voter of its logs, with no transport).
-    /// Announced incarnations to join go to `announced`.
+    /// applied entries; `peers`: peers' addresses and this node's token for
+    /// them (None for a standalone node, the only replica of its logs, with
+    /// no transport). Without a root log yet, it starts a new ledger's if
+    /// `bootstrap` (see [`root`]).
     pub(crate) fn start(
         db: LogDb,
         state: Arc<StateStore>,
         snapshot_every: u64,
         id: u64,
-        addresses: Option<Addresses>,
-        announced: mpsc::UnboundedSender<(String, u64)>,
+        peers: Option<(Addresses, Bearer)>,
+        bootstrap: bool,
     ) -> Result<Arc<Engine>> {
         let logger = slog::Logger::root(slog::Discard, slog::o!());
+        let root: SharedRoot = Arc::default();
+        let root_log = recover_root(&db, id, &logger, &root, bootstrap)?;
         let RecoveredLogs {
-            logs,
+            repos,
             hosted,
             batch,
-            unapplied,
-        } = recover_all(&db, &state, id, &logger)?;
+        } = recover_all(&db, &state, id, &root.read().dir)?;
+        let (members, removed) = root.read().dir.members();
         let hosted = Arc::new(RwLock::new(hosted));
         let events: Arc<Mutex<Events>> = Arc::default();
         let counters: Arc<RwLock<Stats>> = Arc::default();
 
         let (tx, rx) = mpsc::unbounded_channel();
-        let transport = addresses.map(|a| Transport::new(a, tx.clone()));
+        let addresses = peers.as_ref().map(|(a, _)| a.clone());
+        if let Some(a) = &addresses {
+            learn(a, &root.read().dir);
+        }
+        let transport = peers.map(|(a, bearer)| Transport::new(id, a, bearer, tx.clone()));
         let purge_db = db.downgrade();
         let (weak_state, weak_db) = (Arc::downgrade(&state), db.downgrade());
         let (jobs, queue) = std::sync::mpsc::channel();
         let applier = Applier::new(
             state.clone(),
             db.clone(),
-            logs.iter().map(|(&id, l)| (id, l.progress.clone())),
+            repos.iter().map(|(&id, r)| (id, r.progress.clone())),
             tx.clone(),
+            addresses.clone(),
         );
         let apply_thread = std::thread::Builder::new()
             .name("ledger-apply".into())
             .spawn(move || applier.run(&queue))?;
-        let lp = Loop {
+        let boot = rand::random::<u64>() | 1;
+        // Replay the entries recovery did not (it stops at none, but a
+        // log's committed suffix past its state's is handed over here).
+        let dirty = repos.keys().copied().collect();
+        let mut lp = Loop {
             next_id: id << 48,
             node_id: id,
+            boot,
             db,
             state,
             snapshot_every,
             batch,
             applier: jobs,
-            barrier: false,
+            settling: Vec::new(),
+            unsettled: HashMap::new(),
             transport,
-            logs,
+            addresses: addresses.clone(),
+            root_log,
+            repos,
             hosted: hosted.clone(),
             events: events.clone(),
-            ticking: HashSet::new(),
-            announced,
-            fresh: Vec::new(),
-            members: Vec::new(),
-            removed: Vec::new(),
-            to_reconcile: std::collections::VecDeque::default(),
-            hosted_replies: Vec::new(),
-            pending: HashMap::new(),
+            root: root.clone(),
+            members,
+            removed,
+            liveness: Liveness::new(id, boot),
+            up: HashSet::new(),
+            controller: Controller::default(),
+            replies: Vec::new(),
+            located: Vec::new(),
             waiting: Vec::new(),
-            reads: HashMap::new(),
             read_applied: Vec::new(),
-            dirty: unapplied,
-            ticks: 0,
-            logger,
+            dirty,
+            lagging: HashSet::new(),
+            sequencing: HashSet::new(),
+            inbox: VecDeque::new(),
             stats: Stats::default(),
             shared_stats: counters.clone(),
             rounds: Window::new(),
         };
+        // Sequence the logs the directory still names this node for: only
+        // with a boot of this start, so the root appoints them again.
+        let ids: Vec<u64> = lp.repos.keys().copied().collect();
+        for log in ids {
+            lp.publish(log);
+        }
         let (done, stopped) = tokio::sync::watch::channel(false);
         tokio::spawn(async move {
             // The loop, and with it the stores, are dropped when it returns;
@@ -630,9 +706,14 @@ impl Engine {
             state: weak_state,
             db: weak_db,
             stopped,
+            stopping: tokio::sync::watch::Sender::new(false),
             hosted,
+            root,
             events,
             stats: counters,
+            addresses,
+            introduced: RwLock::default(),
+            boot,
             id,
         }))
     }
@@ -645,13 +726,32 @@ impl Engine {
     }
 
     /// Linearizable read barrier: returns once this node has applied
-    /// everything committed to `repo`'s log before the call (the repository
-    /// must be active here).
+    /// everything committed to `repo`'s log before the call (this node
+    /// must sequence it: else [`NotSequencer`]).
     pub(crate) async fn read_barrier(&self, repo: &str) -> Result<()> {
-        let log = log_of(&self.hosted, repo).ok_or(NotHosted)?;
+        let Some(log) = log_of(&self.hosted, repo) else {
+            return Err(self.elsewhere(repo));
+        };
+        self.read_index(log, PROPOSAL_TIMEOUT).await
+    }
+
+    /// The error for a request about `repo`, which this node does not
+    /// host: its sequencer, if it is live.
+    fn elsewhere(&self, repo: &str) -> anyhow::Error {
+        match self.root.read().dir.live(repo) {
+            Some(inc) => NotSequencer {
+                sequencer: inc.sequencer,
+                url: url_of(self.addresses.as_ref(), inc.sequencer),
+            }
+            .into(),
+            None => NotHosted.into(),
+        }
+    }
+
+    async fn read_index(&self, log: u64, timeout: Duration) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.tx.send(Input::ReadIndex(log, tx)).map_err(stopped)?;
-        tokio::time::timeout(PROPOSAL_TIMEOUT, rx)
+        tokio::time::timeout(timeout, rx)
             .await
             .context("read barrier timed out")?
             .map_err(stopped)??;
@@ -659,56 +759,171 @@ impl Engine {
     }
 
     /// Follow `repo`'s log (it must be hosted here): its state, then every
-    /// change after it. The stream ends when the log is dropped, or when the
-    /// subscriber falls `FOLLOW_QUEUE` updates behind.
-    pub(crate) async fn follow(&self, repo: &str) -> Result<mpsc::Receiver<Update>> {
+    /// change after it. The stream ends when the log is dropped. A
+    /// subscriber that falls `FOLLOW_QUEUE` updates behind gets the changes
+    /// it missed as one, once it has room again.
+    pub(crate) async fn follow(&self, repo: &str) -> Result<Subscription> {
         let (tx, rx) = mpsc::channel(FOLLOW_QUEUE);
         let (resp, done) = oneshot::channel();
         self.tx
             .send(Input::Follow(repo.to_string(), tx, resp))
             .map_err(stopped)?;
-        done.await.map_err(stopped)??;
-        Ok(rx)
+        // (Any replica serves it: another node is not hosting it.)
+        let log = done.await.map_err(stopped)??;
+        Ok(Subscription {
+            rx,
+            log,
+            input: self.tx.clone(),
+        })
     }
 
-    /// The ledger's members, and the nodes removed from it (see
-    /// [`enroute_shared::registry`]).
-    pub(crate) fn set_members(&self, members: Vec<u64>, removed: Vec<u64>) {
-        drop(self.tx.send(Input::Members(members, removed)));
-    }
-
-    /// Deliver frames received from a peer.
-    pub(crate) fn receive(&self, frames: Vec<Frame>) {
-        drop(self.tx.send(Input::Frames(frames)));
-    }
-
-    /// Host incarnation `epoch` of `repo`'s log, starting from `meta` (as
-    /// every replica does, from the same state in the object store), with
-    /// `voters`. Resolves once the log is durable in the log store, quiet:
-    /// see [`lead`](Self::lead).
-    pub(crate) async fn host(
-        &self,
-        repo: &str,
-        epoch: u64,
-        meta: RepoMeta,
-        voters: Vec<u64>,
-    ) -> Result<()> {
+    /// Propose `entry` to the root log; resolves once applied here (and
+    /// durable), whether or not it still changed anything. Fails if it is
+    /// not applied within a few seconds (it may still be): proposing it
+    /// again is safe.
+    pub(crate) async fn propose_root(&self, entry: RootEntry) -> Result<()> {
         let (tx, rx) = oneshot::channel();
-        let input = Input::Host {
-            repo: repo.to_string(),
-            epoch,
-            meta,
-            voters,
-            resp: tx,
-        };
-        self.tx.send(input).map_err(stopped)?;
+        let data = entry.encode_to_vec();
+        self.tx
+            .send(Input::ProposeRoot(data, tx))
+            .map_err(stopped)?;
+        tokio::time::timeout(ROOT_CALL_TIMEOUT, rx)
+            .await
+            .context("root proposal timed out")?
+            .map_err(stopped)?
+    }
+
+    /// Linearizable read barrier on the root log: returns once this node
+    /// has applied everything the root committed before the call.
+    pub(crate) async fn root_barrier(&self) -> Result<()> {
+        self.read_index(ROOT, ROOT_CALL_TIMEOUT).await
+    }
+
+    /// Where `repo`'s live incarnation is, as the directory has it here:
+    /// hosted here (resolves once its log is durable), or by other nodes.
+    pub(crate) async fn locate(&self, repo: &str) -> Result<Located> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(Input::Locate(repo.to_string(), tx))
+            .map_err(stopped)?;
         rx.await.map_err(stopped)?
     }
 
-    /// Lead a hosted incarnation: announce it to peers (with its state, so
-    /// they host it before they hear from it) and campaign for it.
-    pub(crate) fn lead(&self, repo: &str, epoch: u64) {
-        drop(self.tx.send(Input::Start(repo.to_string(), epoch)));
+    /// A new incarnation of `repo` (in `object_format`), placed by this
+    /// node: its replicas (this node and the least loaded live members, in
+    /// distinct zones first) and this node as its sequencer.
+    pub(crate) fn create(
+        &self,
+        repo: &str,
+        head: Option<String>,
+        object_format: i32,
+    ) -> crate::proto::Create {
+        let root = self.root.read();
+        let replicas = root.dir.choose(repo, &[self.id], &root.alive);
+        crate::proto::Create {
+            repo: repo.to_string(),
+            head,
+            object_format,
+            replicas,
+            sequencer: self.id,
+            boot: self.boot,
+        }
+    }
+
+    /// The URL of node `id`, as the registry has it (empty: none).
+    pub(crate) fn url(&self, id: u64) -> String {
+        url_of(self.addresses.as_ref(), id)
+    }
+
+    /// The replicas of `repo`'s live log, and those it is changing from,
+    /// as the directory has them here.
+    #[must_use]
+    pub fn replicas(&self, repo: &str) -> Option<(Vec<u64>, Vec<u64>)> {
+        let root = self.root.read();
+        let i = root.dir.live(repo)?;
+        Some((i.replicas.clone(), i.joint.clone()))
+    }
+
+    /// `repo`'s latest incarnation, as the directory has it here.
+    pub(crate) fn incarnation(&self, repo: &str) -> Option<crate::proto::Incarnation> {
+        self.root.read().dir.repos.get(repo).cloned()
+    }
+
+    /// The ledger's members, and the nodes removed from it, as the
+    /// directory has them here.
+    #[must_use]
+    pub fn members(&self) -> (Vec<u64>, Vec<u64>) {
+        self.root.read().dir.members()
+    }
+
+    /// Where each member is, and the key that checks its tokens, as the
+    /// directory has them here.
+    #[must_use]
+    pub fn peers(&self) -> Vec<Member> {
+        self.root.read().dir.peers().cloned().collect()
+    }
+
+    /// Member `id` as the directory has it here.
+    #[must_use]
+    pub fn peer(&self, id: u64) -> Option<Member> {
+        self.root.read().dir.peers().find(|p| p.id == id).cloned()
+    }
+
+    /// Node `id` as the directory has it (removed since, maybe), else as
+    /// it was introduced.
+    #[must_use]
+    pub fn known(&self, id: u64) -> Option<Member> {
+        let node = self.root.read().dir.node(id).cloned();
+        node.or_else(|| self.introduced.read().get(&id).cloned())
+    }
+
+    /// Whether node `id` was removed from the ledger and holds no log any
+    /// more, as applied here (see [`root::Directory::departed`]).
+    pub(crate) fn departed(&self, id: u64) -> bool {
+        self.root.read().dir.departed(id)
+    }
+
+    /// Learn of `peers` that the directory does not have yet (a node that
+    /// is joining talks to the members before it has the directory).
+    pub(crate) fn introduce(&self, peers: &[Member]) {
+        let Some(a) = &self.addresses else { return };
+        let new: Vec<&Member> = peers.iter().filter(|p| self.peer(p.id).is_none()).collect();
+        let mut introduced = self.introduced.write();
+        let mut a = a.write();
+        for p in new {
+            a.entry(p.id).or_insert_with(|| p.url.clone());
+            introduced.insert(p.id, p.clone());
+        }
+    }
+
+    /// The nodes alive, as this node last saw, sorted.
+    #[must_use]
+    pub fn alive(&self) -> Vec<u64> {
+        let mut alive = self.root.read().alive.clone();
+        alive.sort_unstable();
+        alive
+    }
+
+    /// Whether node `id` answers pings at its address in the directory.
+    #[must_use]
+    pub fn answers(&self, id: u64) -> bool {
+        self.root.read().answering.contains(&id)
+    }
+
+    /// The root log's voters, as applied here.
+    #[must_use]
+    pub fn root_voters(&self) -> Vec<u64> {
+        self.root.read().dir.meta.voters.clone()
+    }
+
+    /// Whether this node leads the root log.
+    pub(crate) fn leads_root(&self) -> bool {
+        self.root.read().leading
+    }
+
+    /// Deliver frames received from peer `from`.
+    pub(crate) fn receive(&self, from: u64, frames: Vec<Frame>) {
+        drop(self.tx.send(Input::Frames(from, frames)));
     }
 
     /// What happened to this node's logs since the last call.
@@ -716,14 +931,8 @@ impl Engine {
         std::mem::take(&mut *self.events.lock())
     }
 
-    /// Stop hosting incarnation `epoch` of `repo` (it ended, or a newer one
-    /// exists), and drop its log.
-    pub(crate) fn unhost(&self, repo: &str, epoch: u64) {
-        drop(self.tx.send(Input::Unhost(repo.to_string(), epoch)));
-    }
-
     /// The hosted incarnation of `repo`: its log and epoch, how far its
-    /// state is applied, and whether this node leads it.
+    /// state is applied, and whether this node sequences it.
     pub fn hosted(&self, repo: &str) -> Option<Hosted> {
         self.hosted.read().get(repo).map(Published::hosted)
     }
@@ -764,9 +973,10 @@ impl Engine {
         self.hosted.read().keys().cloned().collect()
     }
 
-    /// The summaries of up to `limit` hosted repositories (deleted ones
-    /// too) named with `prefix` and after `after`, in name order; and
-    /// whether more follow. Blocking.
+    /// The summaries of up to `limit` repositories in the directory
+    /// (deleted ones too) named with `prefix` and after `after`, in name
+    /// order; and whether more follow. A live one hosted here is described
+    /// from its state, the others from the directory alone. Blocking.
     pub(crate) fn list(
         &self,
         prefix: &str,
@@ -780,14 +990,21 @@ impl Engine {
             Bound::Included(prefix)
         };
         let (page, more) = {
+            let root = self.root.read();
             let hosted = self.hosted.read();
-            let mut names = hosted
+            let mut names = root
+                .dir
+                .repos
                 .range::<str, _>((from, Bound::Unbounded))
                 .take_while(|(n, _)| n.starts_with(prefix));
             let page: Vec<_> = names
                 .by_ref()
                 .take(limit)
-                .map(|(n, p)| (n.clone(), p.log, p.epoch))
+                .map(|(n, i)| {
+                    let log = log_id(n, i.epoch);
+                    let here = hosted.get(n).is_some_and(|p| p.log == log);
+                    (n.clone(), i.epoch, i.deleted, here.then_some(log))
+                })
                 .collect();
             (page, names.next().is_some())
         };
@@ -795,9 +1012,20 @@ impl Engine {
         let mut round = state.round();
         let page = page
             .into_iter()
-            // (Not if dropped meanwhile.)
-            .filter(|(_, log, _)| state.contains(*log))
-            .map(|(name, log, epoch)| stored::summary(&mut round, log, &name, epoch))
+            .map(|(name, epoch, deleted, log)| {
+                match log {
+                    // (Not if dropped meanwhile.)
+                    Some(log) if !deleted && state.contains(log) => {
+                        stored::summary(&mut round, log, &name, epoch)
+                    }
+                    _ => Ok(RepoSummary {
+                        name,
+                        epoch,
+                        deleted,
+                        ..Default::default()
+                    }),
+                }
+            })
             .collect::<Result<_>>()?;
         Ok((page, more))
     }
@@ -817,24 +1045,33 @@ impl Engine {
         )?))
     }
 
+    /// `repo`'s manifest, without inline layers' bytes, if this node hosts
+    /// it.
+    pub(crate) fn layers(&self, repo: &str) -> Result<Option<Vec<LayerMeta>>> {
+        let Some(h) = self.hosted(repo) else {
+            return Ok(None);
+        };
+        let state = self.state.upgrade().ok_or_else(|| stopped(()))?;
+        Ok(Some(stored::layers(&state.round(), h.log)?))
+    }
+
     /// A snapshot of the engine's counters.
     #[must_use]
     pub fn stats(&self) -> Stats {
         self.stats.read().clone()
     }
 
-    /// The `Raft` gRPC service for this engine (the transport between
+    /// The `Peer` gRPC service for this engine (the transport between
     /// ledger nodes), to mount on the node's server.
     #[must_use]
-    pub fn raft_server(
+    pub fn peer_server(
         self: &Arc<Self>,
-    ) -> crate::proto::raft_server::RaftServer<super::transport::RaftService> {
+    ) -> crate::proto::peer_server::PeerServer<super::transport::PeerService> {
         super::transport::server(Arc::downgrade(self))
     }
 
     /// What this node knows of `repo`'s log, or `None` if it does not host
-    /// it. Each node answers from its own view, so ask a majority to find
-    /// the leader.
+    /// it.
     #[must_use]
     pub fn repo_status(&self, repo: &str) -> Option<serde_json::Value> {
         let h = self.hosted(repo)?;
@@ -843,7 +1080,7 @@ impl Engine {
             "repo": repo,
             "epoch": h.epoch,
             "term": h.term,
-            "leader": (h.leader != 0).then_some(h.leader),
+            "sequencer": (h.sequencer != 0).then_some(h.sequencer),
             "leading": h.leading,
             "version": h.version,
             "applied": h.applied,
@@ -864,7 +1101,14 @@ impl Engine {
 
     /// Ask the loop to stop.
     pub fn shutdown(&self) {
+        self.stopping.send_replace(true);
         drop(self.tx.send(Input::Stop));
+    }
+
+    /// Becomes true once the engine is asked to stop.
+    #[must_use]
+    pub fn stopping(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.stopping.subscribe()
     }
 
     /// Wait until the engine has stopped (see [`shutdown`](Self::shutdown))
@@ -874,274 +1118,91 @@ impl Engine {
     }
 }
 
+/// A subscription to a log's updates (see [`Engine::follow`]).
+///
+/// Dropping it tells the apply thread, which otherwise would keep the closed
+/// queue until the log next changes, and an idle log may never change.
+pub(crate) struct Subscription {
+    rx: mpsc::Receiver<Update>,
+    log: u64,
+    input: mpsc::UnboundedSender<Input>,
+}
+
+impl Subscription {
+    /// The next update, or `None` once the subscription has ended.
+    pub(crate) async fn recv(&mut self) -> Option<Update> {
+        self.rx.recv().await
+    }
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        // Closed first, so the apply thread sees it closed.
+        self.rx.close();
+        drop(self.input.send(Input::Unfollow(self.log)));
+    }
+}
+
+/// The proposal or read id an entry's context carries (0 if none).
+fn ctx_id(ctx: &[u8]) -> u64 {
+    u64::from_le_bytes(ctx.try_into().unwrap_or([0; 8]))
+}
+
 /// The log hosted for `repo`.
 fn log_of(hosted: &RwLock<BTreeMap<String, Published>>, repo: &str) -> Option<u64> {
     hosted.read().get(repo).map(|p| p.log)
 }
 
-/// A log recovered at startup.
-struct Recovered {
-    meta: LogMeta,
-    repo: String,
-    epoch: u64,
-    applied: u64,
-}
-
-/// Logs whose entries recovery reads in one go.
+/// Logs whose cells recovery reads in one go.
 const RECOVER_CHUNK: usize = 1000;
 
-/// A log as stored: where it starts (its snapshot), and its entries after
-/// that.
-fn read_log(
-    db: &raft_engine::Engine,
-    id: u64,
-) -> raft_engine::Result<(Option<Snapshot>, Vec<Entry>)> {
-    let snapshot = db.get_value::<Snapshot, Prost>(id, SNAPSHOT_KEY)?;
-    let start = snapshot.as_ref().map_or(0, |s| s.get_metadata().index);
-    let entries = match db.last_index(id).filter(|&l| l > start) {
-        Some(last) => fetch(db, id, start + 1, last + 1, None)?,
-        None => Vec::new(),
-    };
-    Ok((snapshot, entries))
-}
-
-/// Load log `id` (where it starts, and `entries` after that) and bring its
-/// state machine (in the state store) up to its commit index. None if the
-/// log is not one of ours (no state, or no snapshot: torn). Repairs to the
-/// log go in `batch`.
-fn recover(
-    db: &LogDb,
-    state: &StateStore,
-    id: u64,
-    me: u64,
-    snapshot: Option<Snapshot>,
-    mut entries: Vec<Entry>,
-    batch: &mut LogBatch,
-) -> Result<Option<Recovered>> {
-    let (Some(snapshot), Some(root)) = (snapshot, state.root(id)) else {
-        return Ok(None);
-    };
-    let hard_state = db
-        .get_value::<HardState, Prost>(id, HARD_STATE_KEY)?
-        .unwrap_or_default();
-    let mut meta = LogMeta::default();
-    (meta.hard_state, meta.snapshot) = (hard_state, snapshot);
-    meta.conf = root.conf();
-    let start = meta.snapshot.get_metadata().index;
-    let applied = root.applied_index;
-    // The log was truncated past what the state store kept: the entries in
-    // between are gone (the sync before truncating failed us).
-    anyhow::ensure!(
-        applied >= start,
-        "its state is at entry {applied}, before the log's start ({start})"
-    );
-    meta.append(entries.iter().map(|e| (e.index, e.term)));
-    if applied > meta.last_index() {
-        // A snapshot from the leader was installed in the state store, but
-        // the log was not reset to it: reset it now.
-        let snap = meta.snapshot_at(applied, root.applied_term);
-        put_snapshot(batch, id, &snap);
-        batch.add_command(id, raft_engine::Command::Compact { index: applied + 1 });
-        meta.apply_snapshot(snap);
-        batch.put_value::<Prost, _>(id, HARD_STATE_KEY.to_vec(), &meta.hard_state)?;
-        entries.clear();
-    }
-    if meta.conf.voters == [me] {
-        // With a single voter, every durable entry is committed.
-        meta.hard_state.commit = meta.hard_state.commit.max(meta.last_index());
-    }
-    // Entries applied were committed, whether or not the hard state saying
-    // so was written.
-    meta.hard_state.commit = meta.hard_state.commit.max(applied);
-    let commit = meta.hard_state.commit.min(meta.last_index());
-    // Up to the first membership change (raft must apply it).
-    let mut round = state.round();
-    let mut replayed = applied;
-    for e in entries
-        .iter()
-        .filter(|e| e.index > applied && e.index <= commit)
-    {
-        if conf_change(e).is_some() {
-            break;
-        }
-        stored::apply(&mut round, id, e.index, e.term, decode(id, e).as_ref())?;
-        replayed = e.index;
-    }
-    round.commit()?;
-    Ok(Some(Recovered {
-        meta,
-        repo: root.repo,
-        epoch: root.epoch,
-        applied: replayed,
-    }))
-}
-
-/// A membership change entry's change (only `ConfChangeV2`s are proposed).
-pub(super) fn conf_change(e: &Entry) -> Option<ConfChangeV2> {
-    use raft_prost::Message as _;
-    match e.get_entry_type() {
-        EntryType::EntryConfChangeV2 => ConfChangeV2::decode(e.data.as_slice()).ok(),
-        _ => None,
-    }
-}
-
-/// What a round changes in one log's storage view once it is durable: an
-/// installed snapshot, appended entries as (index, term), the hard state.
-type Persisted = (u64, Option<Snapshot>, Vec<(u64, u64)>, Option<HardState>);
-
-/// What a round collects from the logs' `Ready`s, for after its write.
+/// What a round leaves for after its write.
 #[derive(Default)]
 struct RoundWork {
-    /// Rounds handed off this pass (log, `Ready` number).
-    rounds: Vec<(u64, u64)>,
-    /// What each changes in the logs' storage view once durable.
-    persisted_state: Vec<Persisted>,
-    /// Messages that may only be sent once durable.
-    held: Vec<(u64, Vec<Message>)>,
-    /// Logs this node was removed from.
-    removed: Vec<u64>,
-}
-
-/// Hand a snapshot from the leader to the apply thread.
-fn hand_snapshot(
-    applier: &std::sync::mpsc::Sender<Job>,
-    l: &Log,
-    id: u64,
-    snap: &mut Snapshot,
-) -> Result<()> {
-    let rec = Record::decode(snap.data.as_slice())?;
-    snap.data.clear();
-    let md = snap.get_metadata();
-    let root = stored::root(&l.repo, l.epoch, md.get_conf_state(), md.index, md.term);
-    hand(
-        applier,
-        Job::Install {
-            log: id,
-            root,
-            meta: rec.meta.unwrap_or_default(),
-        },
-    )
-}
-
-/// Queue the log's reset to a snapshot from the leader in `batch`.
-fn reset_to_snapshot(batch: &mut LogBatch, l: &Log, id: u64, snap: &Snapshot) {
-    put_snapshot(batch, id, snap);
-    let last = l.raw.store().meta.read().last_index();
-    let index = snap.get_metadata().index.max(last) + 1;
-    batch.add_command(id, raft_engine::Command::Compact { index });
-}
-
-/// Publish a log's leader and term to `hosted` when they changed.
-fn publish_role(
-    hosted: &RwLock<BTreeMap<String, Published>>,
-    events: &Mutex<Events>,
-    l: &mut Log,
-    soft_state: bool,
-) {
-    // A new leader comes in the soft state. A new term alone (a
-    // follower that missed an election) comes only in the hard state.
-    if !soft_state && l.raw.raft.term == l.published_term {
-        return;
-    }
-    let mut hosted = hosted.write();
-    let Some(h) = hosted.get_mut(&l.repo) else {
-        return;
-    };
-    l.published_term = l.raw.raft.term;
-    let leading = l.raw.raft.state == StateRole::Leader;
-    // A new leader checkpoints what earlier ones may not have.
-    if leading && !h.leading {
-        events.lock().changed.insert(l.repo.clone());
-    }
-    h.leading = leading;
-    h.leader = l.raw.raft.leader_id;
-    h.term = l.raw.raft.term;
-}
-
-/// Hand the membership changes among `committed` to raft, as the apply
-/// thread will see them: the membership after each (by entry index). Pushes
-/// `id` to `removed` if one removes this node.
-fn apply_confs(
-    l: &mut Log,
-    node_id: u64,
-    id: u64,
-    committed: &[Entry],
-    removed: &mut Vec<u64>,
-) -> HashMap<u64, ConfState> {
-    // Membership changes take effect in raft as they are handed
-    // over (a refused one is refused on every node).
-    let mut confs = HashMap::new();
-    for (e, cc) in committed.iter().filter_map(|e| Some((e, conf_change(e)?))) {
-        let Ok(cs) = l.raw.apply_conf_change(&cc) else {
-            continue;
-        };
-        tracing::info!(repo = l.repo, voters = ?cs.voters, learners = ?cs.learners, "membership changed");
-        // (Not just absent: a joining node replays changes from before it.)
-        if cc
-            .changes
-            .iter()
-            .any(|c| c.node_id == node_id && c.change_type() == ConfChangeType::RemoveNode)
-        {
-            removed.push(id);
-        }
-        l.raw.store().meta.write().conf = cs.clone();
-        confs.insert(e.index, cs);
-    }
-    confs
-}
-
-/// A log known to be hosted.
-#[expect(
-    clippy::expect_used,
-    reason = "invariant: the caller checked the log is hosted"
-)]
-fn hosted_log(logs: &HashMap<u64, Log>, id: u64) -> &Log {
-    logs.get(&id).expect("hosted")
-}
-
-#[expect(
-    clippy::expect_used,
-    reason = "invariant: the caller checked the log is hosted"
-)]
-fn hosted_log_mut(logs: &mut HashMap<u64, Log>, id: u64) -> &mut Log {
-    logs.get_mut(&id).expect("hosted")
+    /// The root log's `Ready` number, if it had one.
+    root_round: Option<u64>,
+    /// What the root's storage view takes once durable.
+    root_persisted: Option<RootPersisted>,
+    /// Root messages that may only be sent once durable.
+    root_held: Vec<Message>,
+    /// Repository logs written, and the last position each one wrote.
+    written: Vec<(u64, u64)>,
 }
 
 /// Fail a waiting proposal or read barrier with `e`.
 fn reject(kind: Wait, e: anyhow::Error) {
     match kind {
-        Wait::Propose { resp, .. } => drop(resp.send(Err(e))),
-        Wait::Read(resp) => drop(resp.send(Err(e))),
+        Wait::Evaluate(proposal) => drop(proposal.resp.send(Err(e))),
+        Wait::Read(reader) => reader.fail(e),
+        Wait::Root { resp, .. } => drop(resp.send(Err(e))),
     }
 }
 
-/// Hand the apply thread a job (it only stops with the loop, or failing).
-fn hand(applier: &std::sync::mpsc::Sender<Job>, job: Job) -> Result<()> {
-    applier
-        .send(job)
-        .map_err(|e| anyhow::anyhow!("the apply thread stopped: {e}"))
+/// `addresses` are the members' in `dir`. It takes `addresses` only to
+/// swap the map, so a caller may hold the root's lock.
+fn learn(addresses: &Addresses, dir: &Directory) {
+    let peers: HashMap<u64, String> = dir.reachable().map(|p| (p.id, p.url.clone())).collect();
+    if *addresses.read() != peers {
+        *addresses.write() = peers;
+    }
 }
 
-/// Whether a log needs no membership change: every member a voter, and no
-/// removed node in it.
-fn settled(conf: &ConfState, members: &[u64], removed: &[u64]) -> bool {
-    members.iter().all(|n| conf.voters.contains(n))
-        && !conf
-            .voters
-            .iter()
-            .chain(&conf.learners)
-            .any(|n| removed.contains(n))
-}
-
-/// Add a log's snapshot to a write.
+/// Stop: this node cannot keep its state. Fail-stop is what
+/// replication's safety assumes.
 #[expect(
-    clippy::expect_used,
-    reason = "invariant: the snapshot key is not reserved"
+    clippy::panic,
+    reason = "a node that cannot persist its state must stop: fail-stop is what replication's safety assumes"
 )]
-fn put_snapshot(batch: &mut LogBatch, id: u64, snap: &Snapshot) {
-    batch
-        .put_value::<Prost, _>(id, SNAPSHOT_KEY.to_vec(), snap)
-        .expect("snapshot key is not reserved");
+fn fail_stop(e: &anyhow::Error) -> ! {
+    panic!("consensus engine: {e:#}");
+}
+
+/// Hand the apply thread a job. It stops only with the loop or by
+/// failing, and a node whose apply thread failed stops.
+fn hand(applier: &std::sync::mpsc::Sender<Job>, job: Job) {
+    if let Err(e) = applier.send(job) {
+        fail_stop(&anyhow::anyhow!("the apply thread stopped: {e}"));
+    }
 }
 
 impl Loop {
@@ -1169,17 +1230,14 @@ impl Loop {
     /// Process rounds while logs have work (e.g. entries that just became
     /// durable are now committed), taking new inputs in between; false if
     /// the loop must stop.
-    #[expect(
-        clippy::panic,
-        reason = "a node that cannot persist its state must stop: fail-stop is what Raft safety assumes"
-    )]
     async fn settle(&mut self, rx: &mut mpsc::UnboundedReceiver<Input>) -> bool {
         for _ in 0..16 {
             if let Err(e) = self.process().await {
                 // Durability failed: we must not continue.
-                panic!("consensus engine: {e:#}");
+                fail_stop(&e);
             }
-            if self.dirty.is_empty() {
+            let idle = (self.dirty.iter()).all(|id| self.unsettled.contains_key(id));
+            if idle && !self.root_log.dirty && self.inbox.is_empty() {
                 break;
             }
             if !self.drain(rx) {
@@ -1192,7 +1250,8 @@ impl Loop {
         true
     }
 
-    /// Handle the inputs pending; false once told to stop.
+    /// Handle the inputs pending (and frames to this node itself); false
+    /// once told to stop.
     fn drain(&mut self, rx: &mut mpsc::UnboundedReceiver<Input>) -> bool {
         for _ in 0..10_000 {
             let Ok(i) = rx.try_recv() else { break };
@@ -1200,99 +1259,199 @@ impl Loop {
                 return false;
             }
         }
+        self.drain_inbox();
         true
     }
 
-    fn touch(&mut self, log: u64, real: bool) {
-        self.dirty.insert(log);
-        if real && let Some(l) = self.logs.get_mut(&log) {
-            let leader = l.raw.raft.state == StateRole::Leader;
-            l.active_until = Instant::now()
-                + if leader {
-                    LEADER_ACTIVE
-                } else {
-                    FOLLOWER_ACTIVE
-                };
-            self.ticking.insert(log);
+    fn drain_inbox(&mut self) {
+        while let Some(f) = self.inbox.pop_front() {
+            self.on_frame(self.node_id, f);
         }
     }
 
     fn tick(&mut self) {
         let now = Instant::now();
-        let mut active = 0;
-        let mut quiet = Vec::new();
-        for &id in &self.ticking {
-            match self.logs.get_mut(&id) {
-                Some(l) if l.active_until > now => {
-                    l.raw.tick();
-                    self.dirty.insert(id);
-                    active += 1;
-                }
-                l => quiet.push((id, l.map(|l| l.repo.clone()))),
-            }
+        self.root_log.raw.tick();
+        self.root_log.dirty = true;
+        // Liveness: pings, and who went down or restarted.
+        for (to, f) in self.liveness.tick(&self.members) {
+            self.send(to, f);
         }
-        if !quiet.is_empty() {
-            let mut events = self.events.lock();
-            for (id, repo) in quiet {
-                self.ticking.remove(&id);
-                events.quiet.extend(repo);
-            }
+        let up = self.liveness.up();
+        let down: Vec<u64> = self.up.difference(&up).copied().collect();
+        let came: Vec<u64> = up.difference(&self.up).copied().collect();
+        self.up = up;
+        if !down.is_empty() || !came.is_empty() {
+            self.root.write().alive = self.up.iter().copied().collect();
         }
-        // Re-issue read index requests that got no answer: a leader drops
-        // them (silently) while it hasn't committed in its term, and
+        let mut answering: Vec<u64> = self.liveness.answering().into_iter().collect();
+        answering.sort_unstable();
+        if self.root.read().answering != answering {
+            self.root.write().answering = answering;
+        }
+        // Replicas back up are caught up at once, and logs short of
+        // replicas may grow onto them now.
+        if !came.is_empty() {
+            self.lagging.extend(self.sequencing.iter().copied());
+            let root = self.root.read();
+            self.controller.note_short(&root.dir);
+        }
+        self.resend(now);
+        self.control(&down);
+        // Re-issue root read index requests that got no answer: a leader
+        // drops them (silently) while it hasn't committed in its term, and
         // forwarded ones can be lost with a leadership change.
-        let stale: Vec<u64> = self
-            .reads
-            .iter()
+        let stale: Vec<u64> = (self.root_log.reads.iter())
             .filter(|(_, r)| now.duration_since(r.issued) > READ_RETRY)
             .map(|(r, _)| *r)
             .collect();
         for rid in stale {
-            if let Some(r) = self.reads.remove(&rid) {
+            if let Some(r) = self.root_log.reads.remove(&rid) {
                 self.waiting.push(Waiting {
-                    log: r.log,
+                    log: ROOT,
                     deadline: r.deadline,
-                    kind: Wait::Read(r.resp),
+                    kind: Wait::Read(r.reader),
                 });
             }
         }
-        // Expire proposals that never committed.
-        let expired: Vec<u64> = self
-            .pending
-            .iter()
-            .filter(|(_, p)| p.deadline < now)
-            .map(|(id, _)| *id)
-            .collect();
-        for id in expired {
-            if let Some(p) = self.pending.remove(&id) {
-                drop(p.resp.send(Err(anyhow::anyhow!("proposal timed out"))));
-            }
+        for (_, (resp, _)) in self.root_log.pending.extract_if(|_, (_, d)| *d < now) {
+            drop(resp.send(Err(anyhow::anyhow!("root proposal timed out"))));
         }
-        self.sweep();
-        // Leaders of active logs re-announce them now and then, so a peer
-        // that missed the first announcement (down, or restarted without
-        // its disk) joins.
-        self.ticks += 1;
-        if self.ticks.is_multiple_of(ANNOUNCE_TICKS) {
-            self.reannounce();
-        }
-        self.stats.logs = self.logs.len();
-        self.stats.active_logs = active;
+        self.stats.logs = self.repos.len();
+        self.stats.lagging_logs = self.lagging.len();
+        let repos = &self.repos;
+        self.sequencing
+            .retain(|log| repos.get(log).is_some_and(|r| r.seq_term().is_some()));
+        self.stats.leading = (self.sequencing.iter())
+            .filter(|log| repos.get(log).is_some_and(RepoLog::leading))
+            .count();
         *self.shared_stats.write() = self.stats.clone();
     }
 
-    /// Announce the active logs this node leads to their peers.
-    fn reannounce(&self) {
-        let Some(t) = &self.transport else { return };
-        let leading = self
-            .ticking
-            .iter()
-            .filter_map(|id| self.logs.get(id))
-            .filter(|l| l.raw.raft.state == StateRole::Leader);
-        for l in leading {
-            for p in l.peers(self.node_id) {
-                t.send(p, Frame::Host(l.repo.clone(), l.epoch, None));
+    /// The logs this node sequences.
+    fn sequenced(&self) -> impl Iterator<Item = (u64, &RepoLog)> {
+        (self.sequencing.iter()).filter_map(|&log| Some((log, self.repos.get(&log)?)))
+    }
+
+    /// Resend to lagging replicas that are alive, and reads' checks, that
+    /// got no answer for a while; ask the root again to end replica
+    /// changes.
+    fn resend(&mut self, now: Instant) {
+        let me = self.node_id;
+        let ids: Vec<u64> = self.lagging.iter().copied().collect();
+        for log in ids {
+            let Some(r) = self.repos.get(&log) else {
+                self.lagging.remove(&log);
+                continue;
+            };
+            let lagging = r.node.lagging::<Bytes>();
+            if r.node.sequencing::<Bytes>().is_none() || lagging.is_empty() {
+                self.lagging.remove(&log);
+                continue;
             }
+            let stale: Vec<u64> = (lagging.into_iter())
+                .filter(|to| {
+                    r.sent
+                        .get(to)
+                        .is_none_or(|t| now.duration_since(*t) > RESEND)
+                })
+                .filter(|to| self.up.contains(to))
+                .collect();
+            for to in stale {
+                self.retry(log, to);
+            }
+        }
+        // Reads' checks.
+        let mut retry = Vec::new();
+        for (log, r) in self.sequenced() {
+            if r.checked.is_none_or(|t| now.duration_since(t) <= RESEND) {
+                continue;
+            }
+            let replicas = r.node.replicas().unwrap_or_default();
+            let waiting = replicas
+                .iter()
+                .filter(|&&n| r.node.waiting(n).next().is_some());
+            retry.extend(waiting.map(|&n| (log, n)));
+        }
+        for (log, to) in retry {
+            if let Some(r) = self.repos.get_mut(&log) {
+                r.checked = Some(now);
+                let fx = r.node.retry_checks(to);
+                self.effects(log, fx);
+            }
+        }
+        // Deposed sequencers the root still names: a seal whose appointment
+        // never came. Only the root's leader can give the log a new term.
+        let root_leader = self.root_log.raw.raft.leader_id;
+        let mut deposed = Vec::new();
+        for &log in &self.sequencing {
+            let Some(r) = self.repos.get_mut(&log) else {
+                continue;
+            };
+            let Some(term) = r.node.deposed::<Bytes>() else {
+                continue;
+            };
+            let due = r
+                .reported
+                .is_none_or(|t| now.duration_since(t) > DEPOSED_RETRY);
+            if root_leader != 0 && due && r.config.sequencer == me && r.config.term == term {
+                r.reported = Some(now);
+                let d = crate::proto::Deposed {
+                    repo: r.repo.clone(),
+                    term,
+                };
+                deposed.push(framed(log, frame::Kind::Deposed(d)));
+            }
+        }
+        for f in deposed {
+            self.send(root_leader, f);
+        }
+        // Replica changes to end.
+        let activate: Vec<crate::proto::Activation> = (self.sequencing.iter())
+            .filter_map(|log| {
+                let r = self.repos.get_mut(log)?;
+                let term = r.node.sequencing::<Bytes>().filter(|_| r.leading())?;
+                let due = r
+                    .activated
+                    .is_none_or(|t| now.duration_since(t) > ACTIVATE_RETRY);
+                (!r.config.joint.is_empty() && due).then(|| {
+                    r.activated = Some(now);
+                    crate::proto::Activation {
+                        repo: r.repo.clone(),
+                        epoch: r.epoch,
+                        term,
+                    }
+                })
+            })
+            .collect();
+        if !activate.is_empty() {
+            let entry: RootEntry = root_entry::Change::Activate(crate::proto::Activate {
+                activations: activate,
+            })
+            .into();
+            self.propose_root_quietly(&entry);
+        }
+    }
+
+    /// On the root's leader: start failovers, and propose the appointments
+    /// ready.
+    fn control(&mut self, down: &[u64]) {
+        // (Not a node removed from the ledger.)
+        let leading = self.root.read().leading && self.members.contains(&self.node_id);
+        let (seals, appointments) = {
+            let root = self.root.read();
+            self.controller
+                .tick(leading, &root.dir, &self.liveness, down)
+        };
+        self.stats.seals += count(seals.len());
+        for (to, f) in seals {
+            self.send(to, f);
+        }
+        if !appointments.is_empty() {
+            self.stats.appointments += count(appointments.len());
+            let entry: RootEntry =
+                root_entry::Change::Appoint(crate::proto::Appoint { appointments }).into();
+            self.propose_root_quietly(&entry);
         }
     }
 
@@ -1300,389 +1459,543 @@ impl Loop {
     fn handle(&mut self, input: Input) -> bool {
         self.rounds.inputs += 1;
         match input {
-            Input::Propose(cmd, resp) => self.on_propose(&cmd, resp),
+            Input::Propose(cmd, resp) => self.on_propose(cmd, resp),
+            Input::Evaluated(log, data, proposal) => self.on_evaluated(log, data, proposal),
+            Input::Confirm(log, version, proposal) => self.on_confirm(log, version, proposal),
+            Input::Reevaluate(log, proposal) => self.evaluate(log, proposal),
             Input::Follow(repo, tx, resp) => self.on_follow(&repo, tx, resp),
-            Input::ReadIndex(log, resp) => self.on_read_index(log, resp),
-            Input::Frames(frames) => {
+            Input::Unfollow(log) => self.on_unfollow(log),
+            Input::ReadIndex(log, resp) => self.read(log, Reader::Barrier(resp)),
+            Input::Frames(from, frames) => {
                 for f in frames {
-                    self.on_frame(f);
+                    self.on_frame(from, f);
                 }
             }
-            Input::Host {
-                repo,
-                epoch,
-                meta,
-                voters,
-                resp,
-            } => match self.host(repo, epoch, meta, voters) {
-                Ok(()) => self.hosted_replies.push(resp),
-                Err(e) => {
-                    drop(resp.send(Err(e)));
-                }
-            },
-            Input::Unhost(repo, epoch) => {
-                self.unhost(log_id(&repo, epoch));
+            Input::Locate(repo, resp) => self.on_locate(&repo, resp),
+            Input::ProposeRoot(data, resp) => {
+                self.next_id += 1;
+                let pid = self.next_id;
+                self.wait(ROOT, Wait::Root { pid, data, resp });
             }
-            Input::Start(repo, epoch) => self.on_start(&repo, epoch),
+            Input::Retire => self.retire(),
             Input::Purge(ids) => self.on_purge(ids),
             Input::Applied(logs) => {
-                let repos = logs.iter().filter_map(|id| self.logs.get(id));
-                (self.events.lock().changed).extend(repos.map(|l| l.repo.clone()));
+                let repos = logs.iter().filter_map(|id| self.repos.get(id));
+                self.events.lock().extend(repos.map(|r| r.repo.clone()));
                 self.answer_reads();
             }
             Input::Durable(durable) => self.on_durable(durable),
-            Input::Members(members, removed) => {
-                if (&members, &removed) != (&self.members, &self.removed) {
-                    (self.members, self.removed) = (members, removed);
-                    self.to_reconcile = self.logs.keys().copied().collect();
-                }
+            Input::Settled(logs) => self.on_settled(logs),
+            Input::Unreachable(peer) => {
+                self.root_log.raw.report_unreachable(peer);
+                self.root_log.dirty = true;
             }
-            Input::Unreachable(peer, logs) => self.on_unreachable(peer, logs),
             Input::Stop => return false,
         }
         true
     }
 
-    fn on_propose(&mut self, cmd: &Command, resp: oneshot::Sender<Result<Outcome>>) {
+    fn on_propose(&mut self, cmd: Command, resp: oneshot::Sender<Result<Outcome>>) {
         let Some(log) = log_of(&self.hosted, &cmd.repo) else {
-            drop(resp.send(Err(NotHosted.into())));
+            drop(resp.send(Err(self.not_here(&cmd.repo))));
             return;
         };
-        let progress = *hosted_log(&self.logs, log).progress.lock();
-        // Refused anyway once applied: keep it out of the log.
+        let Some(progress) = self.repos.get(&log).map(|r| *r.progress.lock()) else {
+            drop(resp.send(Err(self.not_here(&cmd.repo))));
+            return;
+        };
+        // Refused anyway: keep it out of the log.
         if progress.deleted {
-            drop(resp.send(Ok(state_machine::on_deleted(cmd, progress.version))));
+            drop(resp.send(Ok(machine::on_deleted(&cmd, progress.version))));
             return;
         }
-        let data = cmd.encode_to_vec();
-        self.next_id += 1;
-        let pid = self.next_id;
-        self.waiting.push(Waiting {
-            log,
-            deadline: Instant::now() + PROPOSAL_TIMEOUT,
-            kind: Wait::Propose { pid, data, resp },
-        });
-        self.touch(log, true);
+        self.evaluate(log, Proposal::new(cmd, resp));
     }
 
-    #[expect(
-        clippy::expect_used,
-        reason = "a node that cannot persist its state must stop: fail-stop is what Raft safety assumes"
-    )]
+    /// The error for a request about `repo`, not hosted here.
+    fn not_here(&self, repo: &str) -> anyhow::Error {
+        match self.root.read().dir.live(repo) {
+            Some(inc) => self.not_sequencer(inc.sequencer),
+            None => NotHosted.into(),
+        }
+    }
+
+    fn not_sequencer(&self, sequencer: u64) -> anyhow::Error {
+        NotSequencer {
+            sequencer,
+            url: url_of(self.addresses.as_ref(), sequencer),
+        }
+        .into()
+    }
+
+    /// Answer an outcome evaluated without a change at `version`, once a
+    /// read shows the repository still at that version: a linearizable
+    /// read, so a refusal needs no log entry. A change in the meantime
+    /// evaluates the command again.
+    fn on_confirm(&mut self, log: u64, version: u64, proposal: Proposal) {
+        self.read(log, Reader::Confirm(version, Box::new(proposal)));
+    }
+
+    /// Have the sequencer evaluate a proposal (again, after a change
+    /// overtook it), unless it has been tried enough.
+    fn evaluate(&mut self, log: u64, proposal: Proposal) {
+        if let Some(proposal) = proposal.again() {
+            self.wait(log, Wait::Evaluate(proposal));
+        }
+    }
+
+    /// The apply thread evaluated a proposal: append its entry, if this
+    /// node still sequences the log.
+    fn on_evaluated(&mut self, log: u64, data: Vec<u8>, proposal: Proposal) {
+        let proposed = (self.repos.get_mut(&log).filter(|r| r.leading()))
+            .and_then(|r| Some((r.node.sequencing::<Bytes>()?, r)))
+            .and_then(|(term, r)| Some((term, r.node.propose(Bytes::from(data))?, r)));
+        let Some((term, (index, fx), r)) = proposed else {
+            hand(&self.applier, Job::Forget(log));
+            self.evaluate(log, proposal);
+            return;
+        };
+        r.replies.insert(index, (term, proposal));
+        self.dirty.insert(log);
+        self.lagging.insert(log);
+        self.effects(log, fx);
+    }
+
     fn on_follow(
         &mut self,
         repo: &str,
         tx: mpsc::Sender<Update>,
-        resp: oneshot::Sender<Result<()>>,
+        resp: oneshot::Sender<Result<u64>>,
     ) {
         let Some(log) = log_of(&self.hosted, repo) else {
             drop(resp.send(Err(NotHosted.into())));
             return;
         };
-        hand(&self.applier, Job::Follow { log, tx, resp }).expect("apply thread");
+        hand(&self.applier, Job::Follow { log, tx, resp });
     }
 
-    fn on_read_index(&mut self, log: u64, resp: oneshot::Sender<Result<u64>>) {
-        if !self.logs.contains_key(&log) {
-            drop(resp.send(Err(NotHosted.into())));
+    fn on_unfollow(&mut self, log: u64) {
+        hand(&self.applier, Job::Unfollow(log));
+    }
+
+    fn read(&mut self, log: u64, reader: Reader) {
+        if log != ROOT && !self.repos.contains_key(&log) {
+            reader.fail(NotHosted.into());
             return;
         }
+        self.wait(log, Wait::Read(reader));
+    }
+
+    /// Hold `kind` until the log can take it (see `retry_one`).
+    fn wait(&mut self, log: u64, kind: Wait) {
+        let timeout = if log == ROOT {
+            ROOT_TIMEOUT
+        } else {
+            PROPOSAL_TIMEOUT
+        };
         self.waiting.push(Waiting {
             log,
-            deadline: Instant::now() + PROPOSAL_TIMEOUT,
-            kind: Wait::Read(resp),
+            deadline: Instant::now() + timeout,
+            kind,
         });
-        self.touch(log, true);
-    }
-
-    fn on_frame(&mut self, f: Frame) {
-        match f {
-            // For a node that had this address before.
-            Frame::Raft(_, m) if m.to != self.node_id => {}
-            Frame::Raft(log, m) => {
-                let real = is_real_traffic(&m);
-                if let Some(l) = self.logs.get_mut(&log) {
-                    drop(l.raw.step(*m));
-                    self.touch(log, real);
-                }
-                // Messages for logs not hosted here (yet) are
-                // dropped; raft retransmits.
-            }
-            Frame::Wake(log) => self.touch(log, true),
-            Frame::Host(repo, epoch, state) => self.on_announced(repo, epoch, state),
+        if log == ROOT {
+            self.root_log.dirty = true;
         }
     }
 
-    /// A peer announced incarnation `epoch` of `repo`.
-    fn on_announced(&mut self, repo: String, epoch: u64, state: Option<Box<Record>>) {
-        if self.logs.contains_key(&log_id(&repo, epoch)) {
+    /// Send a frame to a peer (or to this node itself).
+    fn send(&mut self, to: u64, f: Frame) {
+        if to == self.node_id {
+            self.inbox.push_back(f);
             return;
         }
-        // A new incarnation, with its initial state: host it
-        // now (its leader's vote requests follow); else load
-        // that state from the object store.
-        match state {
-            Some(s) if s.repo == repo && s.epoch == epoch => {
-                if let Err(e) = self.host(repo, epoch, s.meta.unwrap_or_default(), s.voters) {
-                    tracing::debug!("hosting announced log: {e:#}");
-                }
-            }
-            _ => drop(self.announced.send((repo, epoch))),
-        }
-    }
-
-    fn on_start(&mut self, repo: &str, epoch: u64) {
-        let id = log_id(repo, epoch);
-        if !self.logs.contains_key(&id) {
-            return;
-        }
-        self.announce(repo, epoch, id);
-        drop(hosted_log_mut(&mut self.logs, id).raw.campaign());
-        self.touch(id, true);
-    }
-
-    /// Send log `id`'s state to its peers, so they host it.
-    fn announce(&self, repo: &str, epoch: u64, id: u64) {
         let Some(t) = &self.transport else { return };
-        if let Ok(Some((root, meta))) = load(&self.state, &self.db, id) {
-            let state = root.record(meta);
-            for p in hosted_log(&self.logs, id).peers(self.node_id) {
-                t.send(
-                    p,
-                    Frame::Host(repo.to_string(), epoch, Some(Box::new(state.clone()))),
-                );
+        self.stats.messages_sent += 1;
+        if f.log != ROOT && f.log != 0 {
+            self.stats.log_messages += 1;
+        }
+        t.send(to, f);
+    }
+
+    /// Resend replica `to` of log `log` what it lacks.
+    fn retry(&mut self, log: u64, to: u64) {
+        if let Some(r) = self.repos.get_mut(&log) {
+            let fx = r.node.retry(to);
+            self.effects(log, fx);
+        }
+    }
+
+    /// Hand log `log`'s node a message from `from`, and carry out what it
+    /// does.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a request would drop a committed entry: the protocol is
+    /// broken, and this node must stop before it spreads.
+    fn step(&mut self, log: u64, from: u64, msg: repo::Msg) {
+        let Some(r) = self.repos.get_mut(&log) else {
+            // Not hosted here (yet: the root's entry hosting it may not
+            // have applied): the sequencer sends it again.
+            return;
+        };
+        let request = matches!(msg, repo::Msg::Request(_));
+        let fx = match r.node.step(from, msg) {
+            Ok(fx) => fx,
+            Err(broken) => fail_stop(&anyhow::anyhow!(
+                "{} (log {log:x}): a request would drop committed position {}",
+                r.repo,
+                broken.0
+            )),
+        };
+        if request {
+            self.dirty.insert(log);
+        }
+        self.effects(log, fx);
+    }
+
+    /// Carry out what log `log`'s node did: send its messages, write the
+    /// states it installed, evaluate again the proposals it lost, and
+    /// answer the reads that ended.
+    fn effects(&mut self, log: u64, fx: repo::Effects) {
+        let now = Instant::now();
+        let Some(r) = self.repos.get_mut(&log) else {
+            return;
+        };
+        let mut lost = r.lost();
+        let installed = r.node.store_mut().take_installed();
+        for i in &installed {
+            lost.extend(r.covered(i.index, i.kept));
+            r.handed = r.handed.max(i.index);
+        }
+        let mut read = Vec::new();
+        let mut failed = Vec::new();
+        for (round, index) in fx.reads {
+            let readers = r.readers.remove(&round).unwrap_or_default();
+            match index {
+                Some(index) => read.extend(readers.into_iter().map(|x| (log, index, x))),
+                None => failed.extend(readers),
             }
-        } else {
-            // Peers load it from the object store instead.
-            tracing::warn!(repo, epoch, "no state to announce");
+        }
+        let mut requests = false;
+        let mut sends = Vec::with_capacity(fx.sends.len());
+        for (to, msg) in fx.sends {
+            if matches!(msg, repo::Msg::Request(_)) {
+                r.sent.insert(to, now);
+                requests = true;
+            }
+            sends.push((to, repo::frame(log, msg)));
+        }
+        let (repo_name, epoch, sequencer) = (r.repo.clone(), r.epoch, r.config.sequencer);
+        if let Some(i) = installed.last() {
+            let start = Start {
+                index: i.index,
+                term: i.last_term,
+            };
+            let drop_to = (installed.iter().map(|i| i.drop_to))
+                .chain(r.start_due.map(|(_, d)| d))
+                .max()
+                .unwrap_or(0);
+            r.start_due = Some((start, drop_to));
+        }
+        for i in installed {
+            let root = stored::root(&repo_name, epoch, i.index, i.last_term);
+            let job = Job::Install {
+                log,
+                root,
+                meta: i.meta,
+            };
+            hand(&self.applier, job);
+            self.hold(log);
+            self.stats.snapshots_installed += 1;
+        }
+        self.after_truncate(log, lost);
+        if requests {
+            self.lagging.insert(log);
+        }
+        for (to, f) in sends {
+            self.send(to, f);
+        }
+        if fx.committed.is_some() {
+            self.dirty.insert(log);
+        }
+        if !failed.is_empty() || fx.deposed.is_some() {
+            for reader in failed {
+                reader.fail(self.not_sequencer(sequencer));
+            }
+            self.publish(log);
+        }
+        if !read.is_empty() {
+            self.read_applied.extend(read);
+            self.answer_reads();
+        }
+    }
+
+    fn on_frame(&mut self, from: u64, f: Frame) {
+        let log = f.log;
+        let Some(kind) = f.kind else { return };
+        match kind {
+            frame::Kind::Root(data) => match root_message(&data) {
+                // (Not for a node that had this address before.)
+                Ok(m) if m.to == self.node_id => {
+                    drop(self.root_log.raw.step(m));
+                    self.root_log.dirty = true;
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(from, "an undecodable root message: {e:#}"),
+            },
+            kind @ (frame::Kind::Append(_)
+            | frame::Kind::Install(_)
+            | frame::Kind::Ack(_)
+            | frame::Kind::Seal(_)
+            | frame::Kind::Check(_)
+            | frame::Kind::Open(_)) => {
+                if let Some(msg) = repo::msg(kind) {
+                    self.step(log, from, msg);
+                }
+            }
+            frame::Kind::Sealed(s) => {
+                let root = self.root.read();
+                self.controller.on_sealed(&root.dir, log, from, s);
+            }
+            frame::Kind::Deposed(d) => {
+                let root = self.root.read();
+                self.controller.on_deposed(&root.dir, &d.repo, d.term);
+            }
+            frame::Kind::Ping(p) => {
+                let (pong, restarted) = self.liveness.on_ping(from, p);
+                self.send(from, pong);
+                if restarted {
+                    self.restarted(from);
+                }
+            }
+            frame::Kind::Pong(p) => {
+                if self.liveness.on_pong(from, p) {
+                    self.restarted(from);
+                }
+            }
+        }
+    }
+
+    /// `node` restarted: the logs it sequenced need new terms.
+    fn restarted(&mut self, node: u64) {
+        let root = self.root.read();
+        self.controller.note_node(&root.dir, node);
+    }
+
+    /// Proposals whose positions were truncated: evaluated again (by the
+    /// new sequencer).
+    fn after_truncate(&mut self, log: u64, lost: Vec<Proposal>) {
+        if lost.is_empty() {
+            return;
+        }
+        hand(&self.applier, Job::Forget(log));
+        for p in lost {
+            self.evaluate(log, p);
+        }
+    }
+
+    fn on_locate(&mut self, repo: &str, resp: oneshot::Sender<Result<Located>>) {
+        let located = {
+            let root = self.root.read();
+            match root.dir.live(repo) {
+                None => Located::Absent,
+                Some(inc) if hosts(inc, self.node_id) => Located::Here,
+                Some(inc) => Located::Elsewhere(inc.sequencer),
+            }
+        };
+        if located != Located::Here {
+            drop(resp.send(Ok(located)));
+            return;
+        }
+        // Answered once its log's start is durable.
+        let hosted = log_of(&self.hosted, repo).is_some();
+        if !hosted {
+            self.sync_repo(repo);
+        }
+        let due = log_of(&self.hosted, repo)
+            .filter(|l| self.repos.get(l).is_some_and(|r| r.start_due.is_some()));
+        match due {
+            None if hosted => drop(resp.send(Ok(Located::Here))),
+            log => self.located.push((log.unwrap_or_default(), resp)),
+        }
+    }
+
+    /// This node was removed from the ledger and its logs moved off it (or
+    /// a peer says so): drop every repository's log it still hosts.
+    fn retire(&mut self) {
+        let ids: Vec<u64> = self.repos.keys().copied().collect();
+        if !ids.is_empty() {
+            tracing::warn!(
+                logs = ids.len(),
+                "this node was removed from the ledger: dropping its logs"
+            );
+        }
+        for id in ids {
+            self.unhost(id);
         }
     }
 
     /// Compact the logs `ids` hold back, or drop them if not hosted.
-    #[expect(
-        clippy::expect_used,
-        reason = "a node that cannot persist its state must stop: fail-stop is what Raft safety assumes"
-    )]
     fn on_purge(&mut self, ids: Vec<u64>) {
         for id in ids {
-            if self.logs.contains_key(&id) {
+            if id == ROOT || self.repos.contains_key(&id) {
                 self.compact(id);
                 continue;
             }
             if !is_log(id) {
                 continue;
             }
-            hand(&self.applier, Job::Drop(id)).expect("apply thread");
+            hand(&self.applier, Job::Drop(id));
             self.batch.add_command(id, raft_engine::Command::Clean);
-        }
-    }
-
-    fn on_unreachable(&mut self, peer: u64, logs: Vec<u64>) {
-        for log in logs {
-            if let Some(l) = self.logs.get_mut(&log) {
-                l.raw.report_unreachable(peer);
-            }
         }
     }
 
     fn on_durable(&mut self, durable: Vec<(u64, u64, Option<u64>)>) {
         for (id, index, pin) in durable {
-            if let Some(l) = self.logs.get_mut(&id) {
-                l.durable = (index, pin);
+            if let Some(r) = self.repos.get_mut(&id) {
+                r.durable = (index, pin);
                 self.maybe_snapshot(id);
             }
         }
     }
 
-    /// Propose waiting commands and issue waiting read barriers whose log
-    /// knows a leader; wake the others.
+    /// Issue waiting proposals and reads whose log can take them; keep the
+    /// others waiting, or refuse them.
     fn retry_waiting(&mut self) {
         let now = Instant::now();
         for w in std::mem::take(&mut self.waiting) {
-            self.retry_one(w, now);
+            if w.log == ROOT {
+                self.retry_root(w, now);
+            } else {
+                self.retry_one(w, now);
+            }
         }
     }
 
     fn retry_one(&mut self, w: Waiting, now: Instant) {
-        let Some(l) = self.logs.get_mut(&w.log) else {
+        let Some(r) = self.repos.get_mut(&w.log) else {
             reject(w.kind, NotHosted.into());
             return;
         };
-        let no_leader = l.raw.raft.leader_id == 0;
         if w.deadline < now {
-            reject(w.kind, anyhow::anyhow!("no leader for the log (timed out)"));
+            reject(
+                w.kind,
+                anyhow::anyhow!("the log's sequencer is not ready (timed out)"),
+            );
             return;
         }
-        if no_leader {
-            if l.solo() {
-                drop(l.raw.campaign());
-            } else {
-                self.wake(w.log);
+        if !r.leading() {
+            // A sequencer that has yet to commit its term's no-op serves
+            // nothing yet; any other node names the sequencer.
+            // (Nor does one that the directory names but has yet to be
+            // appointed again: after a restart, or once deposed.)
+            if r.node.sequencing::<Bytes>().is_some() || r.config.sequencer == self.node_id {
+                self.waiting.push(w);
+                return;
             }
-            self.dirty.insert(w.log);
-            self.waiting.push(w);
+            let sequencer = r.config.sequencer;
+            reject(w.kind, self.not_sequencer(sequencer));
             return;
         }
         match w.kind {
-            Wait::Read(resp) => {
-                // raft-rs silently drops read index requests on a leader
-                // that has not committed an entry in its current term yet.
-                if l.raw.raft.state == StateRole::Leader && !l.raw.raft.commit_to_current_term() {
-                    self.dirty.insert(w.log);
+            Wait::Evaluate(proposal) => {
+                // After every entry handed to the apply thread so far.
+                let job = Job::Evaluate {
+                    log: w.log,
+                    proposal,
+                };
+                hand(&self.applier, job);
+            }
+            Wait::Read(reader) => {
+                // (It leads, so it has a round to wait on.)
+                let Some(round) = r.node.read::<Bytes>() else {
                     self.waiting.push(Waiting {
-                        kind: Wait::Read(resp),
+                        kind: Wait::Read(reader),
                         ..w
                     });
                     return;
-                }
-                self.next_id += 1;
-                let rid = self.next_id;
-                l.raw.read_index(rid.to_le_bytes().to_vec());
-                self.reads.insert(
-                    rid,
-                    Read {
-                        log: w.log,
-                        resp,
-                        issued: now,
-                        deadline: w.deadline,
-                    },
-                );
+                };
+                r.readers.entry(round).or_default().push(reader);
+                self.dirty.insert(w.log);
             }
-            Wait::Propose { pid, data, resp } => {
-                if let Err(e) = l.raw.propose(pid.to_le_bytes().to_vec(), data) {
-                    drop(resp.send(Err(anyhow::anyhow!("propose failed: {e}"))));
-                    return;
-                }
-                self.pending.insert(
-                    pid,
-                    Pending {
-                        resp,
-                        deadline: w.deadline,
-                    },
-                );
-            }
-        }
-        self.touch(w.log, true);
-    }
-
-    fn wake(&mut self, log: u64) {
-        let Some(l) = self.logs.get_mut(&log) else {
-            return;
-        };
-        if let Some(t) = &self.transport {
-            for p in l.peers(self.node_id) {
-                t.send(p, Frame::Wake(log));
-            }
-        }
-        // Tick ourselves too, so an election happens if the leader is gone.
-        l.active_until = Instant::now() + FOLLOWER_ACTIVE;
-        self.ticking.insert(log);
-    }
-
-    fn send(&mut self, log: u64, msgs: Vec<Message>) {
-        let Some(t) = &self.transport else { return };
-        self.stats.messages_sent += count(msgs.len());
-        for m in msgs {
-            t.send(m.to, Frame::Raft(log, Box::new(m)));
+            Wait::Root { resp, .. } => drop(resp.send(Err(anyhow::anyhow!("not a root log")))),
         }
     }
 
-    /// One round: collect every touched log's `Ready`, send the messages
-    /// that don't need durability, apply committed entries, then make the
-    /// round's state durable with one log store write (group commit across
-    /// all logs). Only then is the logs' storage view updated, the rounds
-    /// reported persisted to raft (`on_persist_ready`) and the messages that
-    /// require durability (append acks, votes) sent. Committed entries are
-    /// only ever up to the persisted index (raft-rs's default
-    /// `max_apply_unpersisted_log_limit`).
+    /// One round: collect the root log's `Ready` and every repository log's
+    /// writes, make them durable with one log store write (group commit
+    /// across all logs), then send what required it (acks, seal answers,
+    /// raft's votes), advance commit points and apply what committed.
     ///
     /// Synchronous: overlapping the fsync with the next round gains nothing
     /// once the loop is not CPU-bound.
     async fn process(&mut self) -> Result<()> {
         let started = Instant::now();
-        let dirty: Vec<u64> = std::mem::take(&mut self.dirty).into_iter().collect();
+        let settling = std::mem::take(&mut self.settling);
+        if !settling.is_empty() {
+            hand(&self.applier, Job::Sync(settling));
+        }
+        // Logs waiting for their state are left out until it is durable.
+        let dirty: Vec<u64> = (std::mem::take(&mut self.dirty).into_iter())
+            .filter(|id| !self.unsettled.contains_key(id))
+            .collect();
         self.rounds.logs += count(dirty.len());
         let mut batch = std::mem::take(&mut self.batch);
-        let hosted_replies = std::mem::take(&mut self.hosted_replies);
-        for id in std::mem::take(&mut self.fresh) {
-            if let Some(l) = self.logs.get(&id) {
-                put_snapshot(&mut batch, id, &l.raw.store().meta.read().snapshot);
-            }
-        }
+        let (waiting, located) = (std::mem::take(&mut self.located).into_iter())
+            .partition(|(log, _)| self.unsettled.contains_key(log));
+        self.located = waiting;
         let mut work = RoundWork::default();
-        for id in dirty {
-            self.reconcile(id);
+        self.reconcile_root();
+        if std::mem::take(&mut self.root_log.dirty) {
+            self.collect_root(&mut batch, &mut work)?;
+        }
+        let replies = std::mem::take(&mut self.replies);
+        for &id in &dirty {
             self.collect(id, &mut batch, &mut work)?;
         }
-        // Read barriers whose index is applied already (the others are
-        // answered as the apply thread reports).
-        self.answer_reads();
+        // What committed and was already durable here applies now, not after
+        // this round's write: that write holds at most the commit point for
+        // it, which a restart recovers from the applied state.
+        for &id in &dirty {
+            self.apply(id);
+        }
         if !batch.is_empty() {
             self.write_batch(batch).await?;
         }
-        for resp in hosted_replies {
+        for resp in replies {
             drop(resp.send(Ok(())));
         }
-        self.release(work);
+        for (_, resp) in located {
+            drop(resp.send(Ok(Located::Here)));
+        }
+        self.release(work, &dirty);
+        self.answer_reads();
         *self.shared_stats.write() = self.stats.clone();
         self.end_round(started);
         Ok(())
     }
 
-    /// Collect log `id`'s `Ready` into the round: its writes into `batch`,
-    /// what follows once they are durable into `work`.
     fn collect(&mut self, id: u64, batch: &mut LogBatch, work: &mut RoundWork) -> Result<()> {
-        let Some(l) = self.logs.get_mut(&id) else {
+        let Some(r) = self.repos.get_mut(&id) else {
             return Ok(());
         };
-        if !l.raw.has_ready() {
-            return Ok(());
+        if let Some((start, drop_to)) = r.start_due.take() {
+            repo::put_start(batch, id, &start, drop_to)?;
         }
-        let mut rd = l.raw.ready();
-        let msgs = rd.take_messages();
-        let mut snapshot = (!rd.snapshot().is_empty()).then(|| rd.snapshot().clone());
-        // Installed from the leader: the state store takes its state
-        // (durable before the log is reset to it: see the module doc),
-        // and the log keeps where it starts.
-        if let Some(snap) = snapshot.as_mut() {
-            hand_snapshot(&self.applier, l, id, snap)?;
-            self.barrier = true;
-            self.stats.snapshots_installed += 1;
-            reset_to_snapshot(batch, l, id, snap);
+        let (cells, hard) = r.node.store_mut().take_writes();
+        if !cells.is_empty() {
+            batch.add_entries_with::<Cells, Proto>(id, &cells)?;
+            work.written.push((id, Terms::last(r.store())));
         }
-        batch.add_entries_with::<Entries, Prost>(id, rd.entries())?;
-        let terms = rd.entries().iter().map(|e| (e.index, e.term)).collect();
-        let hs = rd.hs().cloned();
-        if let Some(hs) = &hs {
-            batch.put_value::<Prost, _>(id, HARD_STATE_KEY.to_vec(), hs)?;
+        if let Some(hard) = hard {
+            repo::put_hard(batch, id, &hard)?;
         }
-        work.persisted_state.push((id, snapshot.clone(), terms, hs));
-        // Read indexes don't depend on local persistence.
-        for rs in rd.take_read_states() {
-            let rid = u64::from_le_bytes(rs.request_ctx.as_slice().try_into().unwrap_or([0; 8]));
-            if let Some(Read { log, resp, .. }) = self.reads.remove(&rid) {
-                self.read_applied.push((log, rs.index, resp));
-            }
+        // Checks for reads, now that they have their readers.
+        let fx = r.node.send_checks::<Bytes>();
+        if !fx.sends.is_empty() {
+            r.checked = Some(Instant::now());
         }
-        publish_role(&self.hosted, &self.events, l, rd.ss().is_some());
-        let committed = rd.take_committed_entries();
-        let persisted = rd.take_persisted_messages();
-        let number = rd.number();
-        l.raw.advance_append_async(rd);
-        if let Some(last) = committed.last().map(|e| e.index) {
-            let confs = apply_confs(l, self.node_id, id, &committed, &mut work.removed);
-            // Raft counts them applied once handed to the apply thread.
-            l.raw.advance_apply_to(last);
-            self.apply(id, committed, confs)?;
-        }
-        self.send(id, msgs);
-        work.rounds.push((id, number));
-        if !persisted.is_empty() {
-            work.held.push((id, persisted));
-        }
-        if hosted_log(&self.logs, id).raw.has_ready() {
-            self.dirty.insert(id);
-        }
+        self.effects(id, fx);
         Ok(())
     }
 
@@ -1690,14 +2003,6 @@ impl Loop {
     async fn write_batch(&mut self, mut batch: LogBatch) -> Result<()> {
         let db = self.db.clone();
         let w = Instant::now();
-        if std::mem::take(&mut self.barrier) {
-            // States this write starts logs from are durable first.
-            let (done, synced) = oneshot::channel();
-            hand(&self.applier, Job::Sync(done))?;
-            synced
-                .await
-                .map_err(|e| anyhow::anyhow!("the apply thread stopped: {e}"))?;
-        }
         let n = tokio::task::spawn_blocking(move || db.write(&mut batch, true)).await??;
         self.rounds.write += w.elapsed();
         self.stats.log_writes += 1;
@@ -1705,15 +2010,13 @@ impl Loop {
         Ok(())
     }
 
-    /// Everything from this round is durable: update the logs' storage
-    /// view, tell raft, and release the messages that required it
-    /// (append acks, votes).
-    fn release(&mut self, work: RoundWork) {
-        for (id, snap, terms, hs) in work.persisted_state {
-            let Some(l) = self.logs.get(&id) else {
-                continue;
-            };
-            let mut m = l.raw.store().meta.write();
+    /// Everything from this round is durable: update the root's storage
+    /// view and tell raft, send what required durability, advance the
+    /// sequencers' commit points (this node's replica counts now), and hand
+    /// what committed to the apply thread.
+    fn release(&mut self, work: RoundWork, dirty: &[u64]) {
+        if let Some((snap, terms, hs)) = work.root_persisted {
+            let mut m = self.root_log.raw.store().meta.write();
             if let Some(snap) = snap {
                 m.apply_snapshot(snap);
             }
@@ -1721,18 +2024,88 @@ impl Loop {
             if let Some(hs) = hs {
                 m.hard_state = hs;
             }
+            // raft-rs reads every entry after its applied index (an election
+            // scans them for configuration changes): none may be compacted.
+            debug_assert!(
+                self.root_log.raw.raft.raft_log.applied >= m.snapshot.get_metadata().index,
+                "the root log starts after raft's applied index {}",
+                self.root_log.raw.raft.raft_log.applied
+            );
         }
-        for (id, number) in work.rounds {
-            if let Some(l) = self.logs.get_mut(&id) {
-                l.raw.on_persist_ready(number);
-                self.dirty.insert(id);
+        if let Some(number) = work.root_round {
+            self.root_log.raw.on_persist_ready(number);
+            self.root_log.dirty = true;
+        }
+        for m in work.root_held {
+            let to = m.to;
+            self.send(to, root_frame(&m));
+        }
+        for (id, last) in work.written {
+            if let Some(r) = self.repos.get_mut(&id) {
+                // (Truncated meanwhile: only what is still there.)
+                r.node.store_mut().wrote(last);
             }
         }
-        for (id, msgs) in work.held {
-            self.send(id, msgs);
+        // Every write of these logs is durable now: their answers go, and
+        // their sequencers count their own copies.
+        for &id in dirty {
+            let Some(r) = self.repos.get_mut(&id) else {
+                continue;
+            };
+            let written = r.store().written();
+            let fx = r.node.synced(&Synced::after_sync(), written);
+            self.effects(id, fx);
+            self.apply(id);
         }
-        for id in work.removed {
-            self.unhost(id);
+    }
+
+    /// Hand log `id`'s entries committed and durable here to the apply
+    /// thread, with the proposers they answer; tell lagging replicas the
+    /// commit point.
+    fn apply(&mut self, id: u64) {
+        let Some(r) = self.repos.get_mut(&id) else {
+            return;
+        };
+        let upto = r.store().commit().min(r.store().written());
+        let mut again = Vec::new();
+        while r.handed < upto {
+            let cells = r.store().cells_between(r.handed + 1, upto);
+            let Some(last) = cells.last().map(|c| c.index) else {
+                tracing::error!(
+                    repo = r.repo,
+                    at = r.handed + 1,
+                    "committed cells are missing"
+                );
+                break;
+            };
+            let (replies, evaluate) = repo::answered(&mut r.replies, &cells);
+            again.extend(evaluate);
+            let job = Job::Apply {
+                log: id,
+                cells,
+                replies,
+            };
+            hand(&self.applier, job);
+            r.handed = last;
+        }
+        r.trim_cache();
+        let became = r.leading() && !self.hosted.read().get(&r.repo).is_some_and(|p| p.leading);
+        // Replicas not told the commit point yet (and alive), told now.
+        let solo = self.transport.is_none();
+        let tell: Vec<u64> = (r.node.lagging::<Bytes>().into_iter())
+            .filter(|to| solo || self.up.contains(to))
+            .collect();
+        if became {
+            self.publish(id);
+        }
+        for p in again {
+            self.evaluate(id, p);
+        }
+        for to in tell {
+            if let Some(r) = self.repos.get_mut(&id) {
+                let fx = r.node.tell(to);
+                self.effects(id, fx);
+            }
         }
     }
 
@@ -1755,70 +2128,155 @@ impl Loop {
         );
     }
 
-    /// Answer read barriers whose read index this node has applied.
+    /// Answer the readers whose read index this node has applied.
     fn answer_reads(&mut self) {
-        let mut still = Vec::new();
-        for (log, index, resp) in std::mem::take(&mut self.read_applied) {
-            if self
-                .logs
-                .get(&log)
-                .is_some_and(|l| l.progress.lock().applied >= index)
-            {
-                drop(resp.send(Ok(index)));
+        for (log, index, reader) in std::mem::take(&mut self.read_applied) {
+            let progress = if log == ROOT {
+                Some(Progress {
+                    applied: self.root.read().dir.meta.applied_index,
+                    ..Progress::default()
+                })
             } else {
-                still.push((log, index, resp));
+                self.repos.get(&log).map(|r| *r.progress.lock())
+            };
+            match (progress, reader) {
+                (Some(p), reader) if p.applied < index => {
+                    self.read_applied.push((log, index, reader));
+                }
+                (_, Reader::Barrier(resp)) => drop(resp.send(Ok(index))),
+                (Some(p), Reader::Confirm(version, proposal)) if p.version == version => {
+                    drop(proposal.resp.send(Ok(proposal.outcome)));
+                }
+                // Changed since: evaluated again.
+                (_, Reader::Confirm(_, proposal)) => self.evaluate(log, *proposal),
             }
         }
-        self.read_applied = still;
     }
 
-    /// Hand committed entries of one log to the apply thread, with the
-    /// proposers it answers and the membership after each change.
-    fn apply(
-        &mut self,
-        id: u64,
-        entries: Vec<Entry>,
-        confs: HashMap<u64, ConfState>,
-    ) -> Result<()> {
-        let mut replies = HashMap::new();
-        for e in &entries {
-            let pid = u64::from_le_bytes(e.context.as_slice().try_into().unwrap_or([0; 8]));
-            if let Some(p) = self.pending.remove(&pid) {
-                replies.insert(e.index, p.resp);
+    /// Act on a change to the directory.
+    fn on_root_change(&mut self, change: Change) {
+        match change {
+            Change::None => {}
+            Change::Created(repo, epoch) | Change::Appointed(repo, epoch) => {
+                self.controller.applied(&repo, epoch);
+                self.sync_repo(&repo);
+            }
+            Change::Deleted(repo, epoch) => self.unhost(log_id(&repo, epoch)),
+            Change::Members => {
+                self.members_changed();
+                let root = self.root.read();
+                self.controller.note_all(&root.dir);
             }
         }
-        hand(
-            &self.applier,
-            Job::Apply {
-                log: id,
-                entries,
-                replies,
-                confs,
-            },
-        )
     }
 
-    /// Host a log (see [`Engine::host`]).
-    fn host(&mut self, repo: String, epoch: u64, meta: RepoMeta, voters: Vec<u64>) -> Result<()> {
-        let id = log_id(&repo, epoch);
-        if let Some(cur) = log_of(&self.hosted, &repo) {
-            if cur == id {
-                return Ok(());
+    /// Bring this node's hosting of `repo`'s log in line with the
+    /// directory: host it (from its initial state) if it is a replica, drop
+    /// it if not, take its new configuration, and start or end its
+    /// sequencer here.
+    fn sync_repo(&mut self, repo: &str) {
+        let inc = self.root.read().dir.live(repo).cloned();
+        let current = log_of(&self.hosted, repo);
+        let Some(inc) = inc.filter(|i| hosts(i, self.node_id)) else {
+            if let Some(log) = current {
+                self.unhost(log);
             }
-            anyhow::ensure!(
-                hosted_log(&self.logs, cur).epoch < epoch,
-                "a newer incarnation of {repo} is hosted"
-            );
-            // Superseded (it ended elsewhere while this node was away).
-            self.unhost(cur);
-        }
-        // (Maybe not as a voter yet: its leader adds members.)
-        let conf = ConfState {
-            voters,
-            ..Default::default()
+            return;
         };
+        let log = log_id(repo, inc.epoch);
+        if current != Some(log) {
+            if let Some(old) = current {
+                self.unhost(old);
+            }
+            self.host(repo, &inc);
+        }
+        let Some(r) = self.repos.get_mut(&log) else {
+            return;
+        };
+        let config = Config::of(&inc);
+        if r.config != config {
+            let sequencer_changed = r.config.sequencer != config.sequencer;
+            r.config = config;
+            if sequencer_changed {
+                let job = Job::Sequencer {
+                    log,
+                    sequencer: r.config.sequencer,
+                };
+                hand(&self.applier, job);
+            }
+        }
+        let term = r.config.term;
+        let ours = r.config.sequencer == self.node_id && r.config.boot == self.boot;
+        if !ours && r.node.sequencing::<Bytes>().is_some_and(|t| t < term) {
+            // A term of an older configuration is over: the root sealed it,
+            // as if the seal reached this replica too.
+            self.step(
+                log,
+                self.node_id,
+                repo::Msg::Request(Request::Seal { term }),
+            );
+        }
+        let Some(r) = self.repos.get_mut(&log) else {
+            return;
+        };
+        if ours && r.seq_term() != Some(term) && r.fence() <= term {
+            tracing::info!(repo, term, "sequencing a log");
+            let replicas = r.config.replicas.clone();
+            let written = r.store().written();
+            let fx = r.node.appoint(term, replicas, written);
+            self.lagging.insert(log);
+            self.sequencing.insert(log);
+            self.dirty.insert(log);
+            self.effects(log, fx);
+        }
+        self.publish(log);
+    }
+
+    /// Publish log `log`'s sequencer and term to `hosted`.
+    fn publish(&mut self, log: u64) {
+        let Some(r) = self.repos.get(&log) else {
+            return;
+        };
+        let mut hosted = self.hosted.write();
+        let Some(h) = hosted.get_mut(&r.repo) else {
+            return;
+        };
+        let leading = r.leading();
+        // A new sequencer tracks what earlier ones may have left to
+        // maintain.
+        if leading && !h.leading {
+            self.events.lock().insert(r.repo.clone());
+        }
+        (h.leading, h.sequencer, h.term) = (leading, r.config.sequencer, r.config.term);
+    }
+
+    /// The directory's members may have changed: a node removed drops its
+    /// repositories' logs.
+    fn members_changed(&mut self) {
+        let root = self.root.read();
+        if let Some(a) = &self.addresses {
+            learn(a, &root.dir);
+        }
+        let (members, removed) = root.dir.members();
+        // A removed node keeps its logs until they move off it, each as the
+        // directory says (see `sync_repo`).
+        let departed = root.dir.departed(self.node_id);
+        drop(root);
+        if (&members, &removed) == (&self.members, &self.removed) {
+            return;
+        }
+        if departed {
+            self.retire();
+        }
+        (self.members, self.removed) = (members, removed);
+    }
+
+    /// Host incarnation `inc` of `repo`'s log from its initial state.
+    fn host(&mut self, repo: &str, inc: &crate::proto::Incarnation) {
+        let id = log_id(repo, inc.epoch);
+        let meta = root::initial(inc);
         // Its initial state, durable before (with the round's write) its log.
-        let root = stored::root(&repo, epoch, &conf, 0, 0);
+        let root = stored::root(repo, inc.epoch, 0, 0);
         let progress = Arc::new(Mutex::new(Progress {
             version: meta.version,
             applied: 0,
@@ -1832,191 +2290,140 @@ impl Loop {
                 meta,
                 progress: progress.clone(),
             },
-        )?;
-        self.barrier = true;
-        let mut mem = LogMeta::default();
-        mem.snapshot.mut_metadata().set_conf_state(conf.clone());
-        mem.conf = conf;
-        let raw = RawNode::new(
-            &raft_config(self.node_id, 0),
-            LogStore::new(id, self.db.clone(), self.state.clone(), mem),
-            &self.logger,
-        )?;
-        self.logs.insert(
-            id,
-            Log {
-                raw,
-                repo: repo.clone(),
-                epoch,
-                progress: progress.clone(),
-                durable: (0, None),
-                active_until: Instant::now() + FOLLOWER_ACTIVE,
-                published_term: 0,
-            },
         );
-        self.ticking.insert(id);
+        self.hold(id);
+        let config = Config::of(inc);
+        let store = LedgerStore::new(id, self.db.clone(), self.state.clone());
+        let mut r = RepoLog::new(
+            repo.to_string(),
+            inc.epoch,
+            store,
+            progress.clone(),
+            config.clone(),
+            self.node_id,
+        );
+        r.start_due = Some((*r.store().start(), 0));
+        self.repos.insert(id, r);
         self.hosted.write().insert(
-            repo,
+            repo.to_string(),
             Published {
                 log: id,
-                epoch,
+                epoch: inc.epoch,
                 leading: false,
-                leader: 0,
-                term: 0,
+                sequencer: config.sequencer,
+                term: config.term,
                 progress,
             },
         );
-        self.fresh.push(id);
         self.dirty.insert(id);
-        Ok(())
     }
 
-    /// Stop hosting a log (its incarnation ended, and its subscriptions with
-    /// it), and drop it from the log store.
-    #[expect(
-        clippy::expect_used,
-        reason = "a node that cannot persist its state must stop: fail-stop is what Raft safety assumes"
-    )]
+    /// Hold `log`'s writes until the state just handed for it is durable.
+    fn hold(&mut self, log: u64) {
+        self.settling.push(log);
+        *self.unsettled.entry(log).or_default() += 1;
+    }
+
+    /// The states `logs` start from are durable: their writes may go.
+    fn on_settled(&mut self, logs: Vec<u64>) {
+        for log in logs {
+            let Some(n) = self.unsettled.get_mut(&log) else {
+                continue;
+            };
+            *n -= 1;
+            if *n == 0 {
+                self.unsettled.remove(&log);
+                self.dirty.insert(log);
+            }
+        }
+    }
+
+    /// Stop hosting a log (its incarnation ended, or it moved off this
+    /// node; its subscriptions end with it), and drop it from the log
+    /// store.
     fn unhost(&mut self, id: u64) {
-        let Some(l) = self.logs.remove(&id) else {
+        let Some(r) = self.repos.remove(&id) else {
             return;
         };
-        self.ticking.remove(&id);
+        self.lagging.remove(&id);
+        // A proposal in the log may still commit on the other replicas: its
+        // outcome is unknown, so a retry could apply it twice. Reads go to
+        // the new sequencer.
+        let sequencer = r.config.sequencer;
+        for (_, (_, p)) in r.replies {
+            drop(p.resp.send(Err(anyhow::anyhow!(
+                "this node left the log before the proposal's outcome was known"
+            ))));
+        }
+        for reader in r.readers.into_values().flatten() {
+            reader.fail(self.not_sequencer(sequencer));
+        }
         // A state without a log is dropped at restart, as is a log without
         // a state: the two deletions need no order.
-        hand(&self.applier, Job::Drop(id)).expect("apply thread");
+        hand(&self.applier, Job::Drop(id));
         self.batch.add_command(id, raft_engine::Command::Clean);
         // A hosted log is always its repository's entry.
-        self.hosted.write().remove(&l.repo);
+        self.hosted.write().remove(&r.repo);
     }
 
-    /// Visit the next logs of the sweep, waking those not settled.
-    fn sweep(&mut self) {
-        for _ in 0..RECONCILE_PER_TICK {
-            let Some(id) = self.to_reconcile.pop_front() else {
-                return;
-            };
-            let Some(l) = self.logs.get(&id) else {
-                continue;
-            };
-            if settled(
-                &l.raw.store().meta.read().conf,
-                &self.members,
-                &self.removed,
-            ) {
-                continue;
-            }
-            match l.raw.raft.leader_id {
-                // (A removed node drops its logs: it leads none.)
-                leader if leader == 0 || self.removed.contains(&leader) => self.wake(id),
-                leader if leader == self.node_id => {}
-                _ => continue, // its leader's own sweep visits it
-            }
-            self.touch(id, true);
-        }
-    }
-
-    /// If this node leads log `id` and its membership is not settled, take
-    /// the next step: add a member as a learner (the leader's announcements
-    /// tell it to host the log), make a caught-up learner a voter, or remove
-    /// a removed node (the leader too: it then drops the log, and the others
-    /// elect a new leader).
-    fn reconcile(&mut self, id: u64) {
-        let Some(l) = self.logs.get_mut(&id) else {
-            return;
-        };
-        let raft = &l.raw.raft;
-        // One change at a time, after an entry in this term (the fix to
-        // single-server changes).
-        if raft.state != StateRole::Leader
-            || raft.has_pending_conf()
-            || !raft.commit_to_current_term()
-        {
-            return;
-        }
-        if settled(
-            &l.raw.store().meta.read().conf,
-            &self.members,
-            &self.removed,
-        ) {
-            return;
-        }
-        let conf = l.raw.store().meta.read().conf.clone();
-        let (want, removed) = (&self.members, &self.removed);
-        let floor = raft
-            .raft_log
-            .committed
-            .saturating_sub(CATCH_UP)
-            .max(raft.pending_conf_index);
-        let caught_up = |n: u64| raft.prs().get(n).is_some_and(|p| p.matched >= floor);
-        let unknown = |n: &&u64| !conf.voters.contains(n) && !conf.learners.contains(n);
-        let change = if let Some(&n) = want.iter().find(unknown) {
-            Some((ConfChangeType::AddLearnerNode, n))
-        } else if let Some(&n) = conf
-            .learners
-            .iter()
-            .find(|&&n| want.contains(&n) && caught_up(n))
-        {
-            Some((ConfChangeType::AddNode, n))
-        } else {
-            conf.learners
-                .iter()
-                .chain(&conf.voters)
-                .find(|&&n| removed.contains(&n))
-                .map(|&n| (ConfChangeType::RemoveNode, n))
-        };
-        let Some((ty, node)) = change else { return };
-        let single = ConfChangeSingle {
-            node_id: node,
-            change_type: ty.into(),
-        };
-        let cc = ConfChangeV2 {
-            changes: vec![single],
-            ..Default::default()
-        };
-        tracing::info!(repo = l.repo, node, change = ?ty, "changing membership");
-        if let Err(e) = l.raw.propose_conf_change(Vec::new(), cc) {
-            tracing::warn!(repo = l.repo, "proposing a membership change: {e:#}");
-            return;
-        }
-        // A new learner hosts the log only from the leader's announcements,
-        // which stop once the log goes quiet.
-        self.touch(id, true);
-    }
-
-    /// Compact a log every `snapshot_every` durably applied entries.
+    /// Compact a log every `snapshot_every` durably applied entries, and a
+    /// repository log as soon as it is quiet: everything in it durably
+    /// applied, and (if this node sequences it) every replica caught up.
+    /// Otherwise most logs, which take a few entries now and then, would
+    /// never compact, and the log store's purges would rewrite them again
+    /// and again.
     fn maybe_snapshot(&mut self, id: u64) {
-        let Some(l) = self.logs.get(&id) else { return };
-        let snap_index = l.raw.store().meta.read().snapshot.get_metadata().index;
-        if l.durable.0 >= snap_index + self.snapshot_every {
+        let (durable, start, quiet) = if id == ROOT {
+            let m = self.root_log.raw.store().meta.read();
+            (
+                self.root_log.durable,
+                m.snapshot.get_metadata().index,
+                false,
+            )
+        } else {
+            let Some(r) = self.repos.get(&id) else { return };
+            let store = r.store();
+            let quiet = r.durable.0 >= Terms::last(store) && r.node.lagging::<Bytes>().is_empty();
+            (r.durable.0, store.start().index, quiet)
+        };
+        if durable >= start + self.snapshot_every || (quiet && durable > start) {
             self.compact(id);
         }
     }
 
     /// Log compaction: drop the entries up to the index the state store has
-    /// durably applied (in the round's batch; and at once in memory: those entries
-    /// are applied, so nothing reads them), but not the entry of the oldest
-    /// inline layer not flushed then, nor any after it.
+    /// durably applied (in the round's batch; and at once in memory: those
+    /// entries are applied, so nothing reads them), but not the entry of the
+    /// oldest inline layer not flushed then, nor any after it.
     fn compact(&mut self, id: u64) {
-        let Some(l) = self.logs.get(&id) else { return };
-        let (durable, pin) = l.durable;
-        let index = pin.map_or(durable, |p| durable.min(p - 1));
-        let store = l.raw.store();
-        let snap = {
-            let m = store.meta.read();
-            if index <= m.snapshot.get_metadata().index {
-                return;
-            }
-            let Some(term) = m.term(index) else { return };
-            m.snapshot_at(index, term)
+        let written = if id == ROOT {
+            self.compact_root().map(|snap| {
+                let index = snap.get_metadata().index;
+                put_snapshot(&mut self.batch, ROOT, &snap);
+                self.batch
+                    .add_command(ROOT, raft_engine::Command::Compact { index: index + 1 });
+            })
+        } else {
+            // (Not before its start is written: that one would replace it.)
+            let start = (self.repos.get_mut(&id))
+                .filter(|r| r.start_due.is_none())
+                .and_then(RepoLog::compact);
+            start.map(|start| {
+                repo::put_start(&mut self.batch, id, &start, start.index)
+                    .unwrap_or_else(|e| fail_stop(&e));
+            })
         };
-        put_snapshot(&mut self.batch, id, &snap);
-        self.batch
-            .add_command(id, raft_engine::Command::Compact { index: index + 1 });
-        store.meta.write().compact(snap);
-        self.stats.compactions += 1;
+        match (written, id == ROOT) {
+            (None, _) => {}
+            (Some(()), true) => self.stats.root_compactions += 1,
+            (Some(()), false) => self.stats.compactions += 1,
+        }
     }
 }
+
+mod root_log;
+
+use root_log::{RootLog, RootPersisted, put_snapshot, recover_root};
 
 #[cfg(test)]
 mod tests;

@@ -8,29 +8,27 @@ one model to the next without data loss.
 | --- | --- | --- |
 | [Single node](#single-node) | One `both` node | Nothing. Writes and reads stop |
 | [One ledger, scale-out compute nodes](#one-ledger-scale-out-compute-nodes) | One `ledger` node, and N `compute` nodes | A compute node |
-| [High availability](#high-availability) | Three or five `ledger` nodes, and N `compute` nodes. Or three `both` nodes | A minority of ledger nodes, and any compute node |
+| [High availability](#high-availability) | Three or more `ledger` nodes, and N `compute` nodes. Or three `both` nodes | One ledger node at a time, and any compute node |
 
-For the roles, see [Hosting](hosting.md#deployment-model). For each key, see
+For the roles, see [Hosting](hosting.md#node-roles). For each key, see
 [Configuration keys](../reference/configuration-keys.md#node).
 
 ## What every model shares
 
 - **An acknowledged write is on the ledger disk.** Enroute acknowledges a push
   or an API commit after the ledger writes it to the log and syncs the disk.
-  In the replicated models, a majority of ledger nodes do this.
-- **Checkpoints go to the bucket.** A ledger node writes a checkpoint of each
-  changed repository to `bucket` within a minute. Large layers go to `bucket`
-  before Enroute acknowledges the write.
-- **Losing the ledger disks needs manual recovery.** If you lose the disk of
-  the only ledger node, or the disks of a majority of ledger nodes, recovery is
-  manual, from the last checkpoint in `bucket`. Up to about a minute of
-  acknowledged writes is lost. There is no tool for this recovery yet. See
+  In the replicated models, a majority of the repository's replicas do this.
+- **Large layers go to the bucket** before Enroute acknowledges the write. Small
+  ones follow in the background.
+- **Volume snapshots are the last resort.** A ledger node that restarts keeps
+  every acknowledged write on its disk. Only when the single ledger node, or
+  two of a repository's three ledger nodes, lose their disks do you restore
+  from volume snapshots, and lose the writes after them. See
   [Maintenance](maintenance.md#recover-from-losing-a-majority).
 - **Compute disks hold only caches.** A compute node that loses its disk rebuilds
   its caches from the ledger and `bucket`.
-- **The ledger scales up, not out.** Every ledger node holds every repository
-  and applies every write. More ledger nodes add fault tolerance, not
-  capacity. The sync time of the disk is the commit time, so give ledger nodes
+- **The ledger scales out.** Each repository is on three ledger nodes, which
+  apply its writes. More ledger nodes hold more repositories. The sync time of the disk is the commit time, so give ledger nodes
   fast disks with low sync latency, such as local NVMe or provisioned-IOPS
   volumes.
 - **Compute nodes scale out.** Compute nodes do the CPU work: they receive and
@@ -56,8 +54,8 @@ uri = "s3://enroute-objects/prod"
 data_dir = "/var/lib/enroute"
 ```
 
-The node needs no `advertise_url`. Without it, the node is the only voter of
-its logs, and it uses no registry.
+The node needs no `advertise_url`. Without it, the node is the only replica of
+its logs, and it is in no cluster.
 
 On a machine with no object store, such as a VPS, use a
 [local directory](storage-backends.md#local-directory) as the bucket:
@@ -72,9 +70,9 @@ data_dir = "/var/lib/enroute/data"
 
 **Durability.** An acknowledged write is on the node disk. If the process
 stops or the machine restarts, the node starts again on the same disk with
-every acknowledged write. If the disk is lost, recovery is manual, from the
-last checkpoint. With a `file://` bucket on the same disk, the checkpoints are
-lost too, so make backups of the disk.
+every acknowledged write. If the disk is lost, you restore it from a backup
+or volume snapshot, and lose the writes after it. With a `file://` bucket on
+the same disk, the layer files are lost too, so back up the whole disk.
 
 **Availability.** While the node is down, Git and the API are not available.
 
@@ -87,8 +85,10 @@ the file in the bucket. The layers then use disk space one time, not two.
 
 **Move to the next model.** See
 [From a single node](#from-a-single-node-to-one-ledger). The next models put
-nodes on more than one machine, so they need an object store as the bucket.
-There is no procedure yet to move a `file://` bucket to an object store.
+nodes on more than one machine, so they need an object store as the bucket. To
+move from a `file://` bucket to an object store,
+[migrate](upgrades.md#migrate-to-a-new-deployment) the repositories to a new
+deployment.
 
 ## One ledger, scale-out compute nodes
 
@@ -123,11 +123,12 @@ data_dir = "/var/lib/enroute"
 ```
 
 Put the `[hooks]`, `[listen]`, and `[git]` tables of your application on each
-compute node. A compute node finds the ledger node through `bucket`. Other nodes
+compute node. A compute node finds the ledger node in the bucket. Other nodes
 never connect to a compute node, so a compute node needs no `advertise_url`.
 
 **Durability.** An acknowledged write is on the ledger node disk. If the
-ledger disk is lost, recovery is manual, from the last checkpoint.
+ledger disk is lost, you restore it from a volume snapshot, and lose the writes
+after it.
 
 **Availability.**
 
@@ -147,13 +148,14 @@ memory, and a faster disk.
 
 ## High availability
 
-Three or five ledger nodes replicate every log with Raft. A write commits when
-a majority of ledger nodes has it on disk.
+Each repository's log has three replicas among the ledger nodes (all of
+them with three ledger nodes). A write commits when a majority of the log's
+replicas has it on disk.
 
 **Use it when** writes must continue when one ledger node, or its disk, is
 lost.
 
-Each ledger node has its own `advertise_url`:
+Each ledger node has its own `advertise_url`, and the `zone` it runs in:
 
 ```toml
 [bucket]
@@ -164,6 +166,7 @@ role = "ledger"
 data_dir = "/var/lib/enroute"
 internal_listen = "0.0.0.0:7400"
 advertise_url = "http://ledger-1.internal:7400"
+zone = "eu-central-1a"
 ```
 
 Compute nodes use the same configuration as in the previous model.
@@ -172,28 +175,47 @@ For a smaller deployment, run three `both` nodes behind the load balancer.
 Each one uses the ledger node configuration without `role`, with your
 application tables added.
 
-**Durability.** An acknowledged write is on the disks of a majority of ledger
-nodes. If you lose the disks of a majority, recovery is manual, from the last
-checkpoint.
+**Durability.** An acknowledged write is on the disks of at least two of the
+repository's three ledger nodes, so it survives the permanent loss of any one
+ledger node. After you remove a lost node, each of its logs gets a new replica
+and tolerates another loss. See
+[Maintenance](maintenance.md#recover-from-losing-a-majority) for the case of
+two lost disks at once.
 
-**Availability.**
+**Availability.** Writes to every repository continue while one ledger node is
+down. Each repository's log is on three ledger nodes, and a write needs two of
+them. If a second node goes down before the first comes back or is removed,
+the repositories whose logs are on both nodes stop taking writes until one of
+the two returns. Other repositories continue.
 
-| Ledger nodes | Writes continue while this many are down |
-| --- | --- |
-| 3 | 1 |
-| 5 | 2 |
+Creating and deleting repositories, failing a log over to another node, and
+moving a log to new nodes need a majority of all ledger nodes, because the
+ledger's directory is on every ledger node. With five ledger nodes, these
+continue while two are down. An even number of ledger nodes adds no fault
+tolerance to the directory: four nodes also continue with only one down.
 
 A node that stops and starts again on its disk catches up by itself. A node
-that loses its disk comes back as a new node. Start the new node, then remove
-the old one with `enroute members --remove`. Until you remove it, the old node
-counts against the majority. See [Maintenance](maintenance.md).
+that loses its disk comes back as a new node, and the old one counts against
+the majority of its logs until you remove it. See
+[Replace a node that lost its disk](maintenance.md#replace-a-node-that-lost-its-disk).
 
-An even number of ledger nodes adds no fault tolerance: four nodes also
-continue with only one down.
+**Scaling.** Add compute nodes for more traffic, and ledger nodes for more
+repositories. Give ledger nodes fast disks with low sync latency.
 
-**Scaling.** Add compute nodes for more traffic. Give every ledger node more
-CPU, memory, and a faster disk. Put the ledger nodes in different failure
-domains, such as availability zones.
+### Spread ledger nodes over zones
+
+Run the ledger nodes in at least three failure domains, such as availability
+zones, and set `node.zone` on each ledger node. Each repository's log then
+puts its three replicas in three different zones, so a write needs nodes in
+two zones, and the loss of one zone stops no repository. With five ledger
+nodes in three zones, the directory also continues without one zone, because
+no zone holds a majority of the nodes.
+
+Enroute places a new log in distinct zones first, and then on the nodes that
+hold the fewest logs. If a log was placed while a zone was down, so that two
+of its replicas share a zone, the ledger moves one of them when a node in a
+missing zone is up, one log at a time. Without `node.zone`, or with fewer
+zones than replicas, placement goes by load alone.
 
 ## Move between models
 
@@ -207,7 +229,7 @@ acknowledged write. The test suite runs each of them.
    `role = "ledger"`, `internal_listen`, and `advertise_url`. Keep `data_dir`
    and `bucket`.
 3. Start the node. It registers in `bucket` as the only ledger member, and it
-   stays the only voter of every repository's log. `enroute members` lists its
+   stays the only replica of every repository's log. `enroute members` lists its
    ID.
 4. Start the compute nodes with the same `bucket`, and send Git and API traffic
    to them.
@@ -224,17 +246,16 @@ You cannot move back. After the node has an `advertise_url`, do not remove it.
    `advertise_url` and an empty `data_dir`.
 2. Each new node adds itself to the ledger members. `enroute members` lists
    three IDs.
-3. Each repository's log adds the new nodes, one at a time: first as learners,
-   then as voters when they have caught up. Logs that nobody writes change too,
-   at about 100 logs a second.
+3. Each repository's log grows onto the new nodes, one at a time: its
+   sequencer catches the new replica up, and the change ends once the new
+   replicas hold its new term. Logs that nobody writes change too.
 
 The compute nodes need no change.
 
 Wait until the move is complete before you rely on it. Enroute has no command
-that shows the voters of each log yet. To see progress, compare
+that shows the replicas of each log yet. To see progress, compare
 `consensus.repos` in `GET /status` of each new node with the count on the
-first node. A node hosts a log as a learner first, so equal counts do not prove
-that it is a voter. A learner becomes a voter soon after it catches up.
+first node, and check that `consensus.engine.lagging_logs` is 0.
 
 After the move, the first ledger node is an ordinary member. Writes continue
 if it stops.

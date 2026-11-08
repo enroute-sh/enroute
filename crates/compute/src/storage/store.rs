@@ -18,7 +18,7 @@
 //! file not on local disk is served by range from the object store while a
 //! local copy is fetched in the background.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 
@@ -37,7 +37,7 @@ use super::key::FileKey;
 use super::layer::{Layer, LayerBuilder, Written};
 use super::local::LocalCopies;
 use super::pool::{BufferPool, PagedFile};
-use super::tiered::{RangeFetch, StoreFetch};
+use super::tiered::{RangeFetch, StoreFetch, TieredSource};
 
 /// A fresh layer id of upload generation `generation`: 128 random bits,
 /// then the generation.
@@ -180,10 +180,12 @@ impl OpenLayers {
 const EVICT_DELAY: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Lets the local copy of a stored layer go when the layer closes: after
-/// [`EVICT_DELAY`], unless the layer is open again by then.
+/// [`EVICT_DELAY`], unless the layer is open again by then. Its source
+/// stays open meanwhile, so that a reopen finds the chunks it loaded.
 pub(super) struct Release {
     storage: Weak<Storage>,
     key: FileKey,
+    source: Option<Arc<TieredSource>>,
 }
 
 impl Drop for Release {
@@ -192,9 +194,10 @@ impl Drop for Release {
         let Ok(rt) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        let (storage, key) = (self.storage.clone(), self.key.clone());
+        let (storage, key, source) = (self.storage.clone(), self.key.clone(), self.source.take());
         rt.spawn(async move {
             tokio::time::sleep(EVICT_DELAY).await;
+            drop(source);
             // A storage that was closed meanwhile no longer owns the copy.
             if let Some(storage) = storage.upgrade() {
                 storage.remove_local(&key).await;
@@ -222,7 +225,8 @@ impl StoreStats {
 }
 
 impl Storage {
-    /// `dir`: the local copies (and the catalog). `disk_budget`: bound the
+    /// `dir`: the local copies, emptied first: local disk never outlives
+    /// the process that filled it. `disk_budget`: bound the
     /// local disk they use to this many bytes: chunks are loaded as they
     /// are read and evicted under pressure (see
     /// [`DiskCache`](super::tiered::DiskCache)). 0:
@@ -233,8 +237,8 @@ impl Storage {
     ///
     /// # Errors
     ///
-    /// Returns an error if a directory under `dir` or the catalog cannot be
-    /// created or read, or if the system's open-file limit is too low.
+    /// Returns an error if a directory under `dir` cannot be created or
+    /// read, or if the system's open-file limit is too low.
     pub fn new(
         objects: Arc<Objects>,
         dir: PathBuf,
@@ -242,10 +246,7 @@ impl Storage {
         disk_budget: u64,
         max_open_files: Option<usize>,
     ) -> Result<Self> {
-        // Scratch never outlives the process that made it.
-        // A missing directory is the normal case.
-        drop(std::fs::remove_dir_all(dir.join("tmp")));
-        std::fs::create_dir_all(dir.join("tmp"))?;
+        wipe(&dir)?;
         let limits = super::handles::resolve(max_open_files)?;
         let scratch = ScratchBudget::new(limits.scratch);
         let local = LocalCopies::new(
@@ -429,20 +430,6 @@ impl Storage {
         Ok(ids)
     }
 
-    /// The layers `repo`'s state object names (a checkpoint of the log,
-    /// and what an operator recovers from).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the state object cannot be read.
-    pub async fn checkpointed_layers(&self, repo: &str) -> Result<HashSet<String>> {
-        let Some((state, _)) = enroute_shared::repo_state::latest(&self.objects, repo).await?
-        else {
-            return Ok(HashSet::new());
-        };
-        Ok(state.meta().layers.into_iter().map(|l| l.id).collect())
-    }
-
     /// Open stored layer `m`.
     pub(crate) async fn open_layer(
         self: &Arc<Self>,
@@ -471,29 +458,12 @@ impl Storage {
     }
 
     async fn load_layer(self: &Arc<Self>, key: &FileKey, m: &LayerMeta) -> Result<Arc<Layer>> {
-        let trusted = self.local.trusted(key);
-        let open = async || {
-            let file = self.open_file(key, m.bytes).await?;
-            Layer::open(key.id.clone(), file, m.meta_bytes).await
-        };
-        let mut layer = match open().await {
-            // A local copy found after a restart whose metadata is damaged
-            // (its chunks are checked as they are read): start over from the
-            // object store.
-            Err(e) if !trusted => {
-                tracing::warn!(
-                    repo = key.repo,
-                    id = key.id,
-                    "local copy invalid; discarding: {e:#}"
-                );
-                self.local.remove(key).await;
-                open().await?
-            }
-            r => r?,
-        };
+        let file = self.open_file(key, m.bytes).await?;
+        let mut layer = Layer::open(key.id.clone(), file, m.meta_bytes).await?;
         layer.release = Some(Release {
             storage: Arc::downgrade(self),
             key: key.clone(),
+            source: self.local.source(key),
         });
         let layer = Arc::new(layer);
         self.layers.lock().insert(key.clone(), &layer);
@@ -522,18 +492,6 @@ impl Storage {
             .await
             .with_context(|| format!("inline layer {id}"))?;
         Ok(Arc::new(layer))
-    }
-
-    /// Remove local copies of layers that `referenced(repo, id)` says no
-    /// manifest uses any more (for example, retired before a restart),
-    /// except recent ones (a push may be about to reference them).
-    pub(crate) async fn sweep_local_layers(
-        &self,
-        referenced: impl Fn(&str, &str) -> bool,
-    ) -> usize {
-        self.local
-            .sweep(|key| referenced(&key.repo, &key.id) || self.is_open(key))
-            .await
     }
 
     fn is_open(&self, key: &FileKey) -> bool {
@@ -589,9 +547,10 @@ impl Storage {
     }
 
     /// A writer that uploads `key`: a plain put below its capacity, a
-    /// multipart upload above it.
+    /// multipart upload above it. In the caller's IO class, as
+    /// [`Self::stream_layer`] drives it from a blocking thread.
     fn multipart(&self, key: &FileKey) -> BufWriter {
-        BufWriter::with_capacity(self.objects.inner().clone(), key.store_path(), 16 << 20)
+        BufWriter::with_capacity(self.objects.in_current_class(), key.store_path(), 16 << 20)
             .with_max_concurrency(4)
     }
 
@@ -626,19 +585,64 @@ impl Storage {
     }
 }
 
+/// Names under the local directory that are being deleted.
+const WIPED: &str = "wiped-";
+
+/// Empty the local directory `dir` of what an earlier process left: its
+/// scratch and its local copies.
+///
+/// Local disk is a cache that lives as long as the process that fills it,
+/// so every start is a fresh disk and nothing on it needs checking. The
+/// old directories are moved aside at once and deleted in the background,
+/// so a large cache does not hold up the start.
+fn wipe(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    for name in ["tmp", "layers"] {
+        let aside = dir.join(format!("{WIPED}{}", rand::random::<u64>()));
+        match std::fs::rename(dir.join(name), &aside) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(e)
+                    .with_context(|| format!("moving {} aside", dir.join(name).display()));
+            }
+            _ => {}
+        }
+    }
+    std::fs::create_dir_all(dir.join("tmp"))?;
+    let wiped: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(WIPED))
+        .map(|e| e.path())
+        .collect();
+    if !wiped.is_empty() {
+        std::thread::Builder::new()
+            .name("wipe-local".into())
+            .spawn(move || delete_all(&wiped))?;
+    }
+    Ok(())
+}
+
+/// Delete the directories `paths`, logging what fails.
+fn delete_all(paths: &[PathBuf]) {
+    for path in paths {
+        if let Err(e) = std::fs::remove_dir_all(path) {
+            tracing::warn!(path = %path.display(), "deleting old local files: {e}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git::oid::{Kind, Oid, hash_object};
+    use crate::git::oid::{Kind, ObjectFormat, Oid, hash_object};
     use crate::git::pack::full_entry;
     use crate::storage::LayerBuilder;
     use crate::storage::layer::tests::blob;
     use enroute_shared::store::Store;
 
-    /// An inline layer opens from its bytes, with no local copy for the
-    /// catalog to record (the log has them); a published layer is recorded.
+    /// An inline layer opens from its bytes, with no local copy (the log
+    /// has them); a published layer has one.
     #[tokio::test]
-    async fn inline_layers_stay_out_of_the_catalog() {
+    async fn inline_layers_have_no_local_copy() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::for_test(dir.path());
         let (sealed, oid) = one_object(&storage, b"inline\n");
@@ -650,7 +654,7 @@ mod tests {
             .unwrap();
         assert_eq!(l.find(&oid), Some(0));
         assert!(
-            storage.local.catalog.keys().is_empty(),
+            storage.local.written.lock().is_empty(),
             "an inline layer was recorded"
         );
 
@@ -661,12 +665,63 @@ mod tests {
         assert_eq!(
             storage
                 .local
-                .catalog
-                .keys()
+                .written
+                .lock()
                 .iter()
                 .map(|k| k.id.as_str())
                 .collect::<Vec<_>>(),
             vec![id.as_str()]
+        );
+    }
+
+    /// A layer closed and opened again within the release delay reuses
+    /// its open local copy, with the chunks it already has.
+    #[tokio::test]
+    async fn a_reopened_layer_reuses_its_local_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::for_test(dir.path());
+        let (sealed, oid) = one_object(&storage, b"reopened\n");
+        let meta = sealed.meta(1, 0);
+        storage.publish_layer("r", &meta.id, sealed).await.unwrap();
+        let key = FileKey::new("r", &meta.id);
+        let layer = storage.open_layer("r", &meta).await.unwrap();
+        let source = storage.local.source(&key).unwrap();
+        drop(layer);
+        let layer = storage.open_layer("r", &meta).await.unwrap();
+        assert_eq!(layer.find(&oid), Some(0));
+        assert!(Arc::ptr_eq(&storage.local.source(&key).unwrap(), &source));
+    }
+
+    /// Opening the storage empties its local directory: what an earlier
+    /// process left there is gone once the background deletion ends.
+    #[test]
+    fn opening_wipes_the_local_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("layers/r/a.layer");
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        std::fs::write(&old, b"old").unwrap();
+        std::fs::create_dir_all(dir.path().join("tmp")).unwrap();
+        std::fs::write(dir.path().join("tmp/junk"), b"x").unwrap();
+        wipe(dir.path()).unwrap();
+        assert!(!old.exists());
+        assert!(dir.path().join("tmp").is_dir());
+        let left = || {
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        for _ in 0..100 {
+            if left() == ["tmp"] {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(left(), ["tmp"]);
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("tmp")).unwrap().count(),
+            0
         );
     }
 
@@ -727,7 +782,7 @@ mod tests {
 
     /// A one-object layer of `data`, and the object's id.
     fn one_object(storage: &Storage, data: &[u8]) -> (Sealed, Oid) {
-        let mut b = LayerBuilder::new(&storage.workspace());
+        let mut b = LayerBuilder::new(&storage.workspace(), ObjectFormat::Sha1);
         let oid = hash_object(Kind::Blob, data);
         b.add(blob(oid, &full_entry(Kind::Blob, data), None))
             .unwrap();
@@ -751,7 +806,7 @@ mod tests {
     /// On a local store, a local copy is a hard link to the stored file,
     /// made on publish and on open, and kept out of the disk budget.
     ///
-    /// Releasing, sweeping and deleting remove the names they removed
+    /// Releasing and deleting remove the names they removed
     /// before: the stored file stays until the layer is deleted.
     #[tokio::test]
     async fn local_copies_link_to_a_local_store() {
@@ -777,15 +832,6 @@ mod tests {
         drop(storage.open_layer("r", &meta).await.unwrap());
         assert_eq!(inode(&local), inode(&stored));
 
-        // Old enough to sweep: the link shares the stored file's times.
-        let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
-        std::fs::File::open(&stored)
-            .unwrap()
-            .set_modified(hour_ago)
-            .unwrap();
-        assert_eq!(storage.sweep_local_layers(|_, _| false).await, 1);
-        assert!(!local.exists() && stored.exists());
-
         drop(storage.open_layer("r", &meta).await.unwrap());
         storage
             .delete_layers("r", std::slice::from_ref(&id))
@@ -794,8 +840,7 @@ mod tests {
         assert!(!local.exists() && !stored.exists());
     }
 
-    /// A link that fails, as across filesystems, falls back to a copy, and
-    /// a node whose links fail does not open an old link for writing.
+    /// A link that fails, as across filesystems, falls back to a copy.
     #[tokio::test]
     async fn a_failed_link_falls_back_to_a_copy() {
         let dir = tempfile::tempdir().unwrap();
@@ -821,29 +866,5 @@ mod tests {
         let layer = storage.open_layer("r", &meta).await.unwrap();
         assert_eq!(layer.find(&oid), Some(0));
         assert_eq!(links(&storage), 0);
-        drop((layer, storage));
-
-        // Linked by one run, then opened by a run whose links fail.
-        let dir = tempfile::tempdir().unwrap();
-        let storage = local_storage(dir.path(), 1 << 20, |a, b| std::fs::hard_link(a, b));
-        let (sealed, oid) = one_object(&storage, b"linked before\n");
-        let meta = sealed.meta(1, 0);
-        let id = meta.id.clone();
-        storage.publish_layer("r", &id, sealed).await.unwrap();
-        drop(storage);
-        let storage = local_storage(dir.path(), 1 << 20, |_, _| {
-            Err(std::io::ErrorKind::PermissionDenied.into())
-        });
-        let layer = storage.open_layer("r", &meta).await.unwrap();
-        assert_eq!(layer.find(&oid), Some(0));
-        let (local, stored) = both(&storage, dir.path(), &FileKey::new("r", &id));
-        assert_eq!(inode(&local), inode(&stored));
-        assert_eq!(storage.status()["disk_cache"]["used"], 0);
-        assert!(
-            storage
-                .local
-                .linking
-                .load(std::sync::atomic::Ordering::Relaxed)
-        );
     }
 }

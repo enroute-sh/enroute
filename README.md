@@ -13,7 +13,7 @@ Enroute we're asking the question: What would a Git server look like if we
 built it like a modern database? Our answer:
 
 1. **Fast.** Over 7,500 pushes per second to a single repository, with every
-   push on the disks of a majority of ledger nodes before Enroute acknowledges
+   push on the disks of a majority of its ledger replicas before Enroute acknowledges
    it.
 2. **Programmable.** Enroute terminates Git client connections and provides a
    gRPC API. Hooks let your code decide who can read, what they see, and which
@@ -43,8 +43,8 @@ and rebuilt it from the ground up in Rust. At its core is a
   Azure Blob Storage. The object store gives cheap, durable storage that grows
   with your data.
 - **A replicated log for each repository.** Ledger nodes keep the refs and
-  the layer list of each repository in its own Raft log, on a durable local
-  disk. A small push commits once its log entry is on the ledger disks,
+  the layer list of each repository in its own replicated log, on the durable
+  local disks of three ledger nodes. A small push commits once its log entry is on the ledger disks,
   without waiting for the object store.
 - **Readers work on snapshots.** A clone or fetch reads one immutable version
   of the repository from start to end. Readers never block writers.
@@ -95,7 +95,7 @@ To run it in a container instead, use the published image:
 
 ```sh
 docker run --rm -p 8080:8080 -p 50051:50051 -v enroute-dev:/data \
-  ghcr.io/enroute-sh/enroute:0.3.0 dev --dir /data --host 0.0.0.0
+  ghcr.io/enroute-sh/enroute:0.4.0 dev --dir /data --host 0.0.0.0
 ```
 
 To build an application on Enroute with a coding agent, add our agent skills:
@@ -116,12 +116,14 @@ section of the configuration changes:
    an object store.
 2. **Separate compute nodes** behind a load balancer when you need more
    capacity for Git and API traffic.
-3. **Three or five ledger nodes** with Raft when writes must continue after
-   the loss of a machine or an availability zone.
+3. **Three or more ledger nodes** when writes must continue after the loss of
+   a machine or an availability zone. Each repository's log is replicated to
+   three of them.
 
-You can move a deployment from one step to the next without data loss.
-The step from a local directory to an object store is not supported yet. See
-[Deployment profiles](docs/operate/deployment-profiles.md).
+You can move a deployment from one step to the next without data loss. To move
+from a local directory to an object store, copy the repositories to a new
+deployment. See [Deployment profiles](docs/operate/deployment-profiles.md) and
+[Upgrades and migrations](docs/operate/upgrades.md).
 
 ## What's currently supported?
 
@@ -149,7 +151,7 @@ interact with any repository. See the [API reference](docs/reference/proto.md).
 
 In the near future, our focus is on increasing the reliability and performance
 of Enroute. This includes benchmarks against other Git servers, and moving a
-single machine from a local directory to an object store.
+single machine from a local directory to an object store in place.
 
 In addition, we are planning the following features:
 
@@ -168,13 +170,13 @@ In addition, we are planning the following features:
   chapter by chapter, from an empty project to code and diffs on a page.
 - [Hook reference](docs/reference/hooks.md) — every field of every hook, with
   the payload of each call.
-- [Concepts](docs/README.md#concepts) — the model, the clients and interfaces, the hooks
+- [Concepts](docs/concepts/README.md) — the model, the clients and interfaces, the hooks
   and the storage, in four short pages.
-- [Operate a deployment](docs/README.md#operating-enroute) — configuration,
-  storage, security, maintenance and telemetry.
+- [Operate a deployment](docs/operate/README.md) — configuration,
+  storage, security, maintenance, telemetry and upgrades.
 - [Limitations](docs/reference/limitations.md) — what does not work yet, stated
   plainly.
-- [Architecture](docs/README.md#architecture) — how Enroute stores,
+- [Architecture](docs/internals/README.md) — how Enroute stores,
   replicates and serves repositories, and how it is tested.
 
 ## What's the status?
@@ -183,8 +185,10 @@ Enroute is **early**. We use it ourselves, but read
 [limitations](docs/reference/limitations.md) and
 [security](docs/operate/security.md) before you serve anything you care about.
 
-**There is no backwards compatibility between `0.x` releases.** Especially the
-storage format can change in any release, requiring a clean slate and re-push.
+**Until 1.0, any `0.x` release can change the storage format, the configuration
+and the API.** When the storage format changes, you move your repositories to a
+new deployment rather than push them again. See
+[Upgrades and migrations](docs/operate/upgrades.md).
 
 ## How can I contribute?
 

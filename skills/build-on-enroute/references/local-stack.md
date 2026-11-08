@@ -78,7 +78,7 @@ Every release is pushed to the GitHub Container Registry as
 | Tag            | What it names                                  |
 | -------------- | ---------------------------------------------- |
 | `latest`       | The current release. Moves with each one.      |
-| `<version>`    | One release, for example `0.3.0`. Not rebuilt. |
+| `<version>`    | One release, for example `0.4.0`. Not rebuilt. |
 | `sha-<commit>` | One commit. The tag that is never reused.      |
 
 The image is a manifest list for `linux/amd64` and `linux/arm64`, so it runs
@@ -124,7 +124,7 @@ is the host machine as a container sees it:
 docker run --rm -d --name enroute \
   -p 8080:8080 -p 50051:50051 -v enroute-dev:/data \
   --add-host=host.docker.internal:host-gateway \
-  ghcr.io/enroute-sh/enroute:0.3.0 dev --dir /data --host 0.0.0.0 \
+  ghcr.io/enroute-sh/enroute:0.4.0 dev --dir /data --host 0.0.0.0 \
   --hooks http://host.docker.internal:3000/api/enroute/hooks
 ```
 
@@ -140,9 +140,9 @@ docker run --rm -d --name enroute \
 - `-d` runs it in the background. `--rm` deletes the container when it stops,
   but not the volume.
 
-Release `0.3.0` changed the storage format and has no migration. A volume that
-an earlier release wrote is of no use, so remove it before the first start:
-`docker volume rm enroute-dev`.
+A release can change the storage format, and then it cannot read a volume that
+an earlier release wrote. A local volume holds only test data, so remove it
+when you move to a new release: `docker volume rm enroute-dev`.
 
 The endpoint does not have to answer yet. Enroute calls it when a Git request
 arrives, and not before. Git does not serve until that endpoint answers. Until
@@ -209,7 +209,7 @@ key. The next start makes a new key.
 ### Logs
 
 ```sh
-docker logs -f enroute   # the node, and every call it makes
+docker logs -f enroute   # the node; RUST_LOG=debug adds every call
 ```
 
 Add `-e RUST_LOG=debug` to `docker run` to raise the level.

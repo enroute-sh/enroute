@@ -11,7 +11,11 @@ use common::{Git, Server, api, commit, delete, expecting, put, put_as};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn server_side_commits_interoperate_with_git() {
-    let server = Server::start_with(|c| c.compute.merge_factor = 4).await;
+    let server = Server::start_with(|c| {
+        c.compute.merge_factor = 4;
+        c.compute.flush_interval = std::time::Duration::from_millis(200);
+    })
+    .await;
     let git = Git::new();
     let mut c = server.api_client();
     c.create_repo("api").await.unwrap();
@@ -58,6 +62,15 @@ async fn server_side_commits_interoperate_with_git() {
         .await
         .unwrap_err();
     assert_eq!(e.code(), tonic::Code::InvalidArgument, "{e}");
+    // A name longer than git's fsck takes, which a push of the same tree
+    // would also be refused for.
+    let name = "n".repeat(5000);
+    let e = c
+        .create_commit(commit("api", "main", "long", vec![put(&name, "a")]))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), tonic::Code::InvalidArgument, "{e}");
+    assert!(e.message().contains("excessively large pathname"), "{e}");
 
     let url = server.repo_url("api");
     let dst = git.dir("dst");

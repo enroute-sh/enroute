@@ -5,11 +5,15 @@ use tonic::{Code, Request, Response, Status};
 
 use enroute_api::api::v1alpha1::sync_service_server::SyncService;
 use enroute_api::api::v1alpha1::{
-    PushToRemoteRequest, PushToRemoteResponse, RefPushOutcome, RefSpec as WireRefSpec,
-    Remote as WireRemote, ref_push_outcome::Status as WirePushStatus, remote::Credentials,
+    FetchFromRemoteRequest, FetchFromRemoteResponse, PushToRemoteRequest, PushToRemoteResponse,
+    RefFetchOutcome, RefPushOutcome, RefSpec as WireRefSpec, Remote as WireRemote,
+    ref_fetch_outcome::Status as WireFetchStatus, ref_push_outcome::Status as WirePushStatus,
+    remote::Credentials,
 };
 
 use crate::contract::wire::wire_oid_or_unset;
+use crate::protocol::receive_pack::PushCommand;
+use crate::push::Refusal;
 use crate::remote::{self, Error};
 
 use super::Api;
@@ -28,9 +32,63 @@ impl SyncService for Api {
             .remotes
             .push(&snap, &push)
             .await
-            .map_err(|error| push_failed(&error))?;
+            .map_err(|error| sync_failed(&error))?;
         Ok(Response::new(PushToRemoteResponse {
             outcomes: outcomes.iter().map(to_wire_push_outcome).collect(),
+        }))
+    }
+
+    #[tracing::instrument(name = "enroute::grpc::fetch_from_remote", skip(self, request))]
+    async fn fetch_from_remote(
+        &self,
+        request: Request<FetchFromRemoteRequest>,
+    ) -> Result<Response<FetchFromRemoteResponse>, Status> {
+        let request = request.into_inner();
+        let (key, snap) = self.snapshot(request.repo.as_ref()).await?;
+        let fetch = remote::FetchRequest {
+            remote: parse_remote(
+                request
+                    .remote
+                    .ok_or_else(|| Status::invalid_argument("no remote given"))?,
+            ),
+            prefixes: request.prefixes,
+        };
+        let remote::Fetched {
+            changes,
+            pack,
+            failure,
+        } = self
+            .remotes
+            .fetch(&snap, &fetch)
+            .await
+            .map_err(|error| sync_failed(&error))?;
+        if changes.is_empty() {
+            return Ok(Response::new(FetchFromRemoteResponse::default()));
+        }
+
+        let landed = self
+            .compute
+            .land_commands(key.as_str(), snap.format(), changes, false, pack)
+            .await;
+        // A pack cut off by the remote fails the landing too; the remote's
+        // error is the one the caller can act on.
+        if let Some(error) = failure.take() {
+            return Err(sync_failed(&error));
+        }
+        let landed = match landed {
+            Ok(Ok(landed)) => landed,
+            Ok(Err(why)) => {
+                return Err(Status::aborted(format!(
+                    "this repository refused the remote's pack: {why}"
+                )));
+            }
+            Err(error) => return Err(super::internal(&error)),
+        };
+        Ok(Response::new(FetchFromRemoteResponse {
+            outcomes: landed
+                .into_iter()
+                .map(|(change, refusal)| to_wire_fetch_outcome(change, refusal))
+                .collect(),
         }))
     }
 }
@@ -89,11 +147,27 @@ fn to_wire_push_outcome(outcome: &remote::RefOutcome) -> RefPushOutcome {
     }
 }
 
-/// A push that never got as far as an outcome.
+/// One ref's outcome here.
+fn to_wire_fetch_outcome(change: PushCommand, refusal: Option<Refusal>) -> RefFetchOutcome {
+    let (status, message) = match refusal {
+        Some(why) => (WireFetchStatus::Rejected, why.text().to_string()),
+        None if change.new.is_zero() => (WireFetchStatus::Deleted, String::new()),
+        None => (WireFetchStatus::Updated, String::new()),
+    };
+    RefFetchOutcome {
+        name: change.name,
+        old_object_id: wire_oid_or_unset(change.old),
+        new_object_id: wire_oid_or_unset(change.new),
+        status: status.into(),
+        message,
+    }
+}
+
+/// A push or a fetch that never got as far as an outcome.
 ///
 /// The remote's own words reach the caller, who holds the relationship with
 /// it — unlike a storage failure, which [`super::internal`] keeps.
-fn push_failed(error: &Error) -> Status {
+fn sync_failed(error: &Error) -> Status {
     let code = match error {
         Error::Request(_) => Code::InvalidArgument,
         Error::Remote(_) | Error::Protocol(_) | Error::Unsupported(_) => Code::FailedPrecondition,
@@ -104,7 +178,7 @@ fn push_failed(error: &Error) -> Status {
         Error::ReportUnread(_) => Code::Unknown,
         Error::Transport(_) => Code::Unavailable,
         Error::Storage(_) => {
-            tracing::error!(%error, "push to remote failed");
+            tracing::error!(%error, "sync with a remote failed");
             return Status::internal("internal error");
         }
     };

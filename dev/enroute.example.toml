@@ -33,13 +33,17 @@ uri = "s3://enroute-objects/prefix"
 data_dir = "/var/lib/enroute/node"
 # "both" runs the ledger and serves git and the contract. "ledger" runs only
 # the ledger, and needs `advertise_url`. "compute" serves only git and the
-# contract, and finds the ledger through `bucket`.
+# contract, and finds the ledger's members in the bucket.
 role = "both"
 # Every node serves `GET /status` on `internal_listen`. Keep that port inside
 # the cluster. Set `advertise_url` to replicate the ledger across nodes: other
 # nodes dial it, and it reaches `internal_listen`. Leave it out for one node.
 # internal_listen = "0.0.0.0:7400"
 # advertise_url = "http://enroute-0.internal:7400"
+# On a ledger node, the failure domain it runs in, such as an availability
+# zone. Each repository's log keeps its replicas in distinct zones where the
+# members allow it. Leave it out for no zone.
+# zone = "eu-central-1a"
 #
 # The rest of this table, and all of `[layers]` and `[ledger]`, tune the
 # engine. Each key shows its default unless its comment says otherwise. Leave
@@ -64,6 +68,16 @@ role = "both"
 # Drop a repository's view once it is unused this long.
 # evict_after = "15m"
 
+# Concurrent requests to `bucket`, shared by kinds of work. A kind can always
+# use its `reserve`, never more than its `limit`, and shares the rest by
+# `weight`. The commit reserve keeps pushes on time under load, and the
+# background limit keeps compaction and hydration from crowding out pushes.
+# [store_io]
+# slots = 256
+# commit = { reserve = 16, limit = 128, weight = 4 }
+# foreground = { reserve = 8, limit = 128, weight = 2 }
+# background = { reserve = 4, limit = 128, weight = 1 }
+
 # How a compute writes, merges and deletes layers. A small push travels in the
 # log as an inline layer, and is flushed to `bucket` later.
 # [layers]
@@ -74,7 +88,7 @@ role = "both"
 # Inline layers a repository holds before a push uploads first.
 # max_inline = "64 MiB"
 # Flush inline layers once the oldest is this old...
-# flush_interval = "1s"
+# flush_interval = "30s"
 # ...or once there are this many.
 # flush_max_layers = 256
 # How often the sweep runs on each repository, and how long it keeps a layer
@@ -84,11 +98,15 @@ role = "both"
 
 # On a node that runs the ledger.
 # [ledger]
-# Checkpoint a changed repository's state to `bucket` within this.
-# checkpoint_age = "1m"
-# checkpoint_concurrency = 8
 # The state store's block cache and memtables.
 # state_memory = "512 MiB"
+# The largest inline layer to accept. A push that carries a larger layer is
+# refused. 0 refuses every push that carries its layer, so no repository content
+# passes through the ledger. Keep every compute's inline_layer at most this.
+# max_inline_layer = "1 MiB"
+# Create SHA-256 repositories (git's sha256 object format). Turn it on once
+# every node runs a release that reads them: an older one cannot.
+# allow_sha256 = false
 
 [hooks]
 # The hooks to call. Every hook is opt-in: leave the table out and git reads
@@ -121,9 +139,16 @@ git = "0.0.0.0:8080"
 # authorize, and under the granted key with it. Set false to create
 # repositories only with CreateRepository.
 create_on_push = true
-# Let PushToRemote dial http:// and addresses off the public internet, for a
-# development stack or a git server inside your own network.
+# The object format of a repository whose creator names none: one a push
+# creates, or CreateRepository without object_format. "sha1" or "sha256"
+# (which needs ledger.allow_sha256).
+default_object_format = "sha1"
+# Let PushToRemote and FetchFromRemote dial http:// and addresses off the
+# public internet, for a development stack or a git server inside your own
+# network.
 allow_private_remotes = false
+# A push or API commit with a larger object fails. GitHub refuses at 100 MiB.
+max_object_size = "100 MiB"
 
 # Where spans go, over OTLP. Leave the table out and only the console gets
 # them. The endpoint is dialed as written — no `/v1/traces` is appended — and

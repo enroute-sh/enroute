@@ -42,6 +42,13 @@ impl Api {
     }
 }
 
+/// A repository's object format, as git names it.
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+pub(crate) enum ObjectFormat {
+    Sha1,
+    Sha256,
+}
+
 /// `enroute repo`.
 #[derive(clap::Subcommand, Debug)]
 pub(crate) enum RepoCommand {
@@ -52,6 +59,9 @@ pub(crate) enum RepoCommand {
         /// The branch HEAD names.
         #[arg(long, value_name = "REF", default_value = "refs/heads/main")]
         default_branch: String,
+        /// How the repository names its objects, for good.
+        #[arg(long, value_enum, default_value_t = ObjectFormat::Sha1)]
+        object_format: ObjectFormat,
     },
     /// Show a repository.
     Get {
@@ -138,11 +148,17 @@ pub(crate) async fn repo(api_args: &Api, command: RepoCommand) -> Result<()> {
         RepoCommand::Create {
             key: k,
             default_branch,
+            object_format,
         } => {
+            let object_format = match object_format {
+                ObjectFormat::Sha1 => api::ObjectFormat::Sha1,
+                ObjectFormat::Sha256 => api::ObjectFormat::Sha256,
+            };
             let made = client
                 .create_repository(api::CreateRepositoryRequest {
                     repo: Some(key(&k)),
                     default_branch: branch_ref(default_branch),
+                    object_format: object_format.into(),
                 })
                 .await
                 .map_err(|status| failed(&status))?
@@ -230,6 +246,10 @@ fn repo_json(repo: &api::Repository) -> Value {
         "key": repo_key(repo),
         "default_branch": repo.default_branch,
         "last_push": repo.last_push.as_ref().map(|t| utc(t.seconds)),
+        "object_format": match repo.object_format() {
+            api::ObjectFormat::Sha256 => "sha256",
+            api::ObjectFormat::Sha1 | api::ObjectFormat::Unspecified => "sha1",
+        },
     })
 }
 

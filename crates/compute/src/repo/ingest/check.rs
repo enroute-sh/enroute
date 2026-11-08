@@ -54,8 +54,9 @@ pub(super) fn visitor(
     collected: &Mutex<Collected>,
 ) -> impl Fn(&Oid, Kind, &[u8]) -> Result<()> + Sync + '_ {
     move |oid, kind, data| {
-        let (refs, commit) =
-            references(kind, data).with_context(|| format!("invalid {} {oid}", kind.name()))?;
+        // The id was hashed in the format the object's references use.
+        let (refs, commit) = references(oid.format(), kind, data)
+            .with_context(|| format!("invalid {} {oid}", kind.name()))?;
         let mut c = collected.lock();
         let c = &mut *c;
         let slots = c.filter.len();
@@ -93,7 +94,7 @@ pub(super) fn visitor(
 
 /// The slot of `oid` in a reference filter of `slots` slots.
 fn filter_slot(oid: &Oid, slots: usize) -> usize {
-    let [a, b, c, d, ..] = oid.0;
+    let [a, b, c, d, ..] = *oid.prefix();
     ix(u32::from_le_bytes([a, b, c, d]))
         .checked_rem(slots)
         .unwrap_or(0)

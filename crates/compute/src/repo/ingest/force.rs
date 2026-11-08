@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use crate::git::object::parse_tag;
+use crate::git::object::tag_target;
 use crate::git::oid::{Kind, Oid};
 use crate::repo::graph::reaches;
 use crate::repo::view::{DenseId, Snapshot};
@@ -98,7 +98,7 @@ fn peel_to_commit(
     for _ in 0..16 {
         match kind(&oid)? {
             Kind::Commit => return Some(oid),
-            Kind::Tag => oid = parse_tag(&read(&oid)?).ok()?.target,
+            Kind::Tag => oid = tag_target(&read(&oid)?).ok()?,
             _ => return None,
         }
     }

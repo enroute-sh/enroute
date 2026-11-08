@@ -57,6 +57,12 @@ pub(crate) fn apply(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
                 .checked_add(size)
                 .and_then(|end| base.get(off..end))
                 .context("delta copy out of range")?;
+            // Copies can repeat the base without end: stop at the size
+            // that the header gave, which the pack's limit bounds.
+            ensure!(
+                out.len() + src.len() <= dst_size,
+                "delta result size mismatch"
+            );
             out.extend_from_slice(src);
         } else if op != 0 {
             let end = pos + usize::from(op);
@@ -413,6 +419,8 @@ mod tests {
     fn bad_headers_are_errors() {
         assert!(apply(b"", &[0x80]).is_err(), "truncated size");
         assert!(apply(b"", &[0xff; 11]).is_err(), "overlong size");
+        // Base and result size 1, then two copies of the base.
+        assert!(apply(b"x", &[1, 1, 0x90, 1, 0x90, 1]).is_err(), "too long");
     }
 
     #[test]

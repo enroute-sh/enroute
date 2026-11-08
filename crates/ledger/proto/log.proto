@@ -1,0 +1,218 @@
+// The ledger's own records: its log entries, the repository state it keeps
+// in its logs' snapshots, and the root log's directory. Not part of the
+// contract with the compute (crates/shared/proto).
+
+syntax = "proto3";
+
+package enroute.internal.peer.v1;
+
+import "state.proto";
+
+// A log entry: a command as its proposer evaluated it. Every replica
+// applies the same patch or skips it, so they cannot disagree on what a
+// command does, whatever version of the evaluation each one runs.
+//
+// It applies only to the state it was evaluated against: the repository
+// at version `base`, made by evaluation chain `base_chain`
+// (RepoMeta.chain). Otherwise it is skipped, and its proposer evaluates
+// the command again. Versions only grow, but two chains can each reach
+// one: the chain tells them apart.
+message Effect {
+  uint64 base = 1;
+  uint64 base_chain = 2;
+  // The proposer's evaluation chain: random, new whenever the proposer
+  // starts again from its applied state (also in the change, if any).
+  uint64 chain = 3;
+  // Absent: the command changes nothing, and the entry only confirms its
+  // outcome (refusals and failed compare-and-swaps).
+  enroute.internal.v1.Change change = 4;
+}
+
+// A repository's state at a log index of an incarnation, as its log's
+// snapshots carry it (so a recovering node knows which log is which).
+message Record {
+  string repo = 1;
+  uint64 epoch = 2;
+  uint64 index = 3;
+  reserved 4;
+  enroute.internal.v1.RepoMeta meta = 5;
+  reserved 6;
+}
+
+// An entry of the root log: a change to the ledger's directory (which
+// repositories exist, in which incarnation, and who the members are).
+// Applying one changes nothing if it no longer applies, so a proposer may
+// propose it again.
+message RootEntry {
+  oneof change {
+    // Start a repository's next incarnation, unless one is live.
+    Create create = 1;
+    // End a live incarnation, whose tombstone its log has committed.
+    Delete delete = 2;
+    // Add a node to the members, or give a member a new address or key,
+    // unless it was removed.
+    Member add_member = 3;
+    // Remove a node from the members, for good.
+    uint64 remove_member = 4;
+    // Hand repositories' logs to new sequencers (after a seal), unless their
+    // terms moved on.
+    Appoint appoint = 5;
+    // End replica-set changes whose new term committed on the new set.
+    Activate activate = 6;
+    // Move the cluster to a newer release's behaviour, for good.
+    Upgrade upgrade = 7;
+  }
+}
+
+// Move the cluster's version from `from` to `to`, unless it is no longer
+// `from` (a compare-and-swap, so a proposer may propose it again). No
+// release proposes one yet: 0.4 knows it so as to stop at it.
+message Upgrade {
+  enroute.internal.v1.Version from = 1;
+  enroute.internal.v1.Version to = 2;
+}
+
+message Appoint {
+  repeated Appointment appointments = 1;
+}
+
+// The log of incarnation `epoch` of `repo`, sealed at `base_term + 1`, goes
+// to `sequencer` as term `base_term + 1`; applies only while the
+// incarnation's term is `base_term` (a compare-and-swap, as Vertical
+// Paxos's master changes configurations).
+message Appointment {
+  string repo = 1;
+  uint64 epoch = 2;
+  uint64 base_term = 3;
+  uint64 sequencer = 4;
+  // The new term's replicas; the incarnation's current ones if empty.
+  repeated uint64 replicas = 5;
+  // The sequencer's boot (see `Ping`): the term is its only while it runs.
+  uint64 boot = 6;
+}
+
+message Activate {
+  repeated Activation activations = 1;
+}
+
+message Activation {
+  string repo = 1;
+  uint64 epoch = 2;
+  uint64 term = 3;
+}
+
+message Create {
+  string repo = 1;
+  // The new incarnation's HEAD, if given.
+  optional string head = 2;
+  // The new incarnation's object format.
+  enroute.internal.v1.ObjectFormat object_format = 3;
+  // Its replicas and first sequencer, as the proposer placed them; if
+  // absent or no longer members, applying places them itself.
+  repeated uint64 replicas = 4;
+  uint64 sequencer = 5;
+  uint64 boot = 6;
+}
+
+message Delete {
+  string repo = 1;
+  // The incarnation it ends.
+  uint64 epoch = 2;
+  // Its tombstoned state's version and upload generation, which the next
+  // incarnation starts past.
+  uint64 version = 3;
+  uint64 upload_gen = 4;
+}
+
+// A repository's latest incarnation in the directory: enough for any member
+// to host its log from the same initial state.
+message Incarnation {
+  uint64 epoch = 1;
+  // It ended (the repository was deleted).
+  bool deleted = 2;
+  reserved 3;
+  // The HEAD it started with, if given.
+  optional string head = 4;
+  // The version and upload generation its initial state starts past (those
+  // of the incarnation before it; 0 for the first).
+  uint64 base_version = 5;
+  uint64 base_upload_gen = 6;
+  // When live: the version and upload generation it ended at, once deleted.
+  uint64 end_version = 7;
+  uint64 end_upload_gen = 8;
+  // The object format it started with, for good.
+  enroute.internal.v1.ObjectFormat object_format = 9;
+  // Its log's current term (from 1), the term's sequencer and replicas.
+  uint64 term = 10;
+  uint64 sequencer = 11;
+  repeated uint64 replicas = 12;
+  // While the replicas change: the previous term's replicas, which seals
+  // must also reach a quorum of until the term's first cell commits on the
+  // new ones.
+  repeated uint64 joint = 13;
+  // The sequencer's boot (see `Appointment`).
+  uint64 boot = 14;
+}
+
+// The root log's state at an index, apart from the repositories.
+message RootMeta {
+  uint64 applied_index = 1;
+  uint64 applied_term = 2;
+  // The root log's own membership as of that index.
+  repeated uint64 voters = 3;
+  repeated uint64 learners = 4;
+  // The ledger's members, and the nodes removed from it for good.
+  repeated uint64 members = 5;
+  repeated uint64 removed = 6;
+  // Where each member is, and the key that checks its tokens, by id.
+  repeated Member peers = 7;
+  // The cluster's version: the release whose behaviour every node runs.
+  // Set when the root log starts, and moved only by `Upgrade`.
+  enroute.internal.v1.Version version = 8;
+}
+
+// A ledger node as the others reach and trust it.
+message Member {
+  uint64 id = 1;
+  // Its internal URL.
+  string url = 2;
+  // The public key that checks the tokens it signs (see `token.rs`).
+  string key = 3;
+  // Its failure domain, such as an availability zone (`node.zone`; empty:
+  // none named). A log's replicas go to distinct zones first.
+  string zone = 4;
+}
+
+// The root log's whole state, as its snapshots carry it.
+message Directory {
+  RootMeta meta = 1;
+  repeated NamedIncarnation repos = 2;
+}
+
+message NamedIncarnation {
+  string repo = 1;
+  Incarnation incarnation = 2;
+}
+
+// A repository log's cell in the node's log store: an effect, or a no-op
+// (empty).
+message StoredCell {
+  uint64 index = 1;
+  uint64 term = 2;
+  bytes value = 3;
+}
+
+// A repository log's hard state on a node: its replica's fence (the
+// highest term it has heard of) and commit point.
+message Hard {
+  uint64 fence = 1;
+  uint64 commit = 2;
+}
+
+// Where a repository log starts on a node: the position before its first
+// cell (everything up to it trimmed, or installed), and that position's
+// term.
+message Start {
+  uint64 index = 1;
+  uint64 term = 2;
+}

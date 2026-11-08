@@ -5,7 +5,7 @@ Enroute is currently self-hosted. Managed hosting is planned.
 ## Image
 
 Images are published at `ghcr.io/enroute-sh/enroute` for `linux/amd64` and
-`linux/arm64`. Releases use `0.x` version tags.
+`linux/arm64`. Releases use `0.x` version tags, such as `0.4.0`.
 
 | Tag | Meaning |
 | --- | --- |
@@ -34,19 +34,15 @@ node for development instead, see [Run the image](../quickstart.md#run-the-image
 
 ## Upgrades
 
-There is no backwards compatibility between `0.x` releases. Read the release
-commit before you move, and plan an upgrade as a deployment change rather than
-a restart.
+Until Enroute 1.0, a `0.x` release can change the storage format, the
+configuration keys, and the `v1alpha1` contract. The notes of each release say
+what changed. A release that reads your storage is an in-place upgrade: replace
+the image on every node and restart. A release that does not read it needs a
+migration to a new deployment, which copies each repository and keeps the old
+deployment available until the cutover. See
+[Upgrades and migrations](upgrades.md).
 
-- A release that changes the storage format reads nothing that the previous
-  release wrote, and has no migration. Start with an empty bucket and empty
-  node disks, then push your repositories again.
-- The `v1alpha1` contract can change. Generate your client again from the
-  proto files the new image carries.
-- Configuration keys can change. Start the new image against your
-  configuration before you send traffic to it.
-
-## Deployment model
+## Node roles
 
 A node runs one of three roles, set with `node.role`:
 
@@ -56,35 +52,15 @@ A node runs one of three roles, set with `node.role`:
 | `ledger` | The replicated logs only | A durable disk, `node.advertise_url`, and the object store |
 | `compute` | Git and the gRPC API only | The object store, and a disk for caches |
 
-The ledger holds each repository's refs and layer list in a replicated log.
-Every ledger node votes in every log. The compute does the Git work and keeps
-only caches that Enroute can rebuild.
+Every deployment uses the same binary and the same bucket, and only the
+`[node]` table changes. [Deployment profiles](deployment-profiles.md) gives
+the three supported models: a configuration for each node, what each model
+survives, how each one scales, and how to move a live deployment from one
+model to the next.
 
-One `both` node is the simplest deployment. To replicate, run three ledger
-nodes or more. Set `node.internal_listen` and `node.advertise_url` on each one,
-and point them all at one `bucket`. A repository stays writable while a
-majority of its ledger nodes is up. Nodes find each other through the bucket.
-
-Keep the internal listener (`7400` by default) reachable only inside the
-cluster. Every node serves `GET /status` there.
-
-Add compute nodes behind a load balancer. Other nodes never dial a compute node.
-It finds the ledger nodes through the bucket.
-
-[Deployment profiles](deployment-profiles.md) gives the three supported
-models, with a configuration for each node, what each model survives, and how
-to move a live deployment from one model to the next.
-
-## Scaling
-
-- **Ledger nodes scale up, not out.** Each ledger node holds every repository.
-  More ledger nodes add fault tolerance, not capacity. To add capacity, give
-  the nodes more CPU, memory, and disk.
-- **Compute nodes scale out.** Add compute nodes for more Git and API traffic.
-
-Configure [storage](storage-backends.md), [security](security.md),
-[maintenance](maintenance.md), and [observability](observability.md) before
-deploying.
+Before you deploy, configure [storage](storage-backends.md),
+[security](security.md), and [observability](observability.md), and read
+[Maintenance](maintenance.md) for the tasks that a replicated ledger needs.
 
 ## Operator responsibilities
 

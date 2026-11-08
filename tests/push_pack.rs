@@ -84,8 +84,8 @@ fn oid(hex: &str) -> Oid {
     Oid::from_hex(hex).unwrap()
 }
 
-/// A remote holding an older state takes the pack for the newer one, thin
-/// or not, and ends up with the same refs and a sound repository.
+/// A remote holding an older state takes the pack for the newer one, and
+/// ends up with the same refs and a sound repository.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_remote_takes_the_pack_for_a_push() {
     let server = Server::start().await;
@@ -141,40 +141,35 @@ async fn a_remote_takes_the_pack_for_a_push() {
         .unwrap()
         .snapshot();
     // The remote advertises a tag, and a tip this repository lacks.
-    let haves = [oid(&old), oid(&v1), Oid([9; 20])];
+    let haves = [oid(&old), oid(&v1), Oid::sha1([9; 20])];
     let wants = [oid(&new), oid(&v2)];
     let zero = "0".repeat(40);
-    for thin in [false, true] {
-        let pack = pack_for_push(&snap, &wants, &haves, thin).await.unwrap();
-        assert_eq!(pack.objects(), expected, "thin: {thin}");
-        let data = bytes(pack).await;
-        assert_eq!(data[8..12], u32::try_from(expected).unwrap().to_be_bytes());
-        // Without `thin`, no delta has a base outside the pack; with it, the
-        // edited file's delta has its base in what the remote holds.
-        let empty = git.dir(&format!("empty-{thin}"));
-        git.run(
-            git.home.path(),
-            &["init", "-q", "--bare", empty.to_str().unwrap()],
-        )
-        .await;
-        let (ok, out) = git_with_input(&empty, &["index-pack", "--stdin"], data.clone()).await;
-        assert_eq!(ok, !thin, "index-pack in an empty repository:\n{out}");
-        let target = git.dir(&format!("remote-{thin}"));
-        copy_dir(&remote, &target);
-        let commands = [
-            (old.as_str(), new.as_str(), "refs/heads/main"),
-            (zero.as_str(), v2.as_str(), "refs/tags/v2"),
-        ];
-        receive(&target, &commands, &data).await;
-        git.run(&target, &["fsck", "--strict"]).await;
-        assert_eq!(git.rev(&target, "main").await, new);
-        assert_eq!(git.rev(&target, "refs/tags/v2").await, v2);
-    }
+    let pack = pack_for_push(&snap, &wants, &haves).await.unwrap();
+    assert_eq!(pack.objects(), expected);
+    let data = bytes(pack).await;
+    assert_eq!(data[8..12], u32::try_from(expected).unwrap().to_be_bytes());
+    // No delta has a base outside the pack.
+    let empty = git.dir("empty");
+    git.run(
+        git.home.path(),
+        &["init", "-q", "--bare", empty.to_str().unwrap()],
+    )
+    .await;
+    let (ok, out) = git_with_input(&empty, &["index-pack", "--stdin"], data.clone()).await;
+    assert!(ok, "index-pack in an empty repository:\n{out}");
+    let target = git.dir("remote-pushed");
+    copy_dir(&remote, &target);
+    let commands = [
+        (old.as_str(), new.as_str(), "refs/heads/main"),
+        (zero.as_str(), v2.as_str(), "refs/tags/v2"),
+    ];
+    receive(&target, &commands, &data).await;
+    git.run(&target, &["fsck", "--strict"]).await;
+    assert_eq!(git.rev(&target, "main").await, new);
+    assert_eq!(git.rev(&target, "refs/tags/v2").await, v2);
 
     // What the remote holds already needs no objects.
-    let pack = pack_for_push(&snap, &[oid(&old)], &haves, true)
-        .await
-        .unwrap();
+    let pack = pack_for_push(&snap, &[oid(&old)], &haves).await.unwrap();
     assert_eq!(pack.objects(), 0);
     let data = bytes(pack).await;
     let target = git.dir("remote-same");
@@ -188,9 +183,77 @@ async fn a_remote_takes_the_pack_for_a_push() {
     assert_eq!(git.rev(&target, "same").await, old);
 
     // An object this repository does not hold.
-    let unknown = Oid([7; 20]);
+    let unknown = Oid::sha1([7; 20]);
     assert!(matches!(
-        pack_for_push(&snap, &[unknown], &haves, true).await,
+        pack_for_push(&snap, &[unknown], &haves).await,
         Err(Error::Missing(o)) if o == unknown
     ));
+}
+
+/// Two branches edit one file the remote holds: one new version goes whole,
+/// the other as a delta against it, so the pack needs nothing outside it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn versions_on_one_held_base_delta_against_each_other() {
+    let server = Server::start().await;
+    let git = Git::new();
+    let url = server.repo_url("siblings");
+    let src = git.init("src").await;
+    let big = text(3, 400);
+    git.commit_file(&src, "big", &big, "base").await;
+    git.run(&src, &["push", "-q", &url, "main"]).await;
+    let old = git.rev(&src, "main").await;
+    for b in ["a", "b"] {
+        git.run(&src, &["checkout", "-q", "-b", b, &old]).await;
+        git.commit_file(&src, "big", &format!("{big}{b}\n"), b)
+            .await;
+    }
+    git.run(&src, &["push", "-q", &url, "a", "b"]).await;
+    let (a, b) = (git.rev(&src, "a").await, git.rev(&src, "b").await);
+
+    let snap = server
+        .node
+        .compute()
+        .unwrap()
+        .repo_for_read("siblings", true)
+        .await
+        .unwrap()
+        .unwrap()
+        .snapshot();
+    let pack = pack_for_push(&snap, &[oid(&a), oid(&b)], &[oid(&old)])
+        .await
+        .unwrap();
+    let data = bytes(pack).await;
+    let empty = git.dir("empty");
+    git.run(
+        git.home.path(),
+        &["init", "-q", "--bare", empty.to_str().unwrap()],
+    )
+    .await;
+    let (ok, out) = git_with_input(&empty, &["index-pack", "--stdin"], data).await;
+    assert!(ok, "index-pack in an empty repository:\n{out}");
+
+    let idx = std::fs::read_dir(empty.join("objects/pack"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|x| x == "idx"))
+        .unwrap();
+    let verify = git
+        .run(&empty, &["verify-pack", "-v", idx.to_str().unwrap()])
+        .await;
+    let blob_a = git.rev(&src, "a:big").await;
+    let blob_b = git.rev(&src, "b:big").await;
+    let line = |o: &str| {
+        verify
+            .lines()
+            .find(|l| l.starts_with(o))
+            .map(|l| l.split_whitespace().skip(5).collect::<Vec<_>>().join(" "))
+            .unwrap()
+    };
+    let (la, lb) = (line(&blob_a), line(&blob_b));
+    // verify-pack shows "<depth> <base>" for a delta, nothing for a whole object.
+    assert!(
+        (la.is_empty() && lb == format!("1 {blob_a}"))
+            || (lb.is_empty() && la == format!("1 {blob_b}")),
+        "a: {la:?}, b: {lb:?}\n{verify}"
+    );
 }

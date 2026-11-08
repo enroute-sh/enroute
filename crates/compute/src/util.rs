@@ -4,6 +4,38 @@ pub(crate) mod coalesce;
 
 pub(crate) use crate::git::cast::{ix, to_u64, to_usize};
 
+/// The number at the start of `s` as C's `strtol` family reads it with base
+/// 0, which is how git reads numbers off the wire.
+///
+/// That is leading whitespace, an optional sign, then hex after `0x`, octal
+/// after `0`, else decimal. `None` when no digit is read; otherwise whether
+/// it is negative, its magnitude (`None` past `u64::MAX`), and the rest of
+/// `s`.
+pub(crate) fn c_number(s: &str) -> Option<(bool, Option<u64>, &str)> {
+    let s = s.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+    let (negative, s) = match s.strip_prefix('-') {
+        Some(s) => (true, s),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let hex = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .filter(|h| h.starts_with(|c: char| c.is_ascii_hexdigit()));
+    let (radix, digits) = match hex {
+        Some(h) => (16, h),
+        None if s.starts_with('0') => (8, s),
+        None => (10, s),
+    };
+    let len = digits
+        .find(|c: char| !c.is_digit(radix))
+        .unwrap_or(digits.len());
+    let (num, rest) = digits.split_at(len);
+    if num.is_empty() {
+        return None;
+    }
+    Some((negative, u64::from_str_radix(num, radix).ok(), rest))
+}
+
 /// Run `f` on the blocking pool.
 pub(crate) async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> anyhow::Result<T> + Send + 'static,

@@ -14,7 +14,7 @@ use quick_cache::sync::Cache;
 const MIN_OPEN: u64 = 64;
 /// Cap for very high (or no) limits: a bigger cache gains nothing.
 const MAX_OPEN: u64 = 1 << 20;
-/// Descriptors kept back for sockets, the catalog and the state store: at
+/// Descriptors kept back for sockets and the state store: at
 /// least this many, or a quarter of the limit.
 const MIN_RESERVE: u64 = 256;
 
