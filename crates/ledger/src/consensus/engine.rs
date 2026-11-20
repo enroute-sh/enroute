@@ -87,7 +87,7 @@ use super::codec::{Cells, Entries, Prost, Proto};
 use super::control::{Controller, Liveness};
 use super::log_id;
 use super::repo::load;
-use super::repo::{self, Config, LedgerStore, RepoLog};
+use super::repo::{self, LedgerStore, RepoLog};
 use super::root::{self, Change, Directory, ROOT, ROOT_START, SharedRoot, hosts};
 use super::root_store::{LogMeta, LogStore, fetch};
 use super::shardlog::{Request, Store as _, Synced, Terms};
@@ -262,6 +262,8 @@ pub struct Stats {
     pub logs: usize,
     /// Logs whose sequencer here resends to a lagging replica.
     pub lagging_logs: usize,
+    /// Logs sequenced here with something pending that a tick may try again.
+    pub pending_logs: usize,
     /// Frames sent to peers.
     pub messages_sent: u64,
     /// Of those, repository logs' (not the root's, nor pings).
@@ -407,9 +409,15 @@ struct Loop {
     dirty: HashSet<u64>,
     /// Logs whose sequencer here has replicas to catch up.
     lagging: HashSet<u64>,
-    /// Logs this node sequences (or did: an entry whose log no longer has
-    /// a sequencer here is dropped when next looked at), so a tick looks at
-    /// them, not at every log.
+    /// Logs sequenced here with something pending that a tick may have to
+    /// try again: a read's checks, a deposed term to report, or a replica
+    /// change to end. A log enters when one of those may have begun, and a
+    /// tick that finds none drops it, so a tick looks at these and not at
+    /// every log.
+    pending: HashSet<u64>,
+    /// Logs this node hosts and was appointed to sequence, whether its
+    /// term still holds or not: the logs with replicas to catch up when a
+    /// node comes back.
     sequencing: HashSet<u64>,
     /// Frames to this node itself, handled as if received.
     inbox: VecDeque<Frame>,
@@ -473,7 +481,7 @@ impl RecoveredLogs {
         let Some(inc) = inc.filter(|i| hosts(i, me)) else {
             return self.drop_log(state, log);
         };
-        let config = Config::of(inc);
+        let config = root::config(inc);
         let sole = inc.replicas == [me] && inc.joint.is_empty();
         let progress = Arc::new(Mutex::new(Progress {
             version: root.version,
@@ -671,13 +679,14 @@ impl Engine {
             removed,
             liveness: Liveness::new(id, boot),
             up: HashSet::new(),
-            controller: Controller::default(),
+            controller: Controller::new(),
             replies: Vec::new(),
             located: Vec::new(),
             waiting: Vec::new(),
             read_applied: Vec::new(),
             dirty,
             lagging: HashSet::new(),
+            pending: HashSet::new(),
             sequencing: HashSet::new(),
             inbox: VecDeque::new(),
             stats: Stats::default(),
@@ -1058,7 +1067,9 @@ impl Engine {
     /// A snapshot of the engine's counters.
     #[must_use]
     pub fn stats(&self) -> Stats {
-        self.stats.read().clone()
+        let mut stats = self.stats.read().clone();
+        stats.leading = self.hosted.read().values().filter(|h| h.leading).count();
+        stats
     }
 
     /// The `Peer` gRPC service for this engine (the transport between
@@ -1090,12 +1101,12 @@ impl Engine {
     /// This node's view of its hosted repositories, for the status endpoint.
     #[must_use]
     pub fn status(&self) -> serde_json::Value {
-        let hosted = self.hosted.read();
+        let engine = self.stats();
         serde_json::json!({
             "node": self.id,
-            "repos": hosted.len(),
-            "leading": hosted.values().filter(|h| h.leading).count(),
-            "engine": self.stats(),
+            "repos": self.hosted.read().len(),
+            "leading": engine.leading,
+            "engine": engine,
         })
     }
 
@@ -1146,6 +1157,12 @@ impl Drop for Subscription {
 /// The proposal or read id an entry's context carries (0 if none).
 fn ctx_id(ctx: &[u8]) -> u64 {
     u64::from_le_bytes(ctx.try_into().unwrap_or([0; 8]))
+}
+
+/// The term of `r`'s deposed sequencer, if the root still names it: this
+/// node (`me`) in that term.
+fn deposed_named(r: &RepoLog, me: u64) -> Option<u64> {
+    (r.node.deposed::<Bytes>()).filter(|&t| r.config.sequencer == me && r.config.term == t)
 }
 
 /// The log hosted for `repo`.
@@ -1319,18 +1336,8 @@ impl Loop {
         }
         self.stats.logs = self.repos.len();
         self.stats.lagging_logs = self.lagging.len();
-        let repos = &self.repos;
-        self.sequencing
-            .retain(|log| repos.get(log).is_some_and(|r| r.seq_term().is_some()));
-        self.stats.leading = (self.sequencing.iter())
-            .filter(|log| repos.get(log).is_some_and(RepoLog::leading))
-            .count();
+        self.stats.pending_logs = self.pending.len();
         *self.shared_stats.write() = self.stats.clone();
-    }
-
-    /// The logs this node sequences.
-    fn sequenced(&self) -> impl Iterator<Item = (u64, &RepoLog)> {
-        (self.sequencing.iter()).filter_map(|&log| Some((log, self.repos.get(&log)?)))
     }
 
     /// Resend to lagging replicas that are alive, and reads' checks, that
@@ -1361,17 +1368,58 @@ impl Loop {
                 self.retry(log, to);
             }
         }
-        // Reads' checks.
+        // What else a tick tries again, for the logs that have any of it.
+        let root_leader = self.root_log.raw.raft.leader_id;
         let mut retry = Vec::new();
-        for (log, r) in self.sequenced() {
-            if r.checked.is_none_or(|t| now.duration_since(t) <= RESEND) {
+        let mut deposed = Vec::new();
+        let mut activate = Vec::new();
+        let ids: Vec<u64> = self.pending.iter().copied().collect();
+        for log in ids {
+            let Some(r) = self.repos.get_mut(&log) else {
+                self.pending.remove(&log);
                 continue;
-            }
+            };
+            // Reads' checks.
             let replicas = r.node.replicas().unwrap_or_default();
-            let waiting = replicas
-                .iter()
-                .filter(|&&n| r.node.waiting(n).next().is_some());
-            retry.extend(waiting.map(|&n| (log, n)));
+            let waiting: Vec<u64> = (replicas.iter().copied())
+                .filter(|&n| r.node.waiting(n).next().is_some())
+                .collect();
+            let mut more = !waiting.is_empty();
+            if r.checked.is_some_and(|t| now.duration_since(t) > RESEND) {
+                retry.extend(waiting.into_iter().map(|n| (log, n)));
+            }
+            // A deposed sequencer the root still names: a seal whose
+            // appointment never came. Only the root's leader can give the
+            // log a new term.
+            let term = deposed_named(r, me);
+            more |= term.is_some();
+            let due = r
+                .reported
+                .is_none_or(|t| now.duration_since(t) > DEPOSED_RETRY);
+            if let Some(term) = term.filter(|_| root_leader != 0 && due) {
+                r.reported = Some(now);
+                let d = crate::proto::Deposed {
+                    repo: r.repo.clone(),
+                    term,
+                };
+                deposed.push(framed(log, frame::Kind::Deposed(d)));
+            }
+            // A replica change to end.
+            more |= !r.config.joint.is_empty() && r.node.sequencing::<Bytes>().is_some();
+            let due = r
+                .activated
+                .is_none_or(|t| now.duration_since(t) > ACTIVATE_RETRY);
+            if let Some(term) = r.node.activation::<Bytes>(&r.config).filter(|_| due) {
+                r.activated = Some(now);
+                activate.push(crate::proto::Activation {
+                    repo: r.repo.clone(),
+                    epoch: r.epoch,
+                    term,
+                });
+            }
+            if !more {
+                self.pending.remove(&log);
+            }
         }
         for (log, to) in retry {
             if let Some(r) = self.repos.get_mut(&log) {
@@ -1380,50 +1428,9 @@ impl Loop {
                 self.effects(log, fx);
             }
         }
-        // Deposed sequencers the root still names: a seal whose appointment
-        // never came. Only the root's leader can give the log a new term.
-        let root_leader = self.root_log.raw.raft.leader_id;
-        let mut deposed = Vec::new();
-        for &log in &self.sequencing {
-            let Some(r) = self.repos.get_mut(&log) else {
-                continue;
-            };
-            let Some(term) = r.node.deposed::<Bytes>() else {
-                continue;
-            };
-            let due = r
-                .reported
-                .is_none_or(|t| now.duration_since(t) > DEPOSED_RETRY);
-            if root_leader != 0 && due && r.config.sequencer == me && r.config.term == term {
-                r.reported = Some(now);
-                let d = crate::proto::Deposed {
-                    repo: r.repo.clone(),
-                    term,
-                };
-                deposed.push(framed(log, frame::Kind::Deposed(d)));
-            }
-        }
         for f in deposed {
             self.send(root_leader, f);
         }
-        // Replica changes to end.
-        let activate: Vec<crate::proto::Activation> = (self.sequencing.iter())
-            .filter_map(|log| {
-                let r = self.repos.get_mut(log)?;
-                let term = r.node.sequencing::<Bytes>().filter(|_| r.leading())?;
-                let due = r
-                    .activated
-                    .is_none_or(|t| now.duration_since(t) > ACTIVATE_RETRY);
-                (!r.config.joint.is_empty() && due).then(|| {
-                    r.activated = Some(now);
-                    crate::proto::Activation {
-                        repo: r.repo.clone(),
-                        epoch: r.epoch,
-                        term,
-                    }
-                })
-            })
-            .collect();
         if !activate.is_empty() {
             let entry: RootEntry = root_entry::Change::Activate(crate::proto::Activate {
                 activations: activate,
@@ -1650,6 +1657,10 @@ impl Loop {
         if request {
             self.dirty.insert(log);
         }
+        // Deposed while the root names it: a tick reports that.
+        if deposed_named(r, self.node_id).is_some() {
+            self.pending.insert(log);
+        }
         self.effects(log, fx);
     }
 
@@ -1755,11 +1766,13 @@ impl Loop {
             }
             frame::Kind::Sealed(s) => {
                 let root = self.root.read();
-                self.controller.on_sealed(&root.dir, log, from, s);
+                self.controller
+                    .on_sealed(&root.dir, &self.liveness, log, from, s);
             }
             frame::Kind::Deposed(d) => {
                 let root = self.root.read();
-                self.controller.on_deposed(&root.dir, &d.repo, d.term);
+                self.controller
+                    .on_deposed(&root.dir, &self.liveness, &d.repo, d.term);
             }
             frame::Kind::Ping(p) => {
                 let (pong, restarted) = self.liveness.on_ping(from, p);
@@ -1994,6 +2007,7 @@ impl Loop {
         let fx = r.node.send_checks::<Bytes>();
         if !fx.sends.is_empty() {
             r.checked = Some(Instant::now());
+            self.pending.insert(id);
         }
         self.effects(id, fx);
         Ok(())
@@ -2193,7 +2207,7 @@ impl Loop {
         let Some(r) = self.repos.get_mut(&log) else {
             return;
         };
-        let config = Config::of(&inc);
+        let config = root::config(&inc);
         if r.config != config {
             let sequencer_changed = r.config.sequencer != config.sequencer;
             r.config = config;
@@ -2228,6 +2242,10 @@ impl Loop {
             self.sequencing.insert(log);
             self.dirty.insert(log);
             self.effects(log, fx);
+        }
+        // Its configuration may be joint now, or name a deposed sequencer.
+        if self.sequencing.contains(&log) {
+            self.pending.insert(log);
         }
         self.publish(log);
     }
@@ -2292,7 +2310,7 @@ impl Loop {
             },
         );
         self.hold(id);
-        let config = Config::of(inc);
+        let config = root::config(inc);
         let store = LedgerStore::new(id, self.db.clone(), self.state.clone());
         let mut r = RepoLog::new(
             repo.to_string(),
@@ -2346,6 +2364,8 @@ impl Loop {
             return;
         };
         self.lagging.remove(&id);
+        self.pending.remove(&id);
+        self.sequencing.remove(&id);
         // A proposal in the log may still commit on the other replicas: its
         // outcome is unknown, so a retry could apply it twice. Reads go to
         // the new sequencer.

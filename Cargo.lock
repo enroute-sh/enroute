@@ -810,7 +810,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "e2e"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -867,7 +867,7 @@ checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
 
 [[package]]
 name = "enroute"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -913,7 +913,7 @@ dependencies = [
 
 [[package]]
 name = "enroute-api"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "prost 0.14.4",
  "prost-types 0.14.4",
@@ -925,7 +925,7 @@ dependencies = [
 
 [[package]]
 name = "enroute-compute"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -980,7 +980,7 @@ dependencies = [
 
 [[package]]
 name = "enroute-ledger"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -1016,7 +1016,7 @@ dependencies = [
 
 [[package]]
 name = "enroute-shared"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1047,7 +1047,7 @@ dependencies = [
 
 [[package]]
 name = "enroute-signature"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "base64 0.23.1",
  "ed25519-dalek",
@@ -3994,7 +3994,7 @@ dependencies = [
 
 [[package]]
 name = "test-support"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -4932,7 +4932,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "xtask"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "clap",
  "tempfile",

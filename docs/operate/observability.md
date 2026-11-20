@@ -133,7 +133,7 @@ signals that follow:
 
 | Signal | Where | Act when |
 | --- | --- | --- |
-| Request rate, errors, and latency | The `enroute::git::request` spans (`http.response.status_code`) and the `enroute::grpc::*` spans, in your tracing backend | Errors rise, or latency rises. The child spans show which stage is slow |
+| Request rate, errors, and latency | The `enroute::git::request` spans (`http.response.status_code`) and the `enroute::grpc::*` spans, in your tracing backend. `ListTree`, `ListCommits`, and `DiffCommit` have no span | Errors rise, or latency rises. The child spans show which stage is slow |
 | `ERROR` log lines | Each node's console | Any appear. A failed flush, merge, sweep, or API call logs one, with the cause |
 | `enroute diagnose` exit status | A ledger node, on a schedule | It exits with status 1. Its output names the check that failed |
 | A member that is not `alive` | `enroute diagnose` | A node is down. If its disk is lost, [replace it](maintenance.md#replace-a-node-that-lost-its-disk) |

@@ -50,6 +50,8 @@ export function tokenFrom(headers: Header[]): string | undefined {
 
 ## Answer the call
 
+Add `authorize` to the same file:
+
 ```ts
 import { Access, Denial } from "@/lib/gen/enroute/hook/v1alpha1/hook";
 import type { AuthorizeRequest } from "@/lib/gen/enroute/hook/v1alpha1/hook";
@@ -93,9 +95,11 @@ export async function authorize(req: AuthorizeRequest) {
 }
 ```
 
-Then dispatch to it, in `app/api/enroute/hooks/route.ts`:
+Then import it and dispatch to it, in `app/api/enroute/hooks/route.ts`:
 
 ```ts
+import { authorize } from "@/lib/hooks/authorize";
+
 async function dispatch(req: HookRequest): Promise<HookResponse> {
   if (req.authorize) {
     return HookResponse.fromPartial({ authorize: await authorize(req.authorize) });
@@ -123,12 +127,11 @@ keep. It also comes from *your* lookup rather than from the request, because
 the Git client is the one party that must not be trusted about who it is.
 Enroute hands this same actor to every later hook of the request.
 
-**Choose between `404` and `401` deliberately.** This example answers
-`DENIAL_NOT_FOUND` for a repository the user cannot see, which is why the
-permission check comes before the existence check. Answering `NOT_FOUND` only
-for repositories that truly do not exist would tell an anonymous caller which
-repositories exist. Which one to send is your decision; Enroute imposes no
-order.
+**Check the credential before the path.** This example answers `401` to an
+anonymous caller before it looks the path up, so a caller without a token
+cannot learn which repositories exist. To hide private repositories from
+signed-in users as well, see
+[Private repositories](../patterns/private-repositories.md).
 
 **A `401` without a challenge is a dead end.** Git's credential handling —
 netrc, credential helpers, a prompted retry — engages only from the

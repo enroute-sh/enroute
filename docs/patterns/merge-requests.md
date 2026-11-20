@@ -33,10 +33,13 @@ export async function merge(mr: MergeRequest, targetTip: string) {
     newObjectId: { hex: mr.tip },
   }]);
 
+  const rejection = outcomes[0].rejection;
   // The trunk moved while the page was open. Re-read it and ask again.
-  if (outcomes[0].rejection?.reason === Reason.REASON_NON_FAST_FORWARD) {
+  if (rejection?.reason === Reason.REASON_NON_FAST_FORWARD) {
     return { stale: true as const };
   }
+  // Any other rejection, such as REASON_MISSING_OBJECTS, did not land either.
+  if (rejection) return { rejected: rejection };
   return { tip: mr.tip };
 }
 ```
@@ -100,13 +103,15 @@ and `ListCommits` both stream, so fold each one as it arrives.
 
 ```ts
 export async function show(mr: MergeRequest) {
+  // A prefix also matches `refs/heads/main-old`, so pick the exact name.
   const { refs } = await listRefs(mr.repoId, [mr.target]);
-  const targetTip = refs[0]?.objectId?.hex;
+  const targetTip = refs.find((r) => r.name === mr.target)?.objectId?.hex;
   if (!targetTip) return { unknown: true as const };
 
   const bases = await findMergeBases(mr.repoId, mr.tip, targetTip);
   if (bases.exhausted) return { unknown: true as const };   // not "no shared history"
   const base = bases.baseCommitIds[0];
+  if (!base) return { unrelated: true as const };           // no shared history
 
   const { changes, truncated } = await diffCommitAgainst(mr.repoId, mr.tip, base);
   return { base, changes, truncated };
@@ -126,7 +131,11 @@ stopped at a server limit is only the first part of the answer.
 criss-cross history has more than one. One is the ordinary answer. The order
 is not defined, so with more than one, choose by your own rule.
 `exhausted` means the walk stopped before it had the answer, which is not the
-same as "no shared history" — draw no diff and say why.
+same as "no shared history" — draw no diff and say why. An empty
+`baseCommitIds` without `exhausted` means that the histories share no commit,
+or that the repository does not know one of the two commits.
+Do not pass an unset base to `diffCommitAgainst`: that diffs against the
+commit's first parent, not against the trunk.
 
 ### Offer the reviewer the right information
 
@@ -147,8 +156,9 @@ vouch for.
 
 ## Scope
 
-**Enroute makes no merge commit.** It cannot create a Git object outside a
-packfile, so these are the shapes on offer:
+**Enroute makes no merge commit.** `CreateCommit` makes a commit with one
+parent, the branch's current tip, so it cannot join two histories. These are
+the shapes on offer:
 
 | Shape | How it works |
 | --- | --- |

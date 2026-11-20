@@ -3,11 +3,6 @@
 //! `Commands` decides before a one-entry commit, `Objects` between the
 //! objects and the refs, and no mode never calls `pre_receive`.
 
-#![expect(
-    clippy::unwrap_used,
-    reason = "a test fails by panicking, on values it chose itself"
-)]
-
 mod common;
 
 use std::collections::{HashMap, HashSet};

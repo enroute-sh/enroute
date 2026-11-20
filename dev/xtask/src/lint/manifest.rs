@@ -53,14 +53,13 @@ fn workspace_members(root_manifest: &Value) -> Vec<String> {
         .get("workspace")
         .and_then(|workspace| workspace.get("members"))
         .and_then(Value::as_array)
-        .map(|members| {
+        .map_or_default(|members| {
             members
                 .iter()
                 .filter_map(Value::as_str)
                 .map(str::to_string)
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 /// A member manifest's `[package] name`.

@@ -62,7 +62,9 @@ flush and compaction replaces its own layers, so they run independently.
   nothing. Nodes evict replaced layers from their local cache once no snapshot
   references them. The layer sweep deletes the copies in the object store.
 - **Bounded object-store concurrency.** Each node caps concurrent object-store
-  requests (64). Unbounded fan-out (a burst of uploads, or one delete per
+  requests with `[store_io]`: 256 slots by default, and at most 128 for each
+  class of request
+  ([Configuration keys](../reference/configuration-keys.md)). Unbounded fan-out (a burst of uploads, or one delete per
   retired layer) opens hundreds of TLS connections at once, and connects to S3
   time out.
 

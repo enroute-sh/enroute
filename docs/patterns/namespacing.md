@@ -35,7 +35,7 @@ repository key it means. So this works today, with no configuration:
 git clone https://git.example.com/acme/backend.git
 ```
 
-Your `authorize` implementation receives `repo_path` as `/acme/backend.git`,
+Your `authorize` implementation receives `repo_path` as `acme/backend.git`,
 looks it up in your own table, and returns whatever key that repository has.
 The key does not have to resemble the path, and should not — see below.
 If `authorize` is not enabled, the path without `.git` is the key, here

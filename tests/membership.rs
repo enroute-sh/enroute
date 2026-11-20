@@ -3,11 +3,6 @@
 //! A node joins by reading a nonce from the object store and signing it
 //! with its key; every other call needs the token it gets.
 
-#![expect(
-    clippy::unwrap_used,
-    reason = "a test fails by panicking, on values it chose itself"
-)]
-
 mod common;
 
 use common::Server;

@@ -5,7 +5,7 @@ Enroute is currently self-hosted. Managed hosting is planned.
 ## Image
 
 Images are published at `ghcr.io/enroute-sh/enroute` for `linux/amd64` and
-`linux/arm64`. Releases use `0.x` version tags, such as `0.4.0`.
+`linux/arm64`. Releases use `0.x` version tags, such as `0.4.1`.
 
 | Tag | Meaning |
 | --- | --- |

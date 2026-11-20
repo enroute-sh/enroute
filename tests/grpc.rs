@@ -3,7 +3,6 @@
 
 #![expect(
     clippy::as_conversions,
-    clippy::indexing_slicing,
     reason = "a test fails by panicking, on values it chose itself"
 )]
 

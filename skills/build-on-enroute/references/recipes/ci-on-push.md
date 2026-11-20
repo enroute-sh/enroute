@@ -33,6 +33,9 @@ Put the work on a queue in the hook, and keep a record so you can recover
 from a missed call.
 
 ```ts
+import { create } from "@bufbuild/protobuf";
+import { PostReceiveResponseSchema } from "./gen/enroute/hook/v1alpha1/hook_pb";
+
 async function postReceive(
   req: PostReceiveRequest,
 ): Promise<PostReceiveResponse> {
@@ -40,7 +43,7 @@ async function postReceive(
     if (!c.newObjectId) continue;             // a delete builds nothing
     await enqueueBuild(req.repo, c.refname, c.newObjectId.hex, req.actor);
   }
-  return { messages: [] };
+  return create(PostReceiveResponseSchema, { messages: [] });
 }
 ```
 

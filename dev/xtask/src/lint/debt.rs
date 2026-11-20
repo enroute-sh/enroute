@@ -102,14 +102,13 @@ fn declared(manifest: &Value) -> Vec<String> {
         .and_then(|metadata| metadata.get("xtask"))
         .and_then(|xtask| xtask.get("lint-debt"))
         .and_then(Value::as_array)
-        .map(|rules| {
+        .map_or_default(|rules| {
             rules
                 .iter()
                 .filter_map(Value::as_str)
                 .map(str::to_string)
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 #[cfg(test)]

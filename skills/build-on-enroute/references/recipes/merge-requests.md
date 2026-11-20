@@ -42,10 +42,13 @@ async function merge(mr: MergeRequest, targetTip: string): Promise<Merged> {
     }],
   });
 
+  const rejection = outcomes[0].rejection;
   // The trunk moved while the page was open. Re-read it and ask again.
-  if (outcomes[0].rejection?.reason === Reason.NON_FAST_FORWARD) {
+  if (rejection?.reason === Reason.NON_FAST_FORWARD) {
     return { stale: true };
   }
+  // Any other rejection, such as MISSING_OBJECTS, did not land either.
+  if (rejection) return { rejected: rejection };
   return { tip: mr.tip };
 }
 ```
@@ -77,17 +80,20 @@ one moment the application has their attention. It holds no connection to
 them and will not have one again.
 
 ```ts
+import { create } from "@bufbuild/protobuf";
+import { PostReceiveResponseSchema } from "./gen/enroute/hook/v1alpha1/hook_pb";
+
 async function postReceive(
   req: PostReceiveRequest,
 ): Promise<PostReceiveResponse> {
-  const name = await nameOf(req.repo.key);  // the key carries no name
+  const name = await nameOf(req.repo!.key);  // the key carries no name
   const pushed = req.commands
     .filter((c) => c.newObjectId && !isTrunk(c.refname))
     .map((c) => c.refname);
 
   const already = await openRequestsFor(req.repo, pushed);   // one query
 
-  return {
+  return create(PostReceiveResponseSchema, {
     messages: pushed
       .filter((b) => !already.has(b))
       .map((b) =>
@@ -95,7 +101,7 @@ async function postReceive(
         `  curl -X POST ${FORGE_URL}/repos/${name}/merge-requests` +
         ` -d '{"branch": "${b}"}'\n`
       ),
-  };
+  });
 }
 ```
 
@@ -115,7 +121,9 @@ async function show(mr: MergeRequest) {
   const { refs: tips } = await refs.listRefs({
     repo: mr.repo, prefixes: [mr.target],
   });
-  const targetTip = tips[0].objectId!.hex;
+  // A prefix also matches `refs/heads/main-old`, so pick the exact name.
+  const targetTip = tips.find((r) => r.name === mr.target)?.objectId?.hex;
+  if (!targetTip) return { unknown: true };
 
   const bases = await objects.findMergeBases({
     repo: mr.repo,
@@ -124,6 +132,8 @@ async function show(mr: MergeRequest) {
   });
   if (bases.exhausted) return { unknown: true };  // not "no shared history"
   const base = bases.baseCommitIds[0];
+  // No shared history. An unset base would diff against the first parent.
+  if (!base) return { unrelated: true };
 
   const changes: FileChange[] = [];
   let truncated = false;
@@ -177,8 +187,9 @@ vouch for.
 
 ## What it does not do
 
-**Enroute makes no merge commit.** It cannot create a Git object outside a
-packfile, so these are the shapes on offer:
+**Enroute makes no merge commit.** `CreateCommit` makes a commit with one
+parent, the branch's current tip, so it cannot join two histories. These are
+the shapes on offer:
 
 | Shape | How it works |
 | --- | --- |

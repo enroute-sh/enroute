@@ -44,6 +44,12 @@
 
 (def ^:private ^ObjectMapper json (ObjectMapper.))
 
+(defn parse-json
+  "The JSON object in string `s`, with keyword keys."
+  [^String s]
+  (into {} (map (fn [[k v]] [(keyword k) v]))
+        (.readValue json s java.util.Map)))
+
 (defn get-json
   "The JSON object at `url`, with keyword keys, or nil if the status is not
   200."

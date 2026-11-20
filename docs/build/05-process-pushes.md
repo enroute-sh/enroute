@@ -78,7 +78,8 @@ were all refused sends no call at all.
 Nothing here can be refused, and `messages` is the one way your app can speak
 to the person at the terminal. Enroute sends those lines on the sideband, before
 the `ok <ref>` lines, so "open a merge request at ..." comes from here and from
-nowhere else: your app is not on the connection.
+nowhere else: your app is not on the connection. Add `postReceive` to
+`lib/hooks/receive.ts`:
 
 ```ts
 import type { PostReceiveRequest } from "@/lib/gen/enroute/hook/v1alpha1/hook";
@@ -103,9 +104,11 @@ export async function postReceive(req: PostReceiveRequest) {
 }
 ```
 
-Add both to `dispatch`:
+Import both in `app/api/enroute/hooks/route.ts`, and add them to `dispatch`:
 
 ```ts
+import { postReceive, preReceive } from "@/lib/hooks/receive";
+
 if (req.preReceive) {
   return HookResponse.fromPartial({ preReceive: await preReceive(req.preReceive) });
 }
@@ -146,8 +149,9 @@ what it saw last.
 > Treat this as latency, not as a guarantee: anything whose correctness depends
 > on being told needs its own record, reconciled separately.
 
-Enroute waits for your answer and ignores it, the way `receive-pack` waits for
-`post-receive` and ignores its exit code. A failure here undoes nothing.
+Enroute waits for your answer and sends its `messages`. A failure here undoes
+nothing: an error or an empty answer prints nothing and does not fail the
+push.
 
 ## Check your work
 

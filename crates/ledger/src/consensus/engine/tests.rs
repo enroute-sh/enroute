@@ -403,3 +403,26 @@ async fn a_seal_without_an_appointment_gets_a_new_term() {
     assert!(h.leading && h.term == 2, "{h:?}");
     stop(e).await;
 }
+
+/// A tick looks only at the logs with something to try again, so logs at
+/// rest cost it nothing however many this node sequences.
+#[tokio::test]
+async fn a_tick_looks_at_no_log_at_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let (e, _) = start(dir.path(), 1000).unwrap();
+    for i in 0..50 {
+        let name = format!("r{i}");
+        let c = e.create(&name, None, Default::default());
+        root(&e, root_entry::Change::Create(c)).await;
+        assert_eq!(e.locate(&name).await.unwrap(), Located::Here);
+    }
+    assert!(wait_until(|| e.stats().leading == 50).await);
+    let rests = |s: Stats| s.pending_logs == 0 && s.lagging_logs == 0;
+    assert!(wait_until(|| rests(e.stats())).await, "{:?}", e.stats());
+    // A read's checks are tried again until answered, and no longer.
+    create(&e).await;
+    propose(&e, push("refs/heads/a", 1)).await;
+    assert!(wait_until(|| rests(e.stats())).await, "{:?}", e.stats());
+    assert_eq!(e.stats().leading, 51);
+    stop(e).await;
+}

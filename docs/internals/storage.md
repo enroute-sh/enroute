@@ -18,10 +18,12 @@ data region      pack entries (full or REF_DELTA) in storage order: a pushed
                  layer groups them by kind (commits | trees | blobs | tags),
                  topological order within a kind; a merged layer keeps each
                  source's order, sources oldest first
-object table     fixed 52-byte records, one per entry, in storage order:
-                 oid, offset, length, size, base ref, base-context ref, depth
-oid index        (oid, local index), 24 bytes each, sorted by (kind, oid), 170
-                 to each 4 KiB page so that no entry crosses a page
+object table     fixed records, one per entry, in storage order: oid, offset,
+                 length, size, base ref, base-context ref, depth; 52 bytes for
+                 SHA-1 and 64 bytes for SHA-256
+oid index        (oid, local index), sorted by (kind, oid), packed into 4 KiB
+                 pages so that no entry crosses a page; 24 bytes and 170 per
+                 page for SHA-1, 36 bytes and 113 per page for SHA-256
 external oids    oids referenced but stored in other layers
 commit section   commits in topological order: tree, parents, time, segment members
 commit graph     merged layers only: the commit graph in ids, fixed-width arrays

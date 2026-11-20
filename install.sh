@@ -3,7 +3,7 @@
 #
 #   curl -fsSL https://enroute.sh/install | sh
 #
-# ENROUTE_VERSION picks a release, for example `0.4.0`. The default is the
+# ENROUTE_VERSION picks a release, for example `0.4.1`. The default is the
 # latest. ENROUTE_INSTALL_DIR picks the directory. The default is
 # `~/.local/bin`, so that the script does not need root.
 #

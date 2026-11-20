@@ -70,12 +70,12 @@ jobs:
             topology: wide
             spread: single
             args: ""
-            faults: "replace-ledger retire-ledger membership"
+            faults: "members membership"
           - workload: w2
             topology: wide
             spread: many
             args: "--repos 64 --rate 300"
-            faults: "replace-ledger retire-ledger membership"
+            faults: "members membership"
     env:
       LEIN_ROOT: "1"
       LEIN_VERSION: "2.12.0"

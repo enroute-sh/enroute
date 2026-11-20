@@ -35,10 +35,12 @@ The suite also checks the following:
 - Pauses (`SIGSTOP`) of the leader of a repository's log. The suite finds the
   leader with `GET /status/repos/<repo>` on each ledger node.
 - Kills and pauses of compute nodes.
-- Member changes, with the other ledger faults: a ledger node loses its disk
-  and is replaced, or a running ledger node is retired and joins again as a
-  new node. Each follows the steps in
-  [Maintenance](../operate/maintenance.md).
+- Member changes, on their own schedule beside the other ledger faults: a
+  removal of any member, a running or down one, a disk loss, a removed node
+  that is wiped and joins again, and a wiped node that joins with a new ID.
+  They come in any order, so they cover the steps in
+  [Maintenance](../operate/maintenance.md) and the orders in which those
+  steps can overlap. At the end, every log must live on members only.
 
 The suite runs the nodes as local processes on one machine, with 3 ledger
 nodes and 2 compute nodes, 5 ledger nodes and 2 compute nodes, or 3 nodes with

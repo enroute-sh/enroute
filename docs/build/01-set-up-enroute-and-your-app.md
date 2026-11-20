@@ -55,13 +55,9 @@ Without `--enable`, `--hooks` enables all four hooks.
 On the first run, Enroute generates a signing
 key and keeps it in `.enroute/dev` for later runs. The banner shows the key ID
 and the path of the public key, `.enroute/dev/hooks-signing-key.pub.pem`.
-Chapter 3 verifies signatures with that file.
-
-Keep the directory out of Git:
-
-```sh
-echo ".enroute/" >> .gitignore
-```
+Chapter 3 verifies signatures with that file. Enroute also writes
+`.enroute/.gitignore`, so Git ignores the directory without an entry in your
+own `.gitignore`.
 
 Write the URL down. Chapter 3 verifies signatures against it, and the two
 must match byte for byte. Enroute signs over the URL you configured here, not
@@ -84,12 +80,12 @@ Add each hook to `enabled` when your app answers it. See
 Copy the proto files of the release that you run, so that your code builds
 against the contract that `enroute` serves. `enroute --version` prints the
 release. Each release is a tag of the source repository on GitHub, so take
-the files from its archive. For release `0.4.0`:
+the files from its archive. For release `0.4.1`:
 
 ```sh
-curl -fsSL https://github.com/enroute-sh/enroute/archive/refs/tags/v0.4.0.tar.gz | tar -xz
-mkdir -p proto && cp -R enroute-0.4.0/proto/enroute proto/
-rm -rf enroute-0.4.0
+curl -fsSL https://github.com/enroute-sh/enroute/archive/refs/tags/v0.4.1.tar.gz | tar -xz
+mkdir -p proto && cp -R enroute-0.4.1/proto/enroute proto/
+rm -rf enroute-0.4.1
 ```
 
 The image carries the same files at `/usr/share/enroute/proto`. If you built

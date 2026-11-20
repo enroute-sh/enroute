@@ -6,7 +6,6 @@
 #![expect(
     clippy::excessive_nesting,
     clippy::too_many_lines,
-    clippy::unwrap_used,
     reason = "a test fails by panicking, on values it chose itself"
 )]
 
@@ -23,18 +22,16 @@ use enroute_shared::state::{Commit, RefUpdate};
 /// The ids of `repo`'s layer files in the (file) object store under `root`.
 fn files(root: &Path, repo: &str) -> HashSet<String> {
     let dir = root.join("store/data/repos").join(repo).join("layers");
-    std::fs::read_dir(dir)
-        .map(|d| {
-            d.flatten()
-                .filter_map(|e| {
-                    e.file_name()
-                        .to_str()?
-                        .strip_suffix(".layer")
-                        .map(String::from)
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    std::fs::read_dir(dir).map_or_default(|d| {
+        d.flatten()
+            .filter_map(|e| {
+                e.file_name()
+                    .to_str()?
+                    .strip_suffix(".layer")
+                    .map(String::from)
+            })
+            .collect()
+    })
 }
 
 /// Whether `url` serves an empty repository whose HEAD names `head`: a
@@ -545,8 +542,7 @@ async fn deleted_layer_files_are_reclaimed() {
     let named = || -> HashSet<String> {
         compute
             .state("r")
-            .map(|m| m.layers.iter().map(|l| l.id.clone()).collect())
-            .unwrap_or_default()
+            .map_or_default(|m| m.layers.iter().map(|l| l.id.clone()).collect())
     };
     let settled = || files(root.path(), "r") == named() && !named().is_empty();
     assert!(

@@ -36,15 +36,17 @@ Put the *repository* on the queue, and have the job read the tips itself and
 send whatever differs from what it last recorded.
 
 ```ts
+import { create } from "@bufbuild/protobuf";
+import { PostReceiveResponseSchema } from "./gen/enroute/hook/v1alpha1/hook_pb";
 import {
-  RefPushOutcome_Status as Status,
+  RefPushOutcome_Status as Status, RefSpecSchema,
 } from "./gen/enroute/api/v1alpha1/sync_pb";
 
 async function postReceive(
   req: PostReceiveRequest,
 ): Promise<PostReceiveResponse> {
   await enqueueMirror(req.repo);        // the repository, not the commands
-  return { messages: [] };
+  return create(PostReceiveResponseSchema, { messages: [] });
 }
 
 async function mirror(repo: RepoKey): Promise<void> {
@@ -54,12 +56,12 @@ async function mirror(repo: RepoKey): Promise<void> {
   const specs: RefSpec[] = [];
   for (const r of here) {
     if (sent.get(r.name) !== r.objectId!.hex) {
-      specs.push({ source: r.name, destination: r.name, force: false });
+      specs.push(create(RefSpecSchema, { source: r.name, destination: r.name, force: false }));
     }
   }
   for (const name of sent.keys()) {                 // gone here, gone there
     if (!here.some((r) => r.name === name)) {
-      specs.push({ source: "", destination: name, force: false });
+      specs.push(create(RefSpecSchema, { source: "", destination: name, force: false }));
     }
   }
   if (specs.length === 0) return;

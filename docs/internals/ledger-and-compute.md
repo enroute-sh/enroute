@@ -20,15 +20,14 @@ node both roles. The ledger keeps the record of what happened and in what order.
 The compute (the usual word for Git hosting) does the Git work.
 
 - **Ledger**: a small, stable set of nodes with durable disks, like TiKV's
-  stores or Neon's safekeepers. Each repository's log has three of the members
-  as its replicas. The members hold the logs and the state machines (refs and
-  manifest), and little else.
+  stores. Each repository's log has three of the members as its replicas. The
+  members hold the logs and the state machines (refs and manifest), and little
+  else.
 - **Compute**: everything else, as many nodes as the load needs. A compute node
   that serves a repository **subscribes** to its log. A ledger node streams it
   the state of the repository, then every committed change, inline layers
-  included, as Neon's pageservers stream WAL from its safekeepers. Compute nodes
-  are not members of any log. They come and go without a single entry being
-  written.
+  included. Compute nodes are not members of any log. They come and go without
+  a single entry being written.
 
 Compute nodes are subscribers, not replicas, for three reasons. A replica
 join or leave would be a change in the log of every repository the node
@@ -65,7 +64,7 @@ the state machine too. Commands, repository state and outcomes are protobuf
 messages in the log, in the stream to subscribers, in the RPCs and in the state
 objects in the object store. Inline layer bytes travel as bytes, not base64.
 
-Three services run between nodes:
+Four services run between nodes:
 
 - **The membership service**, which earns a node its token (see
   [Joining the ledger](#joining-the-ledger)).
@@ -105,6 +104,8 @@ Three services run between nodes:
   per request (the root log's Raft messages as opaque bytes, the repository
   logs' appends, acknowledgements, seals and checks) and liveness pings
   ([Consensus](consensus.md#batched-transport)).
+- **The `Cluster` service**, which joins a node to the ledger, removes a
+  member, and lists the members ([Membership](#membership)).
 
 ## Joining the ledger
 

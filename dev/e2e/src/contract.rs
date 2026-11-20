@@ -35,7 +35,7 @@ use enroute_api::common::v1alpha1::{ObjectId, RepoKey};
 /// Unset reads as empty, which is what a test asserting a side of a diff is
 /// absent compares against.
 pub(crate) fn hex(id: Option<&ObjectId>) -> String {
-    id.map(|id| id.hex.clone()).unwrap_or_default()
+    id.map_or_default(|id| id.hex.clone())
 }
 
 /// The hex out of every id in a list, for comparing against git's own.

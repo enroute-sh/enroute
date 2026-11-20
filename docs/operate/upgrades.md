@@ -198,6 +198,13 @@ not on the old one. To keep them, copy them back the same way, with
 
 ## Notes for specific releases
 
+### From 0.4.0 to 0.4.1
+
+- 0.4.1 reads the storage that 0.4.0 wrote. [Upgrade in place](#upgrade-in-place).
+- No configuration keys are added or removed, and the proto files are
+  unchanged.
+- `/status` on a ledger node adds `engine.pending_logs`.
+
 ### From 0.3 to 0.4
 
 - 0.4.0 changes the storage format. [Migrate](#migrate-to-a-new-deployment)

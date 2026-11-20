@@ -11,12 +11,14 @@ command. Read that first: this page changes one function in it.
 
 ### What Enroute refuses on its own
 
-Enroute refuses a push whose objects never arrived, whose refname Git would not
-accept, and whose `oldObjectId` no longer matches what the ref holds. It
-refuses nothing else.
+Before it calls `pre_receive`, Enroute refuses a command whose objects never
+arrived, whose refname Git would not accept, that updates the same ref twice,
+or that deletes the branch `HEAD` names. After `pre_receive` allows a command,
+Enroute refuses it if its `oldObjectId` no longer matches what the ref holds.
+It refuses nothing else.
 
-A force-push over the trunk, a deleted trunk, and a branch nobody reviewed each
-land unless your app says otherwise. Enroute holds no opinion about which
+A force-push over the trunk, a deleted release branch or tag, and a branch
+nobody reviewed each land unless your app says otherwise. Enroute holds no opinion about which
 refs may be rewritten, which is why `pre_receive` exists.
 
 ### Reject deletion as well as force pushes
@@ -64,7 +66,7 @@ export function protectionsFor(repoId: string) {
 }
 ```
 
-Give the repository two rows. Add them to `scripts/seed.ts`:
+Give the repository two rows. Add them to `scripts/seed.mts`:
 
 ```ts
 import { protections } from "../lib/db/schema";
@@ -132,8 +134,8 @@ function judge(rules: Rule[], command: RefCommand) {
 **`force` means what Git means.** It is true when `oldObjectId` is not an
 ancestor of `newObjectId`, which is a rewrite. Enroute answers it because your
 app holds no commit graph and cannot work it out. A ref that moves forward
-over a stale value is a different thing, and Enroute refuses that before it
-asks you.
+over a stale value is a different thing: Enroute refuses that when it lands
+the push, after `pre_receive` answers.
 
 **`reason` is all the person gets.** Their Git client prints it the way it
 prints the stderr of a hook. Name the ref and say what to do instead.
@@ -196,16 +198,23 @@ git push origin main
 error: failed to push some refs to 'http://127.0.0.1:8080/acme/widgets.git'
 ```
 
-Deleting the trunk is refused, and this is the check the force-only rule would
-have failed:
+Deleting a protected tag is refused, and this is the check the force-only rule
+would have failed. Creating the tag lands, because a create has no history to
+overwrite:
 
 ```sh
-git push origin --delete main
+git tag v0.1
+git push origin v0.1
+git push origin --delete v0.1
 ```
 
 ```text
- ! [remote rejected] main (refs/heads/main is protected and cannot be deleted)
+ ! [remote rejected] v0.1 (refs/tags/v0.1 is protected and cannot be deleted)
 ```
+
+Enroute refuses a delete of `main` on its own, before it calls `pre_receive`,
+because `main` is the branch `HEAD` names. The deletion check protects every
+other branch and tag that a rule matches.
 
 The repository page still shows `main` at its old tip, because nothing moved.
 

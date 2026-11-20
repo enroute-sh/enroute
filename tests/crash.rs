@@ -6,9 +6,7 @@
     clippy::as_conversions,
     clippy::cast_possible_truncation,
     clippy::excessive_nesting,
-    clippy::panic,
     clippy::too_many_lines,
-    clippy::unwrap_used,
     reason = "a test fails by panicking, on values it chose itself"
 )]
 

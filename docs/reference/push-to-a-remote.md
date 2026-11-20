@@ -13,8 +13,12 @@ rejected if the remote does not support atomic pushes.
 
 `outcomes` match request order. `STATUS_UPDATED`, `STATUS_DELETED`, and
 `STATUS_UP_TO_DATE` are successful outcomes. `STATUS_REJECTED` includes a
-message from the remote or Enroute's fast-forward check. Transport failures
-fail the RPC and no refs are updated.
+message from the remote or Enroute's fast-forward check.
+
+A call that fails before it has outcomes fails the RPC. `UNAVAILABLE` means
+that Enroute could not reach the remote. `UNKNOWN` means that Enroute sent the
+push and could not read the remote's answer, so the push may have landed. List
+the remote's refs before you act on an `UNKNOWN` failure.
 
 The call has a 30-second ref-discovery limit, a one-hour total limit, and a
 one-minute no-output timeout. Retrying a timeout is safe if the remote already
@@ -25,7 +29,6 @@ has the requested values.
 - Use `https`; `http` requires `git.allow_private_remotes`.
 - Do not include a username, password, query, or fragment in the URL.
 - Hosts must resolve to public addresses unless private remotes are enabled.
+  Enroute checks the addresses that the connection dials, not an earlier
+  lookup.
 - Redirects are rejected so credentials cannot reach an unnamed host.
-
-The public-address check and connection can use different DNS resolutions, so
-it is not complete protection against DNS rebinding.

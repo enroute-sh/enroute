@@ -18,7 +18,7 @@ failed=0
 mkdir -p store
 ALL="partition-ledger,partition-compute,kill-ledger,pause-leader,pause-compute,kill-compute"
 # Member changes with the faults that most often stop them part way.
-MEMBERSHIP="replace-ledger,retire-ledger,partition-ledger,kill-ledger,pause-leader"
+MEMBERSHIP="members,partition-ledger,kill-ledger,pause-leader"
 
 for w in $WORKLOADS; do
   for f in $FAULTS; do
@@ -30,7 +30,7 @@ for w in $WORKLOADS; do
     esac
     lazy=""
     # LazyFS slows every write, so only runs that kill ledger nodes use it.
-    case $n in *kill-ledger*|*kill-leader*|*replace-ledger*) [ -x "$LAZYFS" ] && lazy="--lazyfs $LAZYFS" ;; esac
+    case $n in *kill-ledger*|*kill-leader*|*members*) [ -x "$LAZYFS" ] && lazy="--lazyfs $LAZYFS" ;; esac
     echo "== $w $TOPOLOGY ${f}" >&2
     # shellcheck disable=SC2086
     before=$(readlink -f store/latest || true)

@@ -39,13 +39,10 @@ Create `app/api/enroute/hooks/route.ts`:
 import { HookRequest, HookResponse } from "@/lib/gen/enroute/hook/v1alpha1/hook";
 import { verifyHook } from "@/lib/hooks/signature";
 
-// grpc-js needs Node, and so does the signature check.
-export const runtime = "nodejs";
-
 export async function POST(request: Request) {
   const body = new Uint8Array(await request.arrayBuffer());
 
-  if (!verifyHook(request.headers, body)) {
+  if (!(await verifyHook(request.headers, body))) {
     return new Response(null, { status: 401 });
   }
 
@@ -82,8 +79,8 @@ Four rules govern every answer this route will ever give:
 
 Enroute signs each hook with an Ed25519 HTTP Message Signature
 ([RFC 9421](https://www.rfc-editor.org/rfc/rfc9421.html)). Do not implement the
-signature base by hand: use a library, and spend your attention on the two
-checks a library does not do for you.
+signature base by hand: use a library, and spend your attention on the checks
+a library does not do for you.
 
 ```sh
 npm install http-message-signatures
@@ -113,6 +110,8 @@ const KEYID = createHash("sha256")
   .update(`{"crv":"Ed25519","kty":"OKP","x":"${x}"}`)
   .digest("base64url");
 const MAX_SKEW_SECONDS = 300;
+// The components Enroute signs. A signature that covers less proves less.
+const COVERED = ["@method", "@authority", "@path", "content-digest"];
 
 const key = {
   id: KEYID,
@@ -121,38 +120,42 @@ const key = {
     verifyEd25519(null, data, PUBLIC_KEY, signature),
 };
 
-export async function verifyHook(headers: Headers, body: Uint8Array) {
+export async function verifyHook(headers: Headers, body: Uint8Array): Promise<boolean> {
   // The signature covers the content-digest *header*, not the bytes. Without
   // this line the header can describe a body that never arrived.
   const digest = `sha-256=:${createHash("sha256").update(body).digest("base64")}:`;
   if (headers.get("content-digest") !== digest) return false;
 
   try {
-    return await httpbis.verifyMessage(
+    const verified = await httpbis.verifyMessage(
       {
         keyLookup: async ({ keyid }) => (keyid === KEYID ? key : null),
-        // Reject a created time more than five minutes out, either way.
+        // Without this, a signature over `@method` alone verifies.
+        requiredFields: COVERED,
         requiredParams: ["created"],
+        // Reject a created time more than five minutes out, either way.
         maxAge: MAX_SKEW_SECONDS,
-        tolerance: MAX_SKEW_SECONDS,
+        notAfter: Math.floor(Date.now() / 1000) + MAX_SKEW_SECONDS,
       },
       // The URL Enroute is configured with, never the one that arrived.
       { method: "POST", url: ENDPOINT, headers: Object.fromEntries(headers) },
     );
+    // `null` means no signature could be checked, which is not a pass.
+    return verified === true;
   } catch {
     return false;
   }
 }
 ```
 
-Two things in there are load-bearing.
+Three things in there are load-bearing.
 
 **Check the digest against the body yourself.** The signature covers the
 `content-digest` header. It says that header was not altered; it says nothing
 about the bytes that arrived. This library's request type has no body field at
 all, so it cannot make this check for you, and without it somebody can replace
-the body and leave the header and signature untouched. It is the one part of
-verification no library will do.
+the body and leave the header and signature untouched. No library makes this
+check.
 
 `Content-Digest` is its own specification, [RFC 9530], which is why a signature
 library has no opinion about it. Enroute sends a single `sha-256` entry, so
@@ -162,6 +165,12 @@ refusing valid requests rather than accepting bad ones, which is the direction
 to be wrong in.
 
 [RFC 9530]: https://www.rfc-editor.org/rfc/rfc9530.html
+
+**Require the components Enroute signs.** A library verifies whatever
+component list the `Signature-Input` header names. Without `requiredFields`,
+a signature over `@method` alone verifies, and it says nothing about the path
+or the body. Enroute always covers `@method`, `@authority`, `@path`, and
+`content-digest`.
 
 **Verify against the URL Enroute is configured with**, not the `Host` header
 and path that arrived. A proxy rewrites those, and Enroute signed the string

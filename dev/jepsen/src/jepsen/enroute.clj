@@ -81,6 +81,7 @@
   (let [w        (workloads (:workload opts))
         topo     (cluster/topology (:topology opts))
         faults   (:nemesis opts)
+        nem      (nemesis/package faults (:interval opts))
         max-repo (atom 0)
         opts     (merge opts w {:max-repo max-repo, :hot-repo (atom 0)})
         git-gen  #(git-fetch-op max-repo)]
@@ -96,13 +97,13 @@
             :ssh       {:dummy? true}
             :db        (cluster/db)
             :client    (client/client)
-            :nemesis   (nemesis/nemesis)
+            :nemesis   (:nemesis nem)
             :generator (gen/phases
                          (->> (txn-gen opts)
                               (gen/stagger (/ (:rate opts)))
-                              (gen/nemesis (nemesis/generator faults (:interval opts)))
+                              (gen/nemesis (:generator nem))
                               (gen/time-limit (:time-limit opts)))
-                         (gen/nemesis (nemesis/final-generator))
+                         (gen/nemesis (:final-generator nem))
                          (gen/log "Healed. Quiet period.")
                          (gen/sleep (:quiet opts))
                          (gen/clients (gen/each-thread {:f :final-read, :value []}))
@@ -112,21 +113,21 @@
                                   :durability  (ec/durability)
                                   :phantoms    (ec/phantoms)
                                   :fetches     (ec/fetches)
+                                  :members     (ec/members)
                                   :stats       (checker/stats)
                                   :exceptions  (checker/unhandled-exceptions)}
                            (and (:pin? w) (not= :rp (:read-mode w)))
                            (assoc :node-monotonic (ec/node-monotonic))))})))
 
-(def fault-names (set (map name (keys nemesis/faults))))
 
 (def cli-opts
   [["-w" "--workload NAME" "w1, w1-v0, w2, w3, or w4"
     :default :w1, :parse-fn keyword, :validate [workloads "unknown workload"]]
    [nil "--topology NAME" "split (3 ledger and 2 compute nodes), both (3 nodes), or wide (5 ledger and 2 compute nodes)"
     :default :split, :parse-fn keyword, :validate [#{:split :both :wide} "split, both, or wide"]]
-   [nil "--nemesis FAULTS" (str "Comma-separated faults: " (str/join ", " (sort fault-names)))
+   [nil "--nemesis FAULTS" (str "Comma-separated faults: " (str/join ", " (sort nemesis/fault-names)))
     :default [], :parse-fn #(mapv keyword (remove str/blank? (str/split % #",")))
-    :validate [#(every? (comp fault-names name) %) "unknown fault"]]
+    :validate [#(every? (comp nemesis/fault-names name) %) "unknown fault"]]
    [nil "--interval SECONDS" "Seconds between fault changes"
     :default 10, :parse-fn parse-double]
    [nil "--quiet SECONDS" "Seconds of quiet before the final reads"

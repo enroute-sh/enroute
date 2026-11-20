@@ -119,10 +119,10 @@ value.
 | --- | --- |
 | `enroute [serve] --config <URI>` | Run the node. `serve` is the default |
 | `enroute dev [--hooks <URL>] [--enable <HOOK>]` | Run a local node with a generated configuration. See [Quickstart](../quickstart.md) |
-| `enroute members --config <URI>` | List the ledger members in `bucket` |
+| `enroute members --config <URI>` | List the ledger members in `bucket`. Takes `--json` |
 | `enroute members --config <URI> --remove <ID> [--force]` | Remove a ledger member for good |
-| `enroute diagnose --config <URI>` | Check the object store, the ledger members and which answer, and the `/status` of each live node. Exits non-zero if a check fails |
-| `enroute repo create\|get\|list\|delete` | Manage repositories over the API |
+| `enroute diagnose --config <URI>` | Check the object store, the ledger members and which answer, and the `/status` of each live node. Exits non-zero if a check fails. Takes `--json` |
+| `enroute repo create\|get\|list\|delete` | Manage repositories over the API. `create` takes `--default-branch` and `--object-format`, and `list` takes `--prefix` |
 | `enroute refs <KEY> [--prefix <P>]` | Print each ref as `<oid>\t<refname>` |
 | `enroute commit <KEY> --branch <REF> -m <MSG> --author <ID>` | Make a commit with `CreateCommit`. Takes `--put`, `--delete`, `--exec`, `--symlink`, `--expect`, and `--expect-absent` |
 

@@ -25,9 +25,13 @@ Look the token up in the deploy-key table before the session table, and grant
 against the one repository the key names.
 
 ```ts
-const deny = (denial: Denial): AuthorizeResponse => ({
-  outcome: { case: "denied", value: { denial } },
-});
+import { create } from "@bufbuild/protobuf";
+import { AuthorizeResponseSchema } from "./gen/enroute/hook/v1alpha1/hook_pb";
+
+const deny = (denial: Denial): AuthorizeResponse =>
+  create(AuthorizeResponseSchema, {
+    outcome: { case: "denied", value: { denial } },
+  });
 
 async function authorize(req: AuthorizeRequest): Promise<AuthorizeResponse> {
   const token = bearerOrBasicPassword(req.headers);
@@ -41,7 +45,7 @@ async function authorize(req: AuthorizeRequest): Promise<AuthorizeResponse> {
     return deny(Denial.FORBIDDEN);
   }
 
-  return {
+  return create(AuthorizeResponseSchema, {
     outcome: {
       case: "granted",
       value: {
@@ -50,7 +54,7 @@ async function authorize(req: AuthorizeRequest): Promise<AuthorizeResponse> {
         context: new TextEncoder().encode(JSON.stringify({ key: key.id })),
       },
     },
-  };
+  });
 }
 ```
 

@@ -231,7 +231,7 @@ Set exactly one of `granted` or `denied`.
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `repo` | `RepoKey` | The repository to serve. A key no repository holds is a `404` to the client. |
+| `repo` | `RepoKey` | The repository to serve. A key no repository holds is a `404` to the client, except on a push with `git.create_on_push` on, which creates the repository. |
 | `actor` | `string` | Who is asking, as an ID in your own namespace. |
 | `context` | `bytes` | Up to 8 KiB replayed on the later hooks of this request. Optional. |
 
@@ -438,9 +438,9 @@ answers.
 | `actor` | `string` | Who is pushing, as `Granted.actor` named them. |
 | `commands` | `RefCommand[]` | Every update the push still asks for, in `receive-pack` order. |
 | `context` | `bytes` | `Granted.context`, byte for byte. |
-| `push_options` | `string[]` | What the client passed with `git push -o`, in order. Empty when it sent none. |
+| `pushOptions` | `string[]` | What the client passed with `git push -o`, in order. Empty when it sent none. |
 
-`push_options` is how a pusher asks for something along with the push, such as
+`pushOptions` is how a pusher asks for something along with the push, such as
 `git push -o ci.skip` or a merge request title. Git sends them only to a server
 that advertises `push-options`, which Enroute does. They come from the pusher,
 so treat them as a request, not as a decision.
@@ -448,8 +448,11 @@ so treat them as a request, not as a decision.
 Whoever reaches this call already has write access. Use `actor` for policy that
 cares *which* writer, not whether.
 
-`commands` excludes anything Enroute already refused on its own, such as a
-non-fast-forward or an object that never arrived. What you are sent is still
+`commands` excludes anything Enroute already refused on its own: an invalid
+refname, an object that never arrived, a second update to the same ref, or a
+delete of the branch `HEAD` names. A force-push is not refused on its own: it
+arrives with `force` true. A stale `oldObjectId` is refused later, when
+Enroute lands the push. What you are sent is still
 live, so a judgement you return is never for something already dead. In a push
 made with `git push --atomic`, one such refusal fails the whole push, and
 Enroute does not call `pre_receive`.
@@ -613,11 +616,16 @@ the moment it does, rather than by listing refs on a timer.
 | `actor` | `string` | Who pushed, as `Granted.actor` named them. |
 | `commands` | `RefCommand[]` | Every command that landed, and only those. |
 | `context` | `bytes` | `Granted.context`, byte for byte. |
-| `push_options` | `string[]` | What the client passed with `git push -o`, in order. Empty when it sent none. |
+| `pushOptions` | `string[]` | What the client passed with `git push -o`, in order. Empty when it sent none. |
 
 `commands` uses the same [`RefCommand`](#refcommand) as `pre_receive`. A push
 whose commands were all refused sends no call at all, rather than a call with an
 empty list.
+
+Enroute computes `force` only when `pre_receive` is enabled. When
+`post_receive` is enabled and `pre_receive` is not, every command arrives with
+`force` false. To act on force-pushes in `post_receive`, enable `pre_receive`
+as well.
 
 `actor` is always a Git client. An application that moves a ref over the API
 runs no hooks, so its own writes never arrive here.
@@ -642,9 +650,9 @@ sent none, which is also what Git does.
 > Treat this as latency, not as a guarantee. Anything whose correctness depends
 > on being told needs its own record.
 
-Enroute waits for the answer and ignores it, the way `receive-pack` waits for
-`post-receive` and ignores its exit code. A failure here undoes nothing, and the
-push is not failed for it.
+Enroute waits for the answer, sends its `messages`, and ignores the rest, the
+way `receive-pack` waits for `post-receive` and ignores its exit code. A
+failure here undoes nothing, and the push is not failed for it.
 
 ### Example
 
@@ -701,7 +709,7 @@ check.
 | Body is not a `HookResponse` | Git request fails | You set a member of `answer`, and you write binary protobuf |
 | `answer` is empty | Git request fails, except on `post_receive` | The `answer` member matches the `call` member |
 | Signature rejected by your endpoint | Git request fails | You verify against the configured URL's authority and path, not the arriving `Host` |
-| `Granted.repo` names no repository | `404` to the client | The key names a repository |
+| `Granted.repo` names no repository | `404` to the client, unless a push creates it under `git.create_on_push` | The key names a repository |
 | `Granted.context` over 8 KiB | Git request fails | Store the data and send a reference to it |
 | A command with no judgement | The whole push fails | You judge every command in `commands` |
 

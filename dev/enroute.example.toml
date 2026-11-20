@@ -67,6 +67,9 @@ role = "both"
 #
 # Drop a repository's view once it is unused this long.
 # evict_after = "15m"
+# Console log lines that can wait for stdout. When the buffer is full, new
+# lines are dropped and the node logs how many.
+# console_buffer_lines = 128000
 
 # Concurrent requests to `bucket`, shared by kinds of work. A kind can always
 # use its `reserve`, never more than its `limit`, and shares the rest by

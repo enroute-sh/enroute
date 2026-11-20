@@ -143,11 +143,7 @@ impl Landed {
 
     fn record(&self, call: &pb::PostReceiveRequest) {
         let push = Push {
-            repo: call
-                .repo
-                .as_ref()
-                .map(|r| r.key.clone())
-                .unwrap_or_default(),
+            repo: call.repo.as_ref().map_or_default(|r| r.key.clone()),
             actor: call.actor.clone(),
             context: call.context.to_vec(),
             commands: call

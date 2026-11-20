@@ -78,7 +78,7 @@ Every release is pushed to the GitHub Container Registry as
 | Tag            | What it names                                  |
 | -------------- | ---------------------------------------------- |
 | `latest`       | The current release. Moves with each one.      |
-| `<version>`    | One release, for example `0.4.0`. Not rebuilt. |
+| `<version>`    | One release, for example `0.4.1`. Not rebuilt. |
 | `sha-<commit>` | One commit. The tag that is never reused.      |
 
 The image is a manifest list for `linux/amd64` and `linux/arm64`, so it runs
@@ -124,7 +124,7 @@ is the host machine as a container sees it:
 docker run --rm -d --name enroute \
   -p 8080:8080 -p 50051:50051 -v enroute-dev:/data \
   --add-host=host.docker.internal:host-gateway \
-  ghcr.io/enroute-sh/enroute:0.4.0 dev --dir /data --host 0.0.0.0 \
+  ghcr.io/enroute-sh/enroute:0.4.1 dev --dir /data --host 0.0.0.0 \
   --hooks http://host.docker.internal:3000/api/enroute/hooks
 ```
 

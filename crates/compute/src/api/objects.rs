@@ -140,7 +140,7 @@ impl ObjectService for Api {
                     body: lossy(&commit.body),
                 })
                 .collect(),
-            next_page_token: page.next.map(|oid| oid.to_hex()).unwrap_or_default(),
+            next_page_token: page.next.map_or_default(|oid| oid.to_hex()),
         };
         Ok(Response::new(streamed(vec![response])))
     }

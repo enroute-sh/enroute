@@ -4,5 +4,5 @@
 # No `targets`: nothing is cross-compiled. The deploy image builds on a linux
 # builder for that builder, so the only standard library it needs is the host's.
 [toolchain]
-channel = "1.98.1"
+channel = "1.100.0"
 components = ["rustfmt", "clippy"]

@@ -44,7 +44,7 @@ impl Store {
     /// Returns an error if `root` cannot be created, or is not an absolute
     /// path.
     pub fn local(root: &Path) -> Result<Store> {
-        std::fs::create_dir_all(root)?;
+        crate::durable::create_dir_all(root)?;
         Ok(Store {
             store: Arc::new(super::local::LocalStore::new(root)?),
             files: Some(Arc::new(StoreFiles::new(root)?)),

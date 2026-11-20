@@ -12,23 +12,21 @@
 //!
 //! **Failover** (see `shardlog`'s model and [`super::repo`]): seal the log
 //! at term + 1 on its replicas (and, during a replica change, the replicas
-//! it changes from), and once a quorum (of each) answered, appoint one of
-//! the most up-to-date answering members by a compare-and-swap on the root
+//! it changes from), and once a quorum (of each) answered, appoint a member
+//! as up to date as such a quorum by a compare-and-swap on the root
 //! (`Appointment`), batched for every log ready in a tick. A seal refused
 //! by a higher term, or an appointment that no longer applies, means
 //! another took over: the log is looked at again.
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
-
-use crate::proto::{Appointment, Incarnation, Record, Sealed, frame};
+use crate::proto::{Appointment, Incarnation, Sealed, frame};
 
 use super::log_id;
 use super::repo::Msg;
-use super::root::Directory;
-use super::shardlog::{self, Next, Response};
+use super::root::{self, Directory};
+use super::shardlog::{self, Config, Limits, Request, Response};
 use super::transport::{Frame, frame as framed};
 
 /// How often each node pings every other member.
@@ -141,91 +139,107 @@ impl Liveness {
     }
 }
 
-/// A failover in flight: the seal of the next term, as the protocol runs
-/// it ([`shardlog::Reconfigure`]), and once it reached its quorums, the
-/// replicas that may be appointed.
-struct Failover {
-    repo: String,
-    epoch: u64,
-    seal: shardlog::Reconfigure<u64>,
-    candidates: Option<Vec<u64>>,
-    /// Whether the appointment was proposed.
-    proposed: bool,
-    at: Instant,
+/// `d` in milliseconds.
+fn millis(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// The root leader's controller.
-#[derive(Default)]
-pub(super) struct Controller {
-    /// Failovers in flight, by log id.
-    inflight: HashMap<u64, Failover>,
-    /// Repositories to look at.
-    todo: VecDeque<String>,
-    queued: HashSet<String>,
-    /// Whether this node led the root at the last tick.
-    leading: bool,
-    /// Repositories whose sequencer was deposed by a seal whose
-    /// appointment never came: they need a new term.
-    deposed: HashSet<String>,
+/// The cluster as the root's leader sees it, for the controller.
+struct View<'a> {
+    dir: &'a Directory,
+    live: &'a Liveness,
 }
 
-/// Why a log needs a new term, if it does.
-fn needs(
-    repo: &str,
-    inc: &Incarnation,
-    dir: &Directory,
-    live: &Liveness,
-    deposed: bool,
-) -> Option<Vec<u64>> {
+impl shardlog::Cluster<u64, u64> for View<'_> {
+    fn config(&self, log: &u64) -> Option<Config<u64>> {
+        let repo = self.dir.logs.get(log)?;
+        self.dir.live(repo).map(root::config)
+    }
+
+    fn member(&self, r: u64) -> bool {
+        self.dir.meta.members.contains(&r)
+    }
+
+    fn boot(&self, r: u64) -> Option<u64> {
+        self.live.boot(r)
+    }
+
+    /// A removed replica is replaced, missing ones are added (logs made
+    /// while there were fewer members), and one sharing a zone moves to a
+    /// zone the log lacks.
+    fn moved(&self, log: &u64, config: &Config<u64>) -> Option<Vec<u64>> {
+        let (dir, live) = (self.dir, self.live);
+        let repo = dir.logs.get(log)?;
+        let members = &dir.meta.members;
+        let want = root::REPLICAS.min(members.len());
+        let short = short(dir, &config.replicas);
+        if !(short || dir.crowded(&config.replicas)) {
+            return None;
+        }
+        let others: Vec<u64> = (members.iter())
+            .copied()
+            .filter(|&n| live.alive(n) && !config.replicas.contains(&n))
+            .collect();
+        if short {
+            let mut replicas = dir.choose(repo, &config.replicas, &others);
+            replicas.truncate(want);
+            // (Not while too few members are up to place them.)
+            (replicas != config.replicas && replicas.len() == want).then_some(replicas)
+        } else {
+            dir.respread(repo, &config.replicas, config.sequencer, &others, |n| {
+                live.alive(n)
+            })
+        }
+    }
+}
+
+/// Whether `replicas` are fewer than a log wants (placed while fewer members
+/// were up) or hold a removed node.
+fn short(dir: &Directory, replicas: &[u64]) -> bool {
     let members = &dir.meta.members;
-    let seq_gone =
-        deposed || !members.contains(&inc.sequencer) || live.boot(inc.sequencer) != Some(inc.boot);
-    // A removed replica is replaced, missing ones are added (logs made
-    // while there were fewer members), and one sharing a zone moves to a
-    // zone the log lacks, one change at a time.
-    let want = super::root::REPLICAS.min(members.len());
-    let removed = inc.replicas.iter().any(|n| !members.contains(n));
-    let short = removed || inc.replicas.len() < want;
-    if !inc.joint.is_empty() || !(short || dir.crowded(&inc.replicas)) {
-        return seq_gone.then(|| inc.replicas.clone());
-    }
-    let others: Vec<u64> = (members.iter())
-        .copied()
-        .filter(|&n| live.alive(n) && !inc.replicas.contains(&n))
-        .collect();
-    let moved = if short {
-        let mut replicas = dir.choose(repo, &inc.replicas, &others);
-        replicas.truncate(want);
-        // (Not while too few members are up to place them.)
-        (replicas != inc.replicas && replicas.len() == want).then_some(replicas)
-    } else {
-        dir.respread(repo, &inc.replicas, inc.sequencer, &others, |n| {
-            live.alive(n)
-        })
-    };
-    match moved {
-        // A move never drops the sitting sequencer: it hands the log to
-        // another replica first, in a term on the same replicas, as a lease
-        // moves before its replica does. It stays a replica of that term, so
-        // it learns the outcome of what it appended. Its replica moves next.
-        Some(replicas) if !replicas.contains(&inc.sequencer) => Some(inc.replicas.clone()),
-        moved => moved.or_else(|| seq_gone.then(|| inc.replicas.clone())),
-    }
+    replicas.len() < root::REPLICAS.min(members.len())
+        || replicas.iter().any(|n| !members.contains(n))
+}
+
+/// The root leader's controller ([`shardlog::Root`]) over log ids, on this
+/// node's clock.
+pub(super) struct Controller {
+    root: shardlog::Root<u64, u64>,
+    started: Instant,
 }
 
 impl Controller {
-    /// Look at `repo` again soon.
-    pub(super) fn note(&mut self, repo: &str) {
-        if self.leading && self.queued.insert(repo.to_string()) {
-            self.todo.push_back(repo.to_string());
+    pub(super) fn new() -> Controller {
+        Controller {
+            root: shardlog::Root::new(Limits {
+                retry: millis(RETRY),
+                per_tick: CHECKS_PER_TICK,
+                in_flight: IN_FLIGHT,
+            }),
+            started: Instant::now(),
+        }
+    }
+
+    /// The controller's clock.
+    fn now(&self) -> u64 {
+        millis(self.started.elapsed())
+    }
+
+    /// Look at `repo`'s live log soon.
+    fn note(&mut self, dir: &Directory, repo: &str) {
+        if let Some(inc) = dir.live(repo) {
+            self.root.note(log_id(repo, inc.epoch));
         }
     }
 
     /// Look at the repositories `node` sequences.
     pub(super) fn note_node(&mut self, dir: &Directory, node: u64) {
+        if !self.root.leading() {
+            return;
+        }
         if let Some(repos) = dir.sequencing.get(&node) {
             for r in repos {
-                self.note(r);
+                self.note(dir, r);
             }
         }
     }
@@ -234,38 +248,37 @@ impl Controller {
     /// members were up, or with a removed one) or with two in one zone: a
     /// node came up to take them.
     pub(super) fn note_short(&mut self, dir: &Directory) {
-        if !self.leading {
+        if !self.root.leading() {
             return;
         }
-        let members = &dir.meta.members;
-        let want = super::root::REPLICAS.min(members.len());
         // A log with two replicas in one zone, if a member is in a zone it
         // lacks.
-        let zones: BTreeSet<&str> = members.iter().filter_map(|&n| dir.zone(n)).collect();
+        let zones: BTreeSet<&str> = (dir.meta.members.iter())
+            .filter_map(|&n| dir.zone(n))
+            .collect();
         let lacks = |inc: &Incarnation| {
             zones
                 .iter()
                 .any(|&z| inc.replicas.iter().all(|&n| dir.zone(n) != Some(z)))
         };
-        let short = |inc: &Incarnation| {
-            inc.replicas.len() < want
-                || inc.replicas.iter().any(|n| !members.contains(n))
+        let moves = |inc: &Incarnation| {
+            short(dir, &inc.replicas)
                 || !zones.is_empty() && dir.crowded(&inc.replicas) && lacks(inc)
         };
         for (r, inc) in &dir.repos {
-            if !inc.deleted && short(inc) {
-                self.note(r);
+            if !inc.deleted && moves(inc) {
+                self.root.note(log_id(r, inc.epoch));
             }
         }
     }
 
     /// Look at every repository.
     pub(super) fn note_all(&mut self, dir: &Directory) {
-        if !self.leading {
+        if !self.root.leading() {
             return;
         }
-        for r in dir.repos.keys() {
-            self.note(r);
+        for &log in dir.logs.keys() {
+            self.root.note(log);
         }
     }
 
@@ -279,15 +292,8 @@ impl Controller {
         live: &Liveness,
         down: &[u64],
     ) -> (Vec<(u64, Frame)>, Vec<Appointment>) {
-        if leading != self.leading {
-            self.leading = leading;
-            self.inflight.clear();
-            self.todo.clear();
-            self.queued.clear();
-            self.deposed.clear();
-            if leading {
-                self.note_all(dir);
-            }
+        if self.root.lead(leading) {
+            self.note_all(dir);
         }
         if !leading || !live.settled() {
             return (Vec::new(), Vec::new());
@@ -295,153 +301,87 @@ impl Controller {
         for &n in down {
             self.note_node(dir, n);
         }
-        let mut seals = Vec::new();
-        // Failovers that stalled start again.
-        let stalled: Vec<u64> = (self.inflight.iter())
-            .filter(|(_, f)| f.at.elapsed() > RETRY)
-            .map(|(&l, _)| l)
-            .collect();
-        for log in stalled {
-            if let Some(f) = self.inflight.remove(&log) {
-                self.note(&f.repo);
-            }
-        }
-        for _ in 0..CHECKS_PER_TICK {
-            if self.inflight.len() >= IN_FLIGHT {
-                break;
-            }
-            let Some(repo) = self.todo.pop_front() else {
-                break;
-            };
-            self.queued.remove(&repo);
-            let Some(inc) = dir.live(&repo) else { continue };
-            let log = log_id(&repo, inc.epoch);
-            if self.inflight.contains_key(&log) {
-                continue;
-            }
-            let deposed = self.deposed.contains(&repo);
-            let Some(replicas) = needs(&repo, inc, dir, live, deposed) else {
-                continue;
-            };
-            let (seal, sends) = shardlog::Reconfigure::start::<Bytes, Record>(
-                inc.term,
-                &inc.replicas,
-                &inc.joint,
-                replicas,
-            );
-            let msgs = sends.into_iter().map(|(n, q)| (n, Msg::Request(q)));
-            seals.extend(msgs.map(|(n, m)| (n, super::repo::frame(log, m))));
+        let view = View { dir, live };
+        let now = self.now();
+        let mut frames = Vec::new();
+        for seal in self.root.tick(&view, now) {
+            let request = Msg::Request(Request::Seal { term: seal.term });
+            let f = super::repo::frame(seal.log, request);
+            frames.extend(seal.to.iter().map(|&n| (n, f.clone())));
             tracing::info!(
-                repo,
-                term = inc.term + 1,
-                sequencer = inc.sequencer,
+                repo = dir.logs.get(&seal.log).map(String::as_str),
+                term = seal.term,
                 "sealing a log"
             );
-            self.inflight.insert(
-                log,
-                Failover {
-                    repo,
-                    epoch: inc.epoch,
-                    seal,
-                    candidates: None,
-                    proposed: false,
-                    at: Instant::now(),
-                },
-            );
         }
-        let ready = self.ready(dir, live);
-        (seals, ready)
+        (frames, self.appointments(&view, now))
     }
 
-    /// A replica answered a seal. Only members' answers count: an
-    /// appointee must be one, and a quorum of them alone holds everything
-    /// committed.
-    pub(super) fn on_sealed(&mut self, dir: &Directory, log: u64, from: u64, s: Sealed) {
-        let Some(f) = self.inflight.get_mut(&log) else {
-            return;
-        };
-        if s.term != f.seal.base() + 1 {
-            return;
-        }
-        let response = if s.fence > s.term {
-            Response::Fenced { fence: s.fence }
-        } else {
-            Response::Sealed {
-                last: s.last,
-                last_term: s.last_term,
-            }
-        };
-        let members = &dir.meta.members;
-        match f.seal.on_seal(from, response, |n| members.contains(&n)) {
-            Next::Wait | Next::Done(_) => {}
-            Next::Appoint { candidates, .. } => f.candidates = Some(candidates),
-            Next::Failed => {
-                // A higher term came first: look again once the root says.
-                if let Some(f) = self.inflight.remove(&log) {
-                    self.note(&f.repo);
-                }
-            }
-        }
-    }
-
-    /// The failovers whose seals reached their quorums: their appointments.
-    fn ready(&mut self, dir: &Directory, live: &Liveness) -> Vec<Appointment> {
-        let mut out = Vec::new();
+    /// The appointments of the failovers whose seals reached their quorums:
+    /// of the old sequencer if it can (it likely restarted), else of the
+    /// least loaded candidate that is up.
+    fn appointments(&mut self, view: &View<'_>, now: u64) -> Vec<Appointment> {
+        let ready: Vec<(u64, Vec<u64>)> = (self.root.ready())
+            .map(|(&log, c)| (log, c.to_vec()))
+            .collect();
         let mut loads: HashMap<u64, usize> = HashMap::new();
-        for f in self.inflight.values_mut().filter(|f| !f.proposed) {
-            let Some(candidates) = &f.candidates else {
+        let mut out = Vec::new();
+        for (log, candidates) in ready {
+            let Some(repo) = view.dir.logs.get(&log) else {
                 continue;
             };
-            let Some(inc) = dir.live(&f.repo).filter(|i| i.epoch == f.epoch) else {
+            let Some(inc) = view.dir.live(repo) else {
                 continue;
             };
-            let members = &dir.meta.members;
-            let candidates =
-                (candidates.iter().copied()).filter(|&n| members.contains(&n) && live.alive(n));
-            // The old sequencer if it can (it likely restarted), else the
-            // least loaded.
-            let Some(sequencer) = candidates.min_by_key(|&n| {
-                let load = dir.sequenced(n) + loads.get(&n).copied().unwrap_or(0);
+            let up = candidates.into_iter().filter(|&n| view.live.alive(n));
+            let Some(sequencer) = up.min_by_key(|&n| {
+                let load = view.dir.sequenced(n) + loads.get(&n).copied().unwrap_or(0);
                 (n != inc.sequencer, load)
             }) else {
                 continue;
             };
-            let Some(boot) = live.boot(sequencer) else {
+            let Some(a) = self.root.appoint(view, &log, sequencer, now) else {
                 continue;
             };
             *loads.entry(sequencer).or_default() += 1;
-            f.proposed = true;
-            f.at = Instant::now();
             out.push(Appointment {
-                repo: f.repo.clone(),
-                epoch: f.epoch,
-                base_term: f.seal.base(),
+                repo: repo.clone(),
+                epoch: inc.epoch,
+                base_term: a.base,
                 sequencer,
-                replicas: if f.seal.replicas() == inc.replicas {
-                    Vec::new()
-                } else {
-                    f.seal.replicas().to_vec()
-                },
-                boot,
+                replicas: a.replicas.unwrap_or_default(),
+                boot: a.boot,
             });
         }
         out
     }
 
+    /// A replica answered a seal.
+    pub(super) fn on_sealed(
+        &mut self,
+        dir: &Directory,
+        live: &Liveness,
+        log: u64,
+        from: u64,
+        s: Sealed,
+    ) {
+        let response = Response::sealed(s.term, s.last, s.last_term, s.fence);
+        let view = View { dir, live };
+        self.root.on_sealed(&view, &log, from, s.term, response);
+    }
+
     /// `repo`'s sequencer of `term` was deposed (see `proto::Deposed`): if
     /// the root still names that term, the log needs a new one.
-    pub(super) fn on_deposed(&mut self, dir: &Directory, repo: &str, term: u64) {
-        if self.leading && dir.live(repo).is_some_and(|i| i.term == term) {
-            self.deposed.insert(repo.to_string());
-            self.note(repo);
+    pub(super) fn on_deposed(&mut self, dir: &Directory, live: &Liveness, repo: &str, term: u64) {
+        if let Some(inc) = dir.live(repo).filter(|_| self.root.leading()) {
+            let view = View { dir, live };
+            self.root.on_deposed(&view, log_id(repo, inc.epoch), term);
         }
     }
 
     /// The root applied a change to `repo`'s log: its failover is over.
     pub(super) fn applied(&mut self, repo: &str, epoch: u64) {
-        self.deposed.remove(repo);
-        self.inflight.remove(&log_id(repo, epoch));
-        self.note(repo);
+        self.root.applied(log_id(repo, epoch));
     }
 }
 
@@ -462,70 +402,89 @@ mod tests {
         assert!(!live.on_ping(2, Ping { boot: 22 }).1);
     }
 
-    #[test]
-    fn a_log_with_two_replicas_in_one_zone_moves_one_once_a_zone_is_up() {
-        use crate::proto::{Member, root_entry::Change::AddMember};
+    /// A directory with members `zones` (id and zone) and repository `r`'s
+    /// log on 1, 2 and 3, sequenced by 1 at boot 10.
+    fn directory(zones: &[(u64, &str)]) -> (Directory, u64) {
+        use crate::proto::{Create, Member, root_entry::Change};
         let mut dir = Directory::bootstrap(1);
-        for (id, zone) in [(1, "a"), (2, "a"), (3, "b"), (4, "c")] {
+        for &(id, zone) in zones {
             let m = Member {
                 id,
                 zone: zone.into(),
                 ..Member::default()
             };
-            dir.apply(&AddMember(m).into());
+            dir.apply(&Change::AddMember(m).into());
         }
-        // Placed while c was down.
-        let inc = Incarnation {
-            replicas: vec![1, 2, 3],
+        let create = Create {
+            repo: "r".into(),
             sequencer: 1,
             boot: 10,
-            ..Incarnation::default()
+            replicas: vec![1, 2, 3],
+            ..Create::default()
         };
+        dir.apply(&Change::Create(create).into());
+        let log = log_id("r", dir.live("r").unwrap().epoch);
+        (dir, log)
+    }
+
+    /// The replicas of the term the controller gives `log` next, if any,
+    /// once every replica answers its seal.
+    fn sealed_for(dir: &Directory, live: &Liveness, log: u64) -> Option<Vec<u64>> {
+        let view = View { dir, live };
+        let mut c = Controller::new();
+        c.root.lead(true);
+        c.root.note(log);
+        let seal = c.root.tick(&view, 0).pop()?;
+        for &r in &seal.to {
+            let response = Response::sealed(seal.term, 0, 0, seal.term);
+            c.root.on_sealed(&view, &log, r, seal.term, response);
+        }
+        let (_, candidates) = c.root.ready().next()?;
+        let sequencer = candidates[0];
+        let a = c.root.appoint(&view, &log, sequencer, 0)?;
+        Some(
+            a.replicas
+                .unwrap_or_else(|| root::config(dir.live("r").unwrap()).replicas),
+        )
+    }
+
+    #[test]
+    fn a_log_with_two_replicas_in_one_zone_moves_one_once_a_zone_is_up() {
+        let (dir, log) = directory(&[(1, "a"), (2, "a"), (3, "b"), (4, "c")]);
         let mut live = Liveness::new(1, 10);
         live.on_pong(2, Ping { boot: 20 });
         live.on_pong(3, Ping { boot: 30 });
-        assert_eq!(needs("r", &inc, &dir, &live, false), None);
+        assert_eq!(sealed_for(&dir, &live, log), None);
         live.on_pong(4, Ping { boot: 40 });
-        assert_eq!(needs("r", &inc, &dir, &live, false), Some(vec![1, 3, 4]));
-        // Not during a replica change.
-        let joint = Incarnation {
-            joint: vec![1, 2, 4],
-            ..inc
-        };
-        assert_eq!(needs("r", &joint, &dir, &live, false), None);
+        assert_eq!(sealed_for(&dir, &live, log), Some(vec![1, 3, 4]));
     }
 
     #[test]
     fn a_removed_sequencer_hands_its_log_off_before_its_replica_moves() {
-        use crate::proto::{Member, root_entry::Change};
-        let mut dir = Directory::bootstrap(1);
-        for id in 1..=4 {
-            let m = Member {
-                id,
-                ..Member::default()
-            };
-            dir.apply(&Change::AddMember(m).into());
-        }
+        use crate::proto::root_entry::Change;
+        let (mut dir, log) = directory(&[(1, ""), (2, ""), (3, ""), (4, "")]);
         let mut live = Liveness::new(2, 20);
         for (n, boot) in [(1, 10), (3, 30), (4, 40)] {
             live.on_pong(n, Ping { boot });
         }
         dir.apply(&Change::RemoveMember(1).into());
-        let inc = Incarnation {
-            replicas: vec![1, 2, 3],
-            sequencer: 1,
-            boot: 10,
-            ..Incarnation::default()
-        };
         // A new term on the same replicas first.
-        assert_eq!(needs("r", &inc, &dir, &live, false), Some(vec![1, 2, 3]));
+        assert_eq!(sealed_for(&dir, &live, log), Some(vec![1, 2, 3]));
         // Then the removed replica moves.
-        let handed = Incarnation {
+        let config = Config {
             sequencer: 2,
             boot: 20,
-            ..inc
+            ..root::config(dir.live("r").unwrap())
         };
-        let moved = needs("r", &handed, &dir, &live, false).unwrap();
+        let moved = shardlog::Cluster::moved(
+            &View {
+                dir: &dir,
+                live: &live,
+            },
+            &log,
+            &config,
+        );
+        let moved = moved.unwrap();
         assert_eq!(moved.len(), 3);
         assert!(!moved.contains(&1) && moved.contains(&4), "{moved:?}");
     }

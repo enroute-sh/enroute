@@ -1,11 +1,6 @@
 //! Restarts: local disk does not outlive the process, so a restarted node
 //! starts as a fresh one.
 
-#![expect(
-    clippy::unwrap_used,
-    reason = "a test fails by panicking, on values it chose itself"
-)]
-
 mod common;
 
 use common::{Git, Server, copy_dir, local_store, own_copies, push_commits, text, wait_stored};

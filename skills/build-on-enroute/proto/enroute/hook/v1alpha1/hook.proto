@@ -182,7 +182,8 @@ message PreReceiveRequest {
   string actor = 2;
 
   // Every command the push still asks for, less any Enroute already refused
-  // on its own (a non-fast-forward, an object that never arrived). A hook
+  // on its own (an invalid refname, an object that never arrived, a second
+  // update to one ref, a delete of the branch `HEAD` names). A hook
   // sees what is still live, so a judgement it returns is never for something
   // already dead.
   repeated RefCommand commands = 3;
@@ -278,8 +279,8 @@ enum Judgement {
 // correctness depends on being told needs its own record; this is latency, not
 // a guarantee.
 //
-// Enroute waits for the answer and ignores it, the way `receive-pack` waits
-// for `post-receive` and ignores its exit code. An application that fails
+// Enroute waits for the answer, sends its `messages`, and ignores the rest,
+// the way `receive-pack` waits for `post-receive` and ignores its exit code. An application that fails
 // here has not undone anything, so the push is not failed for it.
 message PostReceiveRequest {
   // The repository, as Enroute knows it.
@@ -291,7 +292,8 @@ message PostReceiveRequest {
   string actor = 2;
 
   // Every command that landed, and only those. A push whose commands were all
-  // refused sends nothing at all rather than an empty list.
+  // refused sends nothing at all rather than an empty list. `force` is
+  // computed only when `pre_receive` is enabled, and is false otherwise.
   repeated RefCommand commands = 3;
 
   // `Granted.context`, byte for byte, from the `Authorize` that admitted this

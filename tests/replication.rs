@@ -658,3 +658,92 @@ async fn failover_spreads_logs_across_survivors() {
     }
     clone_matches(&git, &src, &url(&servers[2], "r9"), "dst").await;
 }
+
+/// `server`'s consensus engine.
+fn consensus(server: Option<&Server>) -> &std::sync::Arc<enroute_ledger::consensus::Engine> {
+    server.unwrap().node.consensus().unwrap()
+}
+
+/// A log moves off a removed replica while another of its replicas is down.
+///
+/// The removed replica's seal answer counts toward the quorum, so the log
+/// moves, and keeps serving once the down replica is removed too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_removed_replica_answers_while_another_is_down() {
+    let root = tempfile::tempdir().unwrap();
+    let store = local_store(root.path());
+    let mut servers: Vec<Option<Server>> = cluster(root.path(), &store, 5, |_, _| {})
+        .await
+        .into_iter()
+        .map(Some)
+        .collect();
+    let mut api = servers[0].as_ref().unwrap().api_client();
+    api.create_repo("r").await.unwrap();
+    api.create_commit(commit("r", "main", "init", vec![put("f", "x")]))
+        .await
+        .unwrap();
+    let ids: Vec<u64> = servers.iter().map(|s| consensus(s.as_ref()).id).collect();
+    let (replicas, _) = consensus(servers[0].as_ref()).replicas("r").unwrap();
+    let sequencer = (0..5)
+        .find(|&i| {
+            consensus(servers[i].as_ref())
+                .hosted("r")
+                .is_some_and(|h| h.leading)
+        })
+        .unwrap();
+    let others: Vec<usize> = (0..5)
+        .filter(|&i| i != sequencer && replicas.contains(&ids[i]))
+        .collect();
+    let (a, b) = (others[0], others[1]);
+
+    // A goes down, then B is retired.
+    let down = servers[a].take().unwrap();
+    down.node.shutdown().await;
+    drop(down);
+    let data = root.path().join(format!("n{sequencer}"));
+    let objects = &servers[sequencer]
+        .as_ref()
+        .unwrap()
+        .node
+        .ledger()
+        .unwrap()
+        .objects;
+    enroute_ledger::cluster::remove(objects, &data, ids[b], true)
+        .await
+        .unwrap();
+    assert!(
+        wait_until(|| consensus(servers[b].as_ref()).repos().is_empty(), 30).await,
+        "the log did not move off the retired node"
+    );
+
+    // A is replaced as a node that lost its disk: its old id is removed.
+    enroute_ledger::cluster::remove(objects, &data, ids[a], true)
+        .await
+        .unwrap();
+    let mut left: Vec<u64> = (0..5)
+        .filter(|&i| i != a && i != b)
+        .map(|i| ids[i])
+        .collect();
+    left.sort_unstable();
+    let moved = || {
+        consensus(servers[sequencer].as_ref())
+            .replicas("r")
+            .is_some_and(|(mut r, joint)| {
+                r.sort_unstable();
+                r == left && joint.is_empty()
+            })
+    };
+    assert!(
+        wait_until(moved, 30).await,
+        "the log did not move off the removed nodes"
+    );
+    for i in (0..5).filter(|&i| i != a && i != b) {
+        servers[i]
+            .as_ref()
+            .unwrap()
+            .api_client()
+            .create_commit(commit("r", "main", "after", vec![put("f", i.to_string())]))
+            .await
+            .unwrap();
+    }
+}

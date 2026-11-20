@@ -18,11 +18,14 @@ docker run -d --name codehost-db -p 5432:5432 \
   -e POSTGRES_DB=codehost postgres:17-alpine
 ```
 
-Record the URL in `.env.local`, which Next.js loads automatically:
+Record the URL in `.env.local`:
 
 ```sh
 DATABASE_URL=postgres://codehost:codehost@127.0.0.1:5432/codehost
 ```
+
+Next.js loads `.env.local` on its own. `drizzle-kit` and `tsx` do not, so this
+chapter loads it for each of them.
 
 > **Note:** Nothing in your app depends on Postgres. This section uses
 > ordinary Drizzle, so swapping the driver for SQLite or libSQL changes the two
@@ -100,6 +103,8 @@ Create `drizzle.config.ts` and push the schema:
 ```ts
 import { defineConfig } from "drizzle-kit";
 
+process.loadEnvFile(".env.local");
+
 export default defineConfig({
   schema: "./lib/db/schema.ts",
   out: "./drizzle",
@@ -144,9 +149,13 @@ Create `lib/enroute.ts`:
 
 ```ts
 import { credentials } from "@grpc/grpc-js";
-import { RepositoryServiceClient } from "./gen/enroute/api/v1alpha1/repository";
+import {
+  ObjectFormat, RepositoryServiceClient,
+} from "./gen/enroute/api/v1alpha1/repository";
 
-const ADDRESS = process.env.ENROUTE_API ?? "127.0.0.1:50051";
+// The same variable the `enroute` CLI reads, as a URL. grpc-js takes only the
+// host and port.
+const ADDRESS = new URL(process.env.ENROUTE_API ?? "http://127.0.0.1:50051").host;
 
 const repositories = new RepositoryServiceClient(
   ADDRESS,
@@ -156,12 +165,20 @@ const repositories = new RepositoryServiceClient(
 export function createRepository(key: string) {
   return new Promise<void>((resolve, reject) => {
     repositories.createRepository(
-      { repo: { key }, defaultBranch: "" },
+      {
+        repo: { key },
+        defaultBranch: "",
+        objectFormat: ObjectFormat.OBJECT_FORMAT_SHA1,
+      },
       (err) => (err ? reject(err) : resolve()),
     );
   });
 }
 ```
+
+An empty `defaultBranch` makes `HEAD` point at `refs/heads/main`. The object
+format is fixed when the repository is created, and the generated types
+require you to name it.
 
 The API is plain HTTP/2 with no TLS and no authentication of its own. That is
 correct on a laptop and wrong in a deployment, where anything that can reach
@@ -179,8 +196,6 @@ import { db } from "@/lib/db";
 import { repos } from "@/lib/db/schema";
 import { createRepository } from "@/lib/enroute";
 import { userByToken } from "@/lib/store";
-
-export const runtime = "nodejs";
 
 export async function POST(request: Request) {
   const token = request.headers.get("authorization")?.replace(/^Bearer /, "");
@@ -209,7 +224,7 @@ later clone fails on.
 
 ## Seed the data
 
-Create `scripts/seed.ts`:
+Create `scripts/seed.mts`:
 
 ```ts
 import { db } from "../lib/db";
@@ -237,8 +252,12 @@ process.exit(0);
 ```
 
 ```sh
-npx tsx scripts/seed.ts
+npx tsx --env-file=.env.local scripts/seed.mts
 ```
+
+The `.mts` extension makes `tsx` run the script as an ES module, which is what
+allows the top-level `await`. The project that `create-next-app` makes is not
+an ES module package.
 
 Run it as often as you like. Every step is idempotent, so it reconciles rather
 than duplicates, and it needs no record of what it did last time.

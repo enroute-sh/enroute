@@ -17,6 +17,8 @@ There are two methods. Pick one with the user before anything else:
 | [Migrate to a new deployment](#migrate-to-a-new-deployment) | The new release does not read it (its notes say the storage format changed), or the user moves to another bucket or object store. |
 
 From 0.3 to 0.4 is a migration. See [Notes for 0.3 to 0.4](#notes-for-03-to-04).
+From 0.4.0 to 0.4.1 is an in-place upgrade. See
+[Notes for 0.4.0 to 0.4.1](#notes-for-040-to-041).
 
 Every node of a deployment runs the same release. There is no rolling upgrade
 and no supported downgrade.
@@ -157,9 +159,17 @@ one.
 - **`PERMISSION_DENIED`.** The old deployment's `authorize` refused the
   migration credential.
 - **`FAILED_PRECONDITION`.** The old deployment does not speak Git protocol v2,
-  or the repository on the new deployment has another object format.
-- **`UNAVAILABLE`.** The new deployment cannot reach the old Git URL, or needs
+  or the repository on the new deployment has another object format. An
+  `http` URL or a private IP address in the URL also needs
   `git.allow_private_remotes`.
+- **`UNAVAILABLE`.** The new deployment cannot reach the old Git URL, or the
+  URL's host name resolves to a private address and needs
+  `git.allow_private_remotes`.
+
+## Notes for 0.4.0 to 0.4.1
+
+- 0.4.1 reads what 0.4.0 wrote. Upgrade in place.
+- The configuration keys and the proto files are the same as in 0.4.0.
 
 ## Notes for 0.3 to 0.4
 

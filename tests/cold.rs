@@ -3,10 +3,8 @@
 
 #![expect(
     clippy::cognitive_complexity,
-    clippy::indexing_slicing,
     clippy::multiple_unsafe_ops_per_block,
     clippy::too_many_lines,
-    clippy::unwrap_used,
     reason = "a test fails by panicking, on values it chose itself"
 )]
 
@@ -28,6 +26,10 @@ async fn cold_node_never_waits_on_the_object_store() {
 /// The same within a disk budget far smaller than the repository: chunks
 /// are evicted while every operation runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "release builds ignore ENROUTE_TIER_CHUNK, so each layer here is one chunk that holds its pinned tables and nothing can be evicted"
+)]
 async fn cold_node_within_a_small_disk_budget() {
     cold_node(48 << 10).await;
 }

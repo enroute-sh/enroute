@@ -3,7 +3,6 @@
 #![expect(
     clippy::as_conversions,
     clippy::cast_possible_truncation,
-    clippy::unwrap_used,
     reason = "a test fails by panicking, on values it chose itself"
 )]
 

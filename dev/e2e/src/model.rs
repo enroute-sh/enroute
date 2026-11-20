@@ -662,8 +662,7 @@ impl ReferenceStateMachine for OracleStateMachine {
         let held: Vec<u32> = state
             .held
             .get(&state.current)
-            .map(|held| held.iter().copied().collect())
-            .unwrap_or_default();
+            .map_or_default(|held| held.iter().copied().collect());
         if held.is_empty() {
             base
         } else {

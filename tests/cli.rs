@@ -1,11 +1,6 @@
 //! The data commands and `diagnose`, run as the binary against a node in
 //! this process.
 
-#![expect(
-    clippy::unwrap_used,
-    reason = "a test fails by panicking, on values it chose itself"
-)]
-
 mod common;
 
 use common::{Git, Server, local_store};

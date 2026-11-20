@@ -178,6 +178,7 @@ About 1% of operations, and one operation per process at the end, run
 | `durability` | A final read misses an append that was `:ok` |
 | `phantoms` | A read returns a commit that the client did not write |
 | `fetches` | A fetch of tips that a read returned fails with `not our ref`, or its pack misses objects, or `git fsck` fails |
+| `members` | After member changes, a log does not move onto members only. See [Member changes](#member-changes) |
 
 Elle's `:strong-session-serializable` treats each Jepsen process as a session.
 The `node-monotonic` checker adds the guarantee across the processes of one
@@ -195,18 +196,40 @@ compute node.
 | `pause-leader` | Pauses (`SIGSTOP`) the leader of the current repository, then resumes it |
 | `pause-compute` | Pauses one compute node, then resumes it |
 | `kill-compute` | Kills one compute node, then starts it again |
-| `replace-ledger` | A ledger node loses its disk and starts again at the same address, with a new ID. Then the old ID is removed with `enroute members --remove` |
-| `retire-ledger` | Removes a running ledger node, waits until its logs move off it, and stops it. Then it starts on an empty disk and joins as a new node. Needs `wide` |
+| `members` | Member changes, about every `--interval` seconds, beside the other faults. See [Member changes](#member-changes). Needs `wide` |
 
 Each cycle waits `--interval` seconds, starts one or two faults, waits
 `--interval` seconds, and ends them.
 
-The member changes follow the steps in
-[Maintenance](../../docs/operate/maintenance.md), and never use `--force`. If
-the ledger refuses to remove an old ID, for example while a partition holds,
-the suite tries again when the cycle ends and before the final reads.
 `run.sh` names the set of member changes and other ledger faults
 `membership`.
+
+### Member changes
+
+The `members` fault runs on `jepsen.nemesis.membership`. It keeps the state
+of each ledger node ID: a member, removing (removed, with its logs moving
+off it), or gone. A node can also be wiped: down, with an empty disk. Each
+node's view (`GET /status`, and which repositories it hosts) is polled every
+5 seconds, and the members come from `enroute members --json`. About every
+`--interval` seconds, the suite makes one change that is legal now:
+
+| Change | What it does |
+| --- | --- |
+| `:remove` | Removes any member, also a down or wiped one, with `enroute members --remove` through another node, as long as 3 members stay. It never uses `--force`, so the ledger can refuse |
+| `:free` | Kills a removing node, wipes its disk, and starts it, so that it joins with a new ID |
+| `:lose-disk` | Kills a node and wipes its disk, as if it lost it. The node stays down, and its old ID stays a member |
+| `:rejoin` | Starts a wiped node, which joins with a new ID |
+
+Changes overlap with each other and with the other faults, in any order:
+retiring a node is `:remove` then `:free`, and replacing one is `:lose-disk`,
+`:rejoin` and `:remove` of the old ID, in any order. A wipe goes ahead only
+while every repository keeps 2 replicas on running nodes other than the
+wiped one, so that the faults never lose a majority of a log's data.
+
+At the end, `:settle` starts the wiped nodes, removes the IDs of nodes that
+joined again, and waits up to 180 seconds until each log is on
+min(3, members) running members and on no other node. The `members` checker
+fails the test if a log does not get there.
 
 ### Find the leader
 

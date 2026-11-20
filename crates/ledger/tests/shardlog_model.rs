@@ -1,7 +1,7 @@
 //! Checks the replicated log with Stateright over every interleaving of
 //! sequencers, appointments, replica changes, reads, trims, syncs and
 //! crashes, driving the ledger's own machines: a [`Node`] per replica and
-//! a [`Reconfigure`] per failover.
+//! a [`Root`] per controller, with the root's [`Config`] rules.
 //!
 //! Every message is in flight until the model delivers it, in any order,
 //! so messages land late and after their machine is gone. A fault drops a
@@ -18,8 +18,8 @@ use std::collections::BTreeMap;
 use stateright::{Checker, Expectation, HasDiscoveries, Model, Property, UniformChooser};
 
 use enroute_ledger::consensus::shardlog::{
-    Cell, Effects, Msg, Next, Node, Pos, Reconfigure, Request, Response, Store, Synced, Term,
-    Terms, count, majority, rename_all,
+    Cell, Cluster, Config, Effects, Limits, Msg, Node, Pos, Request, Response, Root, Store, Synced,
+    Term, Terms, count, majority, rename_all,
 };
 
 type V = u8;
@@ -65,6 +65,8 @@ enum Bug {
     ActivateEarly,
     /// A node answers before its writes are durable.
     SyncEarly,
+    /// A controller ignores a removed replica's seal answer.
+    IgnoreRemoved,
 }
 
 /// A log: cells from a start, after a prefix kept only as applied values.
@@ -112,7 +114,7 @@ impl<V: Clone> Log<V> {
     #[must_use]
     fn from(&self, pos: Pos) -> Option<Vec<Cell<V>>> {
         let i = usize::try_from(pos.checked_sub(self.start())?).ok()?;
-        Some(self.cells.get(i..).map(<[_]>::to_vec).unwrap_or_default())
+        Some(self.cells.get(i..).map_or_default(<[_]>::to_vec))
     }
 
     /// The value at `pos` if it is held (the outer option); none for a
@@ -258,33 +260,93 @@ enum ReadSlot {
     Failed,
 }
 
+/// A controller's limits: a failover that stalls stays stalled, as the
+/// model never loses a root entry.
+const LIMITS: Limits = Limits {
+    retry: u64::MAX,
+    per_tick: 1,
+    in_flight: 1,
+};
+
+/// A root leader's controller: two race when a stale leader still runs
+/// one.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum Slot {
-    /// Whether it changes the replicas.
-    Sealing(Reconfigure<ReplicaId>, bool),
-    /// Sealed a quorum: any candidate may be appointed, from `base`.
-    Appointing(Appointing),
-    Gone,
+struct Controller {
+    root: Root<(), ReplicaId>,
+    /// While it seals: the term, the sets it seals, and the replicas whose
+    /// answers reached it.
+    term: Term,
+    sets: Vec<Vec<ReplicaId>>,
+    answered: Vec<ReplicaId>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct Appointing {
-    base: Term,
-    term: Term,
-    candidates: Vec<ReplicaId>,
-    /// The new term's replicas, if they change.
-    change: Option<Vec<ReplicaId>>,
+impl Controller {
+    fn new() -> Self {
+        let mut root = Root::new(LIMITS);
+        // A new leader looks at every log.
+        root.lead(true);
+        root.note(());
+        Controller {
+            root,
+            term: 0,
+            sets: Vec::new(),
+            answered: Vec::new(),
+        }
+    }
+}
+
+/// The cluster as a controller sees it.
+struct Seen<'a> {
+    config: &'a Config<ReplicaId>,
+    wanted: &'a Option<Vec<ReplicaId>>,
+    removed: &'a [ReplicaId],
+    doomed: Option<ReplicaId>,
+    /// The doomed node's boot: how many times it crashed.
+    rebooted: u8,
+    /// Whether it reads the wanted replicas as the config's (a planted
+    /// bug).
+    lie: bool,
+}
+
+impl Cluster<(), ReplicaId> for Seen<'_> {
+    fn config(&self, (): &()) -> Option<Config<ReplicaId>> {
+        let mut c = self.config.clone();
+        if let Some(wanted) = self.wanted.as_ref().filter(|_| self.lie) {
+            c.replicas.clone_from(wanted);
+        }
+        Some(c)
+    }
+
+    fn member(&self, r: ReplicaId) -> bool {
+        !self.removed.contains(&r)
+    }
+
+    fn boot(&self, r: ReplicaId) -> Option<u64> {
+        Some(if self.doomed == Some(r) {
+            u64::from(self.rebooted)
+        } else {
+            0
+        })
+    }
+
+    fn moved(&self, (): &(), _: &Config<ReplicaId>) -> Option<Vec<ReplicaId>> {
+        self.wanted.clone().filter(|w| *w != self.config.replicas)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct State {
     nodes: Vec<N>,
-    /// The config: the open term, its replicas, and while a replica change
-    /// runs, the ones it changes from (all sorted).
-    term: Term,
-    config: Vec<ReplicaId>,
-    joint: Vec<ReplicaId>,
-    reconfigs: Vec<Slot>,
+    /// The config, as the root holds it.
+    config: Config<ReplicaId>,
+    /// The nodes removed from the cluster: they keep their logs and
+    /// answer, but may not sequence.
+    removed: Vec<ReplicaId>,
+    controllers: Vec<Controller>,
+    /// The replicas a replica change wants, until they are the config's.
+    wanted: Option<Vec<ReplicaId>>,
+    /// Seals the controllers may still start.
+    seals: u8,
     reads: Vec<ReadSlot>,
     /// Messages in flight, sorted so that equal states hash equally.
     net: Vec<Envelope>,
@@ -293,6 +355,7 @@ struct State {
     /// Acknowledged values by position, sorted.
     acks: Vec<(Pos, V)>,
     changes: u8,
+    removes: u8,
     trims: u8,
     faults: u8,
     crashes: u8,
@@ -311,10 +374,15 @@ enum Action {
     Drop(usize),
     Retry(ReplicaId, ReplicaId),
     Sync(ReplicaId),
-    Reconfigure,
+    /// A controller's tick that starts a seal.
+    Tick(usize),
+    /// A sequencer tells a controller that a seal deposed it.
+    Depose(usize),
     /// Replace a replica with the spare.
     Change(ReplicaId),
-    /// Appoint a candidate of a reconfiguration.
+    /// Remove a node from the cluster.
+    Remove(ReplicaId),
+    /// Appoint a candidate of a controller.
     Appoint(usize, ReplicaId),
     /// Drop the old replicas once the term has committed on the new.
     Activate(ReplicaId),
@@ -327,13 +395,14 @@ enum Action {
 struct Bounds {
     values: Vec<V>,
     window: Pos,
-    reconfigs: usize,
-    /// Whether a reconfiguration starts only while the earlier ones run,
-    /// so all of them race from one term.
+    /// Seals the controllers may start.
+    reconfigs: u8,
+    /// Whether two root leaders' controllers race.
     race: bool,
     reads: usize,
     /// Replica changes, each one of the reconfigurations.
     changes: u8,
+    removes: u8,
     trims: u8,
     faults: u8,
     crashes: u8,
@@ -349,6 +418,7 @@ impl Default for Bounds {
             race: false,
             reads: 0,
             changes: 0,
+            removes: 0,
             trims: 0,
             faults: 0,
             crashes: 0,
@@ -378,11 +448,37 @@ impl State {
 
     /// The replica no set of the config names.
     fn spare(&self) -> Option<ReplicaId> {
-        replicas().find(|r| !self.config.contains(r) && !self.joint.contains(r))
+        replicas().find(|r| {
+            !self.config.replicas.contains(r)
+                && !self.config.joint.contains(r)
+                && !self.removed.contains(r)
+        })
     }
 }
 
 impl Bounds {
+    /// Controller `id`'s root, and the cluster as it sees it in `s`.
+    fn split<'a>(&self, s: &'a mut State, id: usize) -> (&'a mut Root<(), ReplicaId>, Seen<'a>) {
+        let State {
+            controllers,
+            config,
+            wanted,
+            removed,
+            doomed,
+            crashes,
+            ..
+        } = s;
+        let seen = Seen {
+            config,
+            wanted,
+            removed,
+            doomed: *doomed,
+            rebooted: self.crashes - *crashes,
+            lie: false,
+        };
+        (&mut controllers[id].root, seen)
+    }
+
     /// On a node that won't crash, a sync only delays answers, as the
     /// network can: the node syncs at once, which keeps the state space
     /// small. On the doomed node, syncs are actions of their own.
@@ -508,72 +604,82 @@ impl Bounds {
         else {
             return;
         };
-        let Some(Slot::Sealing(m, change)) = s.reconfigs.get_mut(id) else {
+        let Some(c) = s.controllers.get_mut(id) else {
             return;
         };
-        if term != m.base() + 1 {
+        if term != c.term {
             return;
         }
-        let change = change.then(|| m.replicas().to_vec());
-        let response = if fence > term {
-            Response::Fenced { fence }
-        } else if self.bug == Some(Bug::NotUpToDate) {
+        if fence <= term && c.root.waits(&(), from) && !c.answered.contains(&from) {
+            c.answered.push(from);
+            c.answered.sort_unstable();
+        }
+        if s.removed.contains(&from) && self.bug == Some(Bug::IgnoreRemoved) {
+            return;
+        }
+        let response = match Response::sealed(term, last, last_term, fence) {
             // A planted bug hides how up to date the answer is.
-            Response::Sealed {
+            Response::Sealed { .. } if self.bug == Some(Bug::NotUpToDate) => Response::Sealed {
                 last: 0,
                 last_term: 0,
-            }
-        } else {
-            Response::Sealed { last, last_term }
-        };
-        let base = m.base();
-        let fake = self.answering(
-            from,
-            &Msg::Sealed {
-                term,
-                last,
-                last_term,
-                fence,
             },
-        );
-        let next = (fake.into_iter())
-            .map(|r| m.on_seal(r, response, |_| true))
-            .find(|next| !matches!(next, Next::Wait))
-            .unwrap_or(Next::Wait);
-        s.reconfigs[id] = match next {
-            Next::Wait => return,
-            Next::Appoint { term, candidates } => Slot::Appointing(Appointing {
-                base,
-                term,
-                candidates,
-                change,
-            }),
-            Next::Done(_) | Next::Failed => Slot::Gone,
+            response => response,
         };
+        let fake = self.answering(from, msg);
+        let (root, seen) = self.split(s, id);
+        for r in fake {
+            root.on_sealed(&seen, &(), r, term, response);
+        }
     }
 
     fn appoint(&self, s: &mut State, id: usize, sequencer: ReplicaId) {
-        let slot = std::mem::replace(&mut s.reconfigs[id], Slot::Gone);
-        let Slot::Appointing(a) = slot else { return };
-        // The compare-and-swap on the config (and one replica change at a
-        // time).
-        if a.base != s.term || (a.change.is_some() && !s.joint.is_empty()) {
+        let (root, seen) = self.split(s, id);
+        let a = root.appoint(&seen, &(), sequencer, 0);
+        // The compare-and-swap on the root.
+        let member = |n| !s.removed.contains(&n);
+        let Some(next) = a.and_then(|a| s.config.clone().appointed(a, member, |_| true)) else {
             return;
+        };
+        s.config = next;
+        // (With the bug, the old replicas are dropped at once.)
+        if self.bug == Some(Bug::ActivateEarly) {
+            s.config.joint.clear();
         }
-        s.term = a.term;
-        if let Some(new) = a.change {
-            let old = std::mem::replace(&mut s.config, new);
-            // (With the bug, the old replicas are dropped at once.)
-            s.joint = if self.bug == Some(Bug::ActivateEarly) {
-                Vec::new()
-            } else {
-                old
-            };
+        if s.wanted.as_ref() == Some(&s.config.replicas) {
+            s.wanted = None;
         }
-        let config = s.config.clone();
+        applied(s);
+        let config = s.config.replicas.clone();
         let written = s.nodes[usize::from(sequencer)].store().written();
-        let fx = s.node(sequencer).appoint(a.term, config, written);
+        let term = s.config.term;
+        let fx = s.node(sequencer).appoint(term, config, written);
         self.after(s, sequencer, fx);
+    }
+
+    /// Controller `id`'s tick, if it starts a seal.
+    fn tick(&self, s: &mut State, id: usize) -> Option<()> {
+        let lie = self.bug == Some(Bug::SealNewOnly);
+        let (root, seen) = self.split(s, id);
+        let seen = Seen { lie, ..seen };
+        let seal = root.tick(&seen, 0).pop();
+        let replicas = seen.config(&())?.replicas;
+        let seal = seal?;
+        s.seals -= 1;
+        let mut sets = vec![replicas];
+        if !s.config.joint.is_empty() {
+            sets.push(s.config.joint.clone());
+        }
+        let c = &mut s.controllers[id];
+        (c.term, c.sets, c.answered) = (seal.term, sets, Vec::new());
+        for to in seal.to {
+            s.net.push(Envelope {
+                from: controller(id),
+                to,
+                msg: Msg::Request(Request::Seal { term: seal.term }),
+            });
+        }
+        s.net.sort();
+        Some(())
     }
 
     /// The planted bug that takes the sequencer's own copy as a quorum.
@@ -616,27 +722,33 @@ impl Bounds {
         self.effects(s, r, fx);
         self.settle(s, r);
     }
+}
 
-    fn reconfigure(s: &mut State, current: &[ReplicaId], replicas: Vec<ReplicaId>, change: bool) {
-        let joint = if change { Vec::new() } else { s.joint.clone() };
-        let (m, sends) = Reconfigure::start::<V, Applied>(s.term, current, &joint, replicas);
-        let id = s.reconfigs.len();
-        s.reconfigs.push(Slot::Sealing(m, change));
-        for (to, request) in sends {
-            s.net.push(Envelope {
-                from: controller(id),
-                to,
-                msg: Msg::Request(request),
-            });
-        }
-        s.net.sort();
+/// The root changed the config: every controller's failover is over, and
+/// it looks at the log again.
+fn applied(s: &mut State) {
+    for c in &mut s.controllers {
+        c.root.applied(());
+    }
+}
+
+/// Every controller looks at the log again: a node restarted, or the
+/// members changed.
+fn note_all(s: &mut State) {
+    for c in &mut s.controllers {
+        c.root.note(());
     }
 }
 
 /// Drops the checks and seal answers no machine needs. They change no
 /// replica, so delivering them only adds states.
 fn forget(s: &mut State) {
-    let (reads, nodes, reconfigs) = (&s.reads, &s.nodes, &s.reconfigs);
+    for c in &mut s.controllers {
+        if replicas().all(|r| !c.root.waits(&(), r)) && c.term != 0 {
+            (c.term, c.sets, c.answered) = (0, Vec::new(), Vec::new());
+        }
+    }
+    let (reads, nodes, controllers) = (&s.reads, &s.nodes, &s.controllers);
     s.net.retain(|e| match &e.msg {
         Msg::Check { round, .. } => nodes[usize::from(e.from)]
             .waiting(e.to)
@@ -649,10 +761,9 @@ fn forget(s: &mut State) {
                     .waiting(e.from)
                     .any(|k| k == *round)
         }
-        Msg::Sealed { .. } if e.to >= 100 => matches!(
-            reconfigs.get(usize::from(e.to - 100)),
-            Some(Slot::Sealing(m, _)) if m.pending(e.from)
-        ),
+        Msg::Sealed { .. } if e.to >= 100 => controllers
+            .get(usize::from(e.to - 100))
+            .is_some_and(|c| c.root.waits(&(), e.from)),
         _ => true,
     });
 }
@@ -679,15 +790,25 @@ impl Model for Bounds {
             nodes: replicas()
                 .map(|r| Node::new(r, Mem::default(), self.window))
                 .collect(),
-            term: 1,
-            config: vec![0, 1, 2],
-            joint: Vec::new(),
-            reconfigs: Vec::new(),
+            config: Config {
+                term: 1,
+                sequencer: 0,
+                boot: 0,
+                replicas: vec![0, 1, 2],
+                joint: Vec::new(),
+            },
+            removed: Vec::new(),
+            controllers: (0..if self.race { 2 } else { 1 })
+                .map(|_| Controller::new())
+                .collect(),
+            wanted: None,
+            seals: self.reconfigs,
             reads: Vec::new(),
             net: Vec::new(),
             pool: self.values.clone(),
             acks: Vec::new(),
             changes: self.changes,
+            removes: self.removes,
             trims: self.trims,
             faults: self.faults,
             crashes: self.crashes,
@@ -736,11 +857,15 @@ impl Model for Bounds {
             if state.reads.len() < self.reads && n.leading() {
                 actions.push(Action::Read(r));
             }
-            if n.sequencing() == Some(state.term) && !state.joint.is_empty() && n.leading() {
+            if n.activation(&state.config).is_some() {
                 actions.push(Action::Activate(r));
             }
             if doomed && (n.sequencing().is_some() || n.store().dirty()) {
                 actions.push(Action::Crash(r));
+            }
+            let hosts = state.config.replicas.contains(&r) || state.config.joint.contains(&r);
+            if state.removes > 0 && hosts && !state.removed.contains(&r) {
+                actions.push(Action::Remove(r));
             }
             if state.trims > 0 && trimmable(state, r) {
                 actions.push(Action::Trim(r));
@@ -757,17 +882,21 @@ impl Model for Bounds {
                 actions.push(Action::Drop(i));
             }
         }
-        let running = state.reconfigs.iter().all(|r| *r != Slot::Gone);
-        for (id, slot) in state.reconfigs.iter().enumerate() {
-            if let Slot::Appointing(a) = slot {
-                actions.extend(a.candidates.iter().map(|&r| Action::Appoint(id, r)));
+        for (id, c) in state.controllers.iter().enumerate() {
+            for (&(), candidates) in c.root.ready() {
+                actions.extend(candidates.iter().map(|&r| Action::Appoint(id, r)));
+            }
+            // Only a tick that starts a seal: one that does nothing would be
+            // an action without a next state.
+            if state.seals > 0 && self.tick(&mut state.clone(), id).is_some() {
+                actions.push(Action::Tick(id));
+            }
+            if state.seals > 0 {
+                actions.push(Action::Depose(id));
             }
         }
-        if state.reconfigs.len() < self.reconfigs && (running || !self.race) {
-            actions.push(Action::Reconfigure);
-            if state.changes > 0 && state.joint.is_empty() {
-                actions.extend(state.config.iter().map(|&r| Action::Change(r)));
-            }
+        if state.changes > 0 && state.config.joint.is_empty() && state.wanted.is_none() {
+            actions.extend(state.config.replicas.iter().map(|&r| Action::Change(r)));
         }
     }
 
@@ -801,31 +930,38 @@ impl Model for Bounds {
                 self.after(&mut s, r, fx);
             }
             Action::Sync(r) => self.sync(&mut s, r),
-            Action::Reconfigure => {
-                let config = s.config.clone();
-                Self::reconfigure(&mut s, &config, config.clone(), false);
+            Action::Tick(id) => self.tick(&mut s, id)?,
+            Action::Depose(id) => {
+                let term = s.config.term;
+                let (root, seen) = self.split(&mut s, id);
+                root.on_deposed(&seen, (), term);
             }
             Action::Change(out) => {
                 let spare = s.spare()?;
-                let mut new: Vec<ReplicaId> =
-                    s.config.iter().copied().filter(|&r| r != out).collect();
+                let mut new: Vec<ReplicaId> = s
+                    .config
+                    .replicas
+                    .iter()
+                    .copied()
+                    .filter(|&r| r != out)
+                    .collect();
                 new.push(spare);
                 new.sort_unstable();
-                // The replicas it changes from, as the ledger seals (the
-                // new one has nothing to lose).
-                let current = if self.bug == Some(Bug::SealNewOnly) {
-                    new.clone()
-                } else {
-                    s.config.clone()
-                };
                 s.changes -= 1;
-                Self::reconfigure(&mut s, &current, new, true);
+                s.wanted = Some(new);
+                note_all(&mut s);
+            }
+            Action::Remove(r) => {
+                s.removed.push(r);
+                s.removed.sort_unstable();
+                s.removes -= 1;
+                note_all(&mut s);
             }
             Action::Appoint(id, r) => self.appoint(&mut s, id, r),
             Action::Activate(r) => {
-                if s.nodes[usize::from(r)].sequencing() == Some(s.term) {
-                    s.joint.clear();
-                }
+                let term = s.nodes[usize::from(r)].activation(&s.config)?;
+                s.config = s.config.clone().activated(term)?;
+                applied(&mut s);
             }
             Action::Read(r) => {
                 if self.bug == Some(Bug::NoCheck) {
@@ -858,6 +994,7 @@ impl Model for Bounds {
                 store.now = store.disk.clone();
                 n.restart(applied, false);
                 s.crashes -= 1;
+                note_all(&mut s);
                 for r in replicas() {
                     self.settle(&mut s, r);
                 }
@@ -878,10 +1015,21 @@ impl Model for Bounds {
                 missed_ack(s).is_none()
             }),
             Property::always("reads agree", |_, s: &State| reads_disagree(s).is_none()),
+            Property::always("a seal answered by a quorum finishes", |_, s: &State| {
+                stuck_seal(s).is_none()
+            }),
+            Property::always(
+                "a seal answered by a quorum of members appoints",
+                |_, s: &State| unappointable(s).is_none(),
+            ),
             Property::sometimes("an ack", |_, s: &State| !s.acks.is_empty()),
-            Property::sometimes("an appointment", |_, s: &State| s.term > 1),
+            Property::sometimes("an appointment", |_, s: &State| s.config.term > 1),
             Property::sometimes("a replica change", |_, s: &State| {
-                s.config != [0, 1, 2] && s.joint.is_empty()
+                s.config.replicas != [0, 1, 2] && s.config.joint.is_empty()
+            }),
+            Property::sometimes("a removed replica moved off", |_, s: &State| {
+                (s.removed.iter())
+                    .any(|r| !s.config.replicas.contains(r) && !s.config.joint.contains(r))
             }),
             Property::sometimes("a read", |_, s: &State| {
                 s.reads
@@ -916,9 +1064,9 @@ fn disagreement(s: &State) -> Option<Pos> {
 
 /// The sets a seal of the config needs a quorum of each of.
 fn quorums(s: &State) -> Vec<Vec<ReplicaId>> {
-    let mut q = vec![s.config.clone()];
-    if !s.joint.is_empty() {
-        q.push(s.joint.clone());
+    let mut q = vec![s.config.replicas.clone()];
+    if !s.config.joint.is_empty() {
+        q.push(s.config.joint.clone());
     }
     q
 }
@@ -930,6 +1078,40 @@ fn lost_ack(s: &State) -> Option<(Pos, V)> {
         let holds =
             |r: &ReplicaId| s.nodes[usize::from(*r)].store().disk.log.value(pos) == Some(Some(v));
         !(quorums(s).iter()).any(|q| q.iter().filter(|r| holds(r)).count() >= majority(q.len()))
+    })
+}
+
+/// Whether the replicas `answered` hold a majority of every set in `sets`.
+fn quorate(sets: &[Vec<ReplicaId>], answered: impl Fn(&ReplicaId) -> bool) -> bool {
+    (sets.iter()).all(|q| q.iter().filter(|r| answered(r)).count() >= majority(q.len()))
+}
+
+/// A seal still waiting although a majority of every set it seals
+/// answered.
+fn stuck_seal(s: &State) -> Option<usize> {
+    (s.controllers.iter())
+        .position(|c| c.root.sealing(&()) && quorate(&c.sets, |r| c.answered.contains(r)))
+}
+
+/// A seal of the next term with no one to appoint, although members that
+/// stay replicas answered a majority of every set it seals: the most up to
+/// date of them holds every committed cell.
+fn unappointable(s: &State) -> Option<usize> {
+    s.controllers.iter().position(|c| {
+        let Some(first) = c.sets.first().filter(|_| c.term == s.config.term + 1) else {
+            return false;
+        };
+        let stays = s.wanted.as_ref().unwrap_or(first);
+        let member_stays = |r: &ReplicaId| {
+            c.answered.contains(r)
+                && !s.removed.contains(r)
+                && first.contains(r)
+                && stays.contains(r)
+        };
+        c.root
+            .ready()
+            .any(|(&(), candidates)| candidates.is_empty())
+            && quorate(&c.sets, member_stays)
     })
 }
 
@@ -974,20 +1156,20 @@ fn relabel(s: &State, perm: &[ReplicaId]) -> State {
         node.relabel(to);
         t.nodes[usize::from(perm[r])] = node;
     }
-    rename_all(to, &mut t.config);
-    rename_all(to, &mut t.joint);
+    rename_all(to, &mut t.config.replicas);
+    rename_all(to, &mut t.config.joint);
+    rename_all(to, &mut t.removed);
     t.doomed = s.doomed.map(to);
-    for slot in &mut t.reconfigs {
-        match slot {
-            Slot::Sealing(m, _) => m.relabel(to),
-            Slot::Appointing(a) => {
-                rename_all(to, &mut a.candidates);
-                if let Some(c) = &mut a.change {
-                    rename_all(to, c);
-                }
-            }
-            Slot::Gone => {}
+    t.config.sequencer = to(s.config.sequencer);
+    if let Some(w) = &mut t.wanted {
+        rename_all(to, w);
+    }
+    for c in &mut t.controllers {
+        c.root.relabel(to);
+        for q in &mut c.sets {
+            rename_all(to, q);
         }
+        rename_all(to, &mut c.answered);
     }
     for slot in &mut t.reads {
         if let ReadSlot::Running(n, _, _) = slot {
@@ -1009,8 +1191,9 @@ fn representative(s: &State) -> State {
     let hasher = BuildHasherDefault::<DefaultHasher>::default();
     // While the spare is untouched, renaming it gains nothing: only the
     // config's replicas are renamed (a coarser reduction, still sound).
-    let spare_untouched = s.config == [0, 1, 2]
-        && s.joint.is_empty()
+    let spare_untouched = s.config.replicas == [0, 1, 2]
+        && s.config.joint.is_empty()
+        && s.wanted.is_none()
         && *s.nodes[3].store() == Mem::default()
         && s.net.iter().all(|e| e.to != 3);
     let perms: Vec<Vec<ReplicaId>> = if spare_untouched {
@@ -1112,7 +1295,7 @@ fn breaks(bug: Bug, property: &'static str, bounds: Bounds) -> Vec<Action> {
 }
 
 /// Bounds from `SHARDLOG_BOUNDS`: values, window, reconfigurations, reads,
-/// trims, faults, crashes, and optionally replica changes.
+/// trims, faults, crashes, and optionally replica changes and removals.
 #[test]
 #[ignore = "explores the bounds in SHARDLOG_BOUNDS"]
 fn sized() {
@@ -1122,10 +1305,11 @@ fn sized() {
         Bounds {
             values: (1..=n[0]).map(|v| v * 10).collect(),
             window: n[1].into(),
-            reconfigs: n[2].into(),
+            reconfigs: n[2],
             race: std::env::var_os("SHARDLOG_RACE").is_some(),
             reads: n[3].into(),
             changes: n.get(7).copied().unwrap_or(0),
+            removes: n.get(8).copied().unwrap_or(0),
             trims: n[4],
             faults: n[5],
             crashes: n[6],
@@ -1159,9 +1343,9 @@ fn faults() {
     );
 }
 
-/// Two appointments race for the config.
+/// Two root leaders' controllers race for the config.
 #[test]
-#[ignore = "takes half a minute in a release build"]
+#[ignore = "takes hours in a release build: the walks race two controllers too"]
 fn racing_appointments() {
     holds(
         Bounds {
@@ -1225,6 +1409,34 @@ fn replica_change_read() {
             ..Bounds::default()
         },
         &["an ack", "a replica change", "a read"],
+    );
+}
+
+/// A replica is removed from the cluster and a replica change moves the
+/// log off it, while it still answers seals.
+#[test]
+fn removal() {
+    holds(
+        Bounds {
+            changes: 1,
+            removes: 1,
+            ..Bounds::default()
+        },
+        &["an ack", "an appointment", "a removed replica moved off"],
+    );
+}
+
+/// Issue 7: with one replica down, a seal needs the removed replica's
+/// answer.
+#[test]
+fn ignoring_removed_answers_stalls_seals() {
+    breaks(
+        Bug::IgnoreRemoved,
+        "a seal answered by a quorum finishes",
+        Bounds {
+            removes: 1,
+            ..Bounds::default()
+        },
     );
 }
 
@@ -1359,9 +1571,10 @@ fn walk_bounds() -> Bounds {
         values: vec![10, 20, 30, 40],
         window: 2,
         reconfigs: 4,
-        race: false,
+        race: true,
         reads: 2,
         changes: 2,
+        removes: 1,
         trims: 2,
         faults: 3,
         crashes: 2,
@@ -1370,7 +1583,7 @@ fn walk_bounds() -> Bounds {
 }
 
 /// Every planted bug, by name.
-const BUGS: [(&str, Bug); 10] = [
+const BUGS: [(&str, Bug); 11] = [
     ("NoFence", Bug::NoFence),
     ("NoPrevCheck", Bug::NoPrevCheck),
     ("SealOne", Bug::SealOne),
@@ -1381,6 +1594,7 @@ const BUGS: [(&str, Bug); 10] = [
     ("SealNewOnly", Bug::SealNewOnly),
     ("ActivateEarly", Bug::ActivateEarly),
     ("SyncEarly", Bug::SyncEarly),
+    ("IgnoreRemoved", Bug::IgnoreRemoved),
 ];
 
 /// The seed in `SHARDLOG_SIM_SEED`, or one from the clock: each thread

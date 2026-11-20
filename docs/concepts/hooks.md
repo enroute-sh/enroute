@@ -105,7 +105,8 @@ is not.
 fails the whole push, so an incomplete answer cannot let a ref update through.
 
 `post_receive` is informational. Enroute sends it after the push has
-succeeded, ignores its answer, and does not retry it. If your application must
+succeeded and does not retry it. It sends the answer's `messages` to the
+client and ignores the rest of the answer. If your application must
 act on every push, keep its own record, for example by comparing `ListRefs`
 with what it last saw.
 

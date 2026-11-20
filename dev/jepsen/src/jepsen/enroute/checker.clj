@@ -154,3 +154,16 @@
     (if (empty? finals)
       history
       (h/map #(get fixed (:index %) %) history))))
+
+(defn members
+  "Member changes end: once the faults stop, every log moves onto members
+  only (see `jepsen.enroute.membership`)."
+  []
+  (reify checker/Checker
+    (check [_ test history _]
+      (let [settles (filter #(and (= :nemesis (:process %)) (= :settle (:f %))
+                                  (some? (:value %)))
+                            history)]
+        (if-let [op (last settles)]
+          {:valid? (= :settled (:value op)), :result (:value op)}
+          {:valid? true, :result :no-member-changes})))))

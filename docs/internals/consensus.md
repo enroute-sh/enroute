@@ -82,10 +82,14 @@ that the checker must catch, and the walks must find each within minutes:
   Figure 8.
 - **Failover.** The controller *seals* the log at term + 1 on its replicas. A
   seal raises the replica's fence and answers where its log ends. Once a
-  majority answered, the controller appoints one of the most up to date of
-  those answers, with a compare-and-swap on the root (`Appointment`). A seal
-  majority meets every commit majority, so the new sequencer holds every
-  committed entry.
+  majority answered, the controller appoints a replica that is at least as up
+  to date as a majority of the answers, with a compare-and-swap on the root
+  (`Appointment`). That majority meets every commit majority, so the new
+  sequencer holds every committed entry. A node removed from the cluster keeps
+  its logs until they move off it, so its answer counts toward the majority, but
+  only a member is appointed. When the removed node is the most up to date, the
+  controller waits for more answers, until a member is as up to date as a
+  majority. The entries past that member are not committed.
 - **Reads** take the sequencer's commit point, then check with a majority that
   its term is still open, once its no-op has committed.
 
@@ -116,8 +120,11 @@ incarnation's log starts again from 1.
 
 The root log runs raft-rs, in the etcd/raft design. The repository logs run the
 `shardlog` protocol, through the same code the model checks: each hosted log is
-a `shardlog::Node`, which hides the replica, the sequencer and the read rounds,
-and each failover is a `shardlog::Reconfigure`. The engine feeds them messages,
+a `shardlog::Node`, which hides the replica, the sequencer and the read rounds.
+The root leader's controller is a `shardlog::Root`, which seals and appoints,
+and the root applies appointments and activations by `shardlog::Config`'s
+rules; the engine gives the controller the directory, liveness and placement
+through `shardlog::Cluster`. The engine feeds them messages,
 proposals and timer fires, carries out the effects (sends, commits, reads that
 ended), keeps their store over the log store, and syncs it; answers that need
 their writes on disk go only through `Node::synced`. It never reads or writes a
@@ -275,8 +282,8 @@ share a zone and a member in a zone the log lacks is up, the controller
 changes the replicas with an appointment, one change at a time:
 
 - The seal goes to the old replicas and needs a majority of them, as any
-  failover's does. The new sequencer is one of the most up-to-date answers that
-  stays a replica. The new replica holds nothing to lose.
+  failover's does. The new sequencer is a replica that stays, at least as up to
+  date as a majority of the answers. The new replica holds nothing to lose.
 - A removed sequencer first hands the log to another replica, in a term on the
   same replicas, as a lease moves before its replica does. It stays a replica of
   that term, so it learns the outcome of each proposal it appended and answers

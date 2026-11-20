@@ -2,11 +2,6 @@
 //!
 //! Each span is the child of the span that caused it, on either node.
 
-#![expect(
-    clippy::panic,
-    reason = "a test fails by panicking, on values it chose itself"
-)]
-
 mod common;
 
 use common::{Git, Server, clone_matches, cluster, local_store, push_commits};

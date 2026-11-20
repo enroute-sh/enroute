@@ -13,18 +13,16 @@ use enroute_shared::state::{Command, Commit, UPLOAD_GEN_WINDOW, layer_gen};
 /// The ids of `repo`'s layer files in the (file) object store under `root`.
 fn files(root: &Path, repo: &str) -> HashSet<String> {
     let dir = root.join("store/data/repos").join(repo).join("layers");
-    std::fs::read_dir(dir)
-        .map(|d| {
-            d.flatten()
-                .filter_map(|e| {
-                    e.file_name()
-                        .to_str()?
-                        .strip_suffix(".layer")
-                        .map(String::from)
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    std::fs::read_dir(dir).map_or_default(|d| {
+        d.flatten()
+            .filter_map(|e| {
+                e.file_name()
+                    .to_str()?
+                    .strip_suffix(".layer")
+                    .map(String::from)
+            })
+            .collect()
+    })
 }
 
 fn config(root: &Path) -> enroute::node::Config {

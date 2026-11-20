@@ -401,3 +401,50 @@ async fn protocol_v0_and_v1_clients() {
         assert_eq!(git.rev(&src, "main").await, git.rev(&pc, "HEAD").await);
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn push_negotiate_finds_history_no_advertised_ref_reaches() {
+    let server = Server::start().await;
+    let git = Git::new();
+    let (src, url) = seeded(&server, &git, "neg", 12).await;
+    // Move `main` to a commit `src` does not have, so no advertised tip is in its history.
+    let other = git.dir("other");
+    git.run(
+        git.home.path(),
+        &["clone", "-q", &url, other.to_str().unwrap()],
+    )
+    .await;
+    git.commit_file(&other, "other.txt", &text(90, 20), "other")
+        .await;
+    git.run(&other, &["push", "-q", &url, "main"]).await;
+
+    git.commit_file(&src, "new.txt", &text(91, 20), "new").await;
+    let (ok, _, err) = git
+        .try_run(
+            &src,
+            &[
+                "-c",
+                "push.negotiate=true",
+                "push",
+                "--progress",
+                &url,
+                "main:refs/heads/new",
+            ],
+        )
+        .await;
+    assert!(ok, "push failed:\n{err}");
+    assert!(!err.contains("negotiation failed"), "{err}");
+    // The new commit, its root tree and its blob.
+    assert!(err.contains("Total 3 "), "{err}");
+    let check = git.dir("check");
+    git.run(
+        git.home.path(),
+        &["clone", "-q", "--bare", &url, check.to_str().unwrap()],
+    )
+    .await;
+    git.run(&check, &["fsck", "--strict"]).await;
+    assert_eq!(
+        git.rev(&src, "main").await,
+        git.rev(&check, "refs/heads/new").await
+    );
+}

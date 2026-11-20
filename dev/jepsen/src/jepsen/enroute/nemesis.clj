@@ -6,7 +6,8 @@
                     [nemesis :as n]
                     [util :as util]]
             [jepsen.enroute [cluster :as cluster]
-                            [http :as http]]))
+                            [http :as http]
+                            [membership :as membership]]))
 
 (defn- ledgers [test] (get-in test [:topology :ledgers]))
 (defn- computes [test] (get-in test [:topology :computes]))
@@ -81,82 +82,20 @@
   [test killed paused]
   (remove (into @killed @paused) (ledgers test)))
 
-(defn- remove-stale!
-  "Tries to remove each ID in `stale` through a live ledger node other than
-  its own, and keeps the ones the ledger refused."
-  [test stale live]
-  (reset! stale
-          (set (remove (fn [[node id]]
-                         (some #(cluster/remove-member! test % id)
-                               (shuffle (remove #{node} (live)))))
-                       @stale))))
-
-(defn- replace-ledger!
-  "Ledger node `l` loses its disk and comes back at the same address with a
-  new ID. The old ID is then removed, as an operator would. If the ledger
-  refuses, the old ID stays in `stale` for a later try."
-  [test l stale live]
-  (let [old (cluster/node-id l)]
-    (cluster/kill! l)
-    (cluster/lose-unsynced! test l)
-    (cluster/wipe! test l)
-    (cluster/start! test l)
-    (cluster/await-ready l 60000)
-    (let [new (cluster/await-new-id l old 60000)]
-      (when old (swap! stale conj [l old]))
-      (remove-stale! test stale live)
-      [l old new (if (some #(= old (second %)) @stale) :old-kept :old-removed)])))
-
-(defn- retire-ledger!
-  "Removes running ledger node `l`, waits until its logs move off it, stops
-  it, and starts it on an empty disk, so that it joins as a new node. Skipped
-  if fewer than 3 live members would remain."
-  [test l live]
-  (let [id  (cluster/node-id l)
-        via (first (shuffle (remove #{l} (live))))]
-    (cond
-      (or (nil? id) (nil? via)) [l :no-id]
-      (< (dec (count (ledgers test))) 3) [l id :too-few]
-      (not (cluster/remove-member! test via id)) [l id :refused]
-      :else
-      ;; await-fn retries only while its function throws: it returns any
-      ;; value at once, nil too.
-      (let [moved (try (util/await-fn #(or (= 0 (cluster/hosted-logs l))
-                                           (throw (ex-info "logs still on the node" {})))
-                                      {:timeout 60000, :retry-interval 500})
-                       (catch Exception _ false))]
-        (cluster/kill! l)
-        (cluster/wipe! test l)
-        (cluster/start! test l)
-        (cluster/await-ready l 60000)
-        [l id (cluster/await-new-id l id 60000) (if moved :moved :timed-out)]))))
-
 (defn nemesis
   "Handles every fault. It remembers what it did so that the matching
   recovery undoes it."
   []
-  (let [killed (atom #{}), paused (atom #{})
-        ;; [node id] of each ID that lost its disk and is still a member.
-        stale  (atom #{})]
+  (let [killed (atom #{}), paused (atom #{})]
     (reify
       n/Reflection
       (fs [_] #{:partition :heal :kill-ledger :kill-leader :kill-compute :start :pause-leader
-                :pause-compute :resume :replace-ledger :retire-ledger :remove-stale})
+                :pause-compute :resume})
 
       n/Nemesis
       (setup! [this test] this)
       (invoke! [_ test op]
         (assoc (case (:f op)
-          :replace-ledger (let [live #(live-ledgers test killed paused)]
-                            (if-let [l (some-> (seq (live)) rand-nth)]
-                              (assoc op :value (replace-ledger! test l stale live))
-                              (assoc op :value :no-live-ledger)))
-          :retire-ledger (let [live #(live-ledgers test killed paused)]
-                           (if-let [l (some-> (seq (live)) rand-nth)]
-                             (assoc op :value (retire-ledger! test l live))
-                             (assoc op :value :no-live-ledger)))
-          :remove-stale (assoc op :value
-                               [:kept (remove-stale! test stale #(live-ledgers test killed paused))])
           :partition (let [g (grudge test (:value op))]
                        (cluster/partition! g)
                        (assoc op :value [(:value op) g]))
@@ -208,13 +147,14 @@
    :kill-leader      {:start (fn [] {:f :kill-leader}), :stop {:f :start}}
    :kill-compute     {:start (fn [] {:f :kill-compute}), :stop {:f :start}}
    :pause-leader     {:start (fn [] {:f :pause-leader}), :stop {:f :resume}}
-   :pause-compute    {:start (fn [] {:f :pause-compute}), :stop {:f :resume}}
-   ;; Each change ends by itself. The stop retries an old ID that the ledger
-   ;; refused to remove while a fault held.
-   :replace-ledger   {:start (fn [] {:f :replace-ledger}), :stop {:f :remove-stale}}
-   :retire-ledger    {:start (fn [] {:f :retire-ledger}), :stop {:f :remove-stale}}})
+   :pause-compute    {:start (fn [] {:f :pause-compute}), :stop {:f :resume}}})
 
-(defn generator
+(def fault-names
+  "Every fault: those above, and `members`, the member changes of
+  [[jepsen.enroute.membership]]."
+  (conj (set (map name (keys faults))) "members"))
+
+(defn- cycles
   "Cycles: quiet, then one or two faults at once, held for a while, then
   their recovery."
   [names interval]
@@ -232,7 +172,13 @@
                         (distinct (map #(:stop (faults %)) chosen)))))
             (range))))
 
-(defn final-generator
-  "Ends every fault."
-  []
-  (map gen/once [{:f :heal} {:f :resume} {:f :start} {:f :remove-stale}]))
+(defn package
+  "The nemesis for `names`, its generator, and its final generator. Member
+  changes run on their own schedule, beside the cycles of the other faults."
+  [names interval]
+  (let [members (when (some #{:members} names) (membership/package interval))
+        names   (remove #{:members} names)]
+    {:nemesis         (if members (n/compose [(nemesis) (:nemesis members)]) (nemesis))
+     :generator       (apply gen/any (remove nil? [(cycles names interval) (:generator members)]))
+     :final-generator (concat (map gen/once [{:f :heal} {:f :resume} {:f :start}])
+                              (some-> (:final-generator members) vector))}))

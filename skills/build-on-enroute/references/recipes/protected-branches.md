@@ -7,11 +7,13 @@ people who can otherwise push.
 
 A trunk is the branch everything else is measured against, so it is the one
 branch nobody may rewrite under everybody else. Enroute will not
-stop them. It refuses a push whose objects never arrived, a push whose refname
-Git would not accept, and a push whose `oldObjectId` no longer matches what
-the ref holds. It refuses nothing else. A force-push over the trunk, a deleted
-trunk, or a branch nobody reviewed each lands unless the application says
-otherwise. Enroute holds no opinion about which refs may be rewritten.
+stop them. Before it calls `pre_receive`, it refuses a command whose objects
+never arrived, whose refname Git would not accept, that updates the same ref
+twice, or that deletes the branch `HEAD` names. After the hook allows a
+command, it refuses one whose `oldObjectId` no longer matches what the ref
+holds. It refuses nothing else. A force-push over the trunk, a deleted release
+branch or tag, or a branch nobody reviewed each lands unless the application
+says otherwise. Enroute holds no opinion about which refs may be rewritten.
 
 The obvious hook checks whether the push is a force, and refuses it if it is.
 That hook protects nothing. A delete carries no `newObjectId`, and a command
@@ -25,14 +27,21 @@ Test the delete before the force, and read the rule from a table instead of a
 literal.
 
 ```ts
+import { create } from "@bufbuild/protobuf";
+import {
+  PreReceiveResponseSchema, RefJudgementSchema,
+} from "./gen/enroute/hook/v1alpha1/hook_pb";
+
 async function preReceive(req: PreReceiveRequest): Promise<PreReceiveResponse> {
   const judgements: RefJudgement[] = [];
 
   for (const c of req.commands) {
-    judgements.push({ refname: c.refname, ...(await judge(req, c)) });
+    judgements.push(
+      create(RefJudgementSchema, { refname: c.refname, ...(await judge(req, c)) }),
+    );
   }
 
-  return { judgements };
+  return create(PreReceiveResponseSchema, { judgements });
 }
 
 const allow = { judgement: Judgement.ALLOW, reason: "" };
@@ -64,8 +73,8 @@ delete first, or whoever cannot rewrite a protected branch can still remove it.
 
 **`force` means what Git means.** It is true when `oldObjectId` is not an
 ancestor of `newObjectId`, which is a rewrite. A ref that moves forward over a
-stale value is a different thing, and Enroute refuses that before it asks the
-hook.
+stale value is a different thing: Enroute refuses that when it lands the
+push, after the hook answers.
 
 **`reason` reaches the person.** Their Git client prints it, the way it prints
 the stderr of a hook. Name the ref and say what to do instead. That text is

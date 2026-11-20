@@ -31,7 +31,7 @@ pub fn compute_id(data_dir: &Path) -> Result<u64> {
     if let Ok(s) = std::fs::read_to_string(&path) {
         return u64::from_str_radix(s.trim(), 16).context("malformed compute-id");
     }
-    std::fs::create_dir_all(data_dir)?;
+    enroute_shared::durable::create_dir_all(data_dir)?;
     let id = rand::random::<u64>();
     // Durably: a torn file would fail every later start.
     enroute_shared::durable::write(&path, format!("{id:016x}\n").as_bytes(), 0o644)

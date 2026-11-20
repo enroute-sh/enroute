@@ -830,7 +830,7 @@ impl OidIndex {
         // the smallest index of a duplicate first.
         entries.sort_by_key(|a| (a.oid, a.idx));
         // About one entry per bucket, at most 16 bits.
-        let bits = (usize::BITS - entries.len().leading_zeros()).clamp(1, 16);
+        let bits = entries.len().bit_width().clamp(1, 16);
         let mut fanout = vec![0u32; (1 << bits) + 1];
         for e in entries.iter() {
             let Some(n) = fanout.get_mut(prefix(&e.oid, bits) + 1) else {

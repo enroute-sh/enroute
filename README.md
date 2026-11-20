@@ -1,75 +1,92 @@
-<img src="https://github.com/enroute-sh/enroute/blob/assets/banner.png?raw=true"></img>
-
 <p align="center">
-  <a href="https://github.com/enroute-sh/enroute/blob/HEAD/LICENSE">
-    <img src="https://img.shields.io/badge/License-Apache_2.0-E11311.svg" alt="Apache 2.0 License">
-  </a>
+  <a href="https://enroute.sh"><img src="https://github.com/enroute-sh/enroute/blob/assets/banner.png?raw=true" alt="Enroute" width="100%" /></a>
 </p>
 
-**Enroute** is a _fast_, _programmable_ Git server that is _easy to operate_.
+<p align="center">
+  <strong>Git infrastructure for the most demanding workloads</strong>
+</p>
 
-Databases have changed a lot in the last decade. Git servers haven't. With
-Enroute we're asking the question: What would a Git server look like if we
-built it like a modern database? Our answer:
+<p align="center">
+  <a href="https://enroute.sh/docs">Docs</a> &nbsp;|&nbsp;
+  <a href="https://enroute.sh/docs/quickstart">Quickstart</a> &nbsp;|&nbsp;
+  <a href="https://enroute.sh/docs/reference">API reference</a> &nbsp;|&nbsp;
+  <a href="https://enroute.sh/blog">Blog</a>
+</p>
 
-1. **Fast.** Over 7,500 pushes per second to a single repository, with every
-   push on the disks of a majority of its ledger replicas before Enroute acknowledges
-   it.
-2. **Programmable.** Enroute terminates Git client connections and provides a
-   gRPC API. Hooks let your code decide who can read, what they see, and which
-   pushes land. Each hook is opt-in. No pre-baked opinions, just code.
-3. **Easy to operate.** Repositories live in object storage such as S3:
-   cheap, durable, and no repository disks to fill or replicate. One binary,
-   no external database and no maintenance jobs. Start with one node and grow
-   to a replicated cluster without pushing a single repository again.
+<p align="center">
+  <a href="https://github.com/enroute-sh/enroute/releases/latest"><img src="https://img.shields.io/github/v/release/enroute-sh/enroute?style=flat-square&color=E11311&label=release" alt="Latest release" /></a>
+  <a href="https://github.com/enroute-sh/enroute/blob/HEAD/LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-E11311?style=flat-square" alt="Apache 2.0 License" /></a>
+  <a href="https://discord.gg/Dhzzu3vpUh"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat-square&logo=discord&logoColor=white" alt="Join us on Discord" /></a>
+  <a href="https://x.com/enroute_sh"><img src="https://img.shields.io/badge/X-Follow-000000?style=flat-square&logo=x&logoColor=white" alt="Follow us on X" /></a>
+  <a href="https://www.linkedin.com/company/enroute-sh/"><img src="https://custom-icon-badges.demolab.com/badge/LinkedIn-Follow-0A66C2?style=flat-square&logo=linkedin-white&logoColor=fff" alt="Follow us on LinkedIn" /></a>
+</p>
+
+---
+
+**Enroute** is Git infrastructure for the most demanding workloads out there:
+thousands of pushes per second at millisecond latency, programmable, open
+source, with APIs built for machines.
+
+We are building the Git backend for the next decade of software development:
+
+1. **Scalable.** Over 7,600 pushes per second to a single repository, and
+   single-digit ms latency for most operations. Clusters can hold 300,000+
+   repositories, compute scales horizontally with load and can even be
+   co-located with sandboxes or CI runners.
+2. **Programmable.** Enroute not only terminates Git client connections, but
+   provides a rich gRPC API to interact programmatically with repositories.
+   Hooks let your code decide who can read, what they see, and which pushes
+   land.
+3. **Infinite storage.** Repositories live in object storage such as S3 (or
+   compatible APIs), Google Cloud Storage or Azure Blob Storage: dirt cheap,
+   extremely durable, and virtually unlimited.
 
 ## How does it work?
 
-Most Git servers keep each repository as a directory of files on the disk of
-one machine, as Git itself does. To scale, they shard repositories across
-machines, replicate them by copying files, and run `git gc` to keep them
-healthy.
+Most Git servers keep each repository as a directory of files on the disk of one
+machine. To scale, they shard repositories across machines, replicate them by
+copying files, and run blocking gc and repack tasks to keep them healthy.
 
 We've rethought the Git server with the design principles of modern databases,
-and rebuilt it from the ground up in Rust. At its core is a
-[Git storage engine](docs/internals/overview.md) built on these principles:
+and rebuilt it from the ground up in Rust. At its core is a [Git storage
+engine](docs/internals/overview.md) built on these principles:
 
-- **Separate compute and storage.** **Compute** nodes do the Git work: they
+- **Separate compute and storage.** Compute nodes do the heavy lifting: they
   receive pushes and serve clones and fetches. They keep only caches that
-  Enroute can rebuild, so you can add or replace them at any time. **Ledger**
-  nodes hold the state that matters. One process can run both roles.
-- **Object storage as the storage tier.** Each repository is a set of
-  immutable layers in an object store such as S3, Google Cloud Storage or
-  Azure Blob Storage. The object store gives cheap, durable storage that grows
-  with your data.
-- **A replicated log for each repository.** Ledger nodes keep the refs and
-  the layer list of each repository in its own replicated log, on the durable
-  local disks of three ledger nodes. A small push commits once its log entry is on the ledger disks,
-  without waiting for the object store.
-- **Readers work on snapshots.** A clone or fetch reads one immutable version
-  of the repository from start to end. Readers never block writers.
-- **Optimistic writes.** A compute node does the expensive work of a push
-  without locks: it indexes and validates the pack and builds a new layer.
-  Many pushes, also to the same repository, do this at the same time. Only
-  the last step is serialized, through the log of the repository: one entry
-  that adds the layer and updates the refs with a compare-and-swap. Pushes to
-  different branches do not conflict.
-- **Log-structured layers.** New pushes add layers, and Enroute merges them
-  and removes unused ones in the background, as an LSM tree does. There is no
-  `git repack` to schedule.
+  Enroute can rebuild, so you can add or replace them at any time. Ledger nodes
+  keep track of and persist metadata.
+- **Object storage as the storage tier.** Each repository is a set of immutable
+  layers in an object store such as S3, Google Cloud Storage or Azure Blob
+  Storage. The object store provides cheap, durable storage that grows with your
+  data.
+- **A replicated log for each repository.** Ledger nodes keep the refs and the
+  layer list of each repository in its own replicated log, which can be deployed
+  in an HA configuration across failure domains. The ledger leader ensures load
+  remains evenly balanced and repositories stay available even when nodes go
+  down.
+- **Readers work on snapshots.** Lightweight MVCC snapshots allow each request
+  to work off an immutable version of the repository from start to end. This
+  way, readers never block writers, and vice-versa.
+- **Optimistic concurrency control.** The expensive work of a push happens
+  without locks: indexing and validating the pack files happens concurrently for
+  many pushes at the same time. Metadata in the ledger is updated via
+  compare-and-swap. Pushes to different branches do not conflict.
+- **Log-structured layers.** New pushes add layers, and Enroute merges them and
+  removes unused ones in the background, as an LSM tree does. There is no `git
+  repack` to schedule. Objects are grouped by the commit that changed them, so a
+  fetch reads a few ranges of a layer instead of walking the tree.
 
-There is no external database. The only requirements are an object store (on
-a single machine, a local directory works) and a disk that persists for each
+There is no external database. The only requirements are an object store (on a
+single machine, even a local directory works) and a disk that persists for each
 ledger node.
 
-This design is also what makes Enroute fast. Enroute merges small pushes
-before it uploads them, and serves clones from local copies of the layers. A
-repository that nobody writes to costs almost nothing.
+This design is also what makes Enroute fast. Small, frequent pushes are merged
+before being uploaded to object storage, and clones are served from local copies
+of the layers. A repository that nobody writes to costs almost nothing.
 
-While currently focused purely on Git storage, the vision is that this will
-eventually form the basis for a broader suite of primitives to support you in
-automating your software development lifecycle end-to-end, including CI/CD,
-code reviews and much more.
+On top of that, Enroute is headless: it takes care of the complicated Git work
+and leaves the rest to you. The API and hooks provide the right primitives to
+integrate Git hosting seamlessly into whatever you have in mind.
 
 ## I'm intrigued, how can I try it out?
 
@@ -95,7 +112,7 @@ To run it in a container instead, use the published image:
 
 ```sh
 docker run --rm -p 8080:8080 -p 50051:50051 -v enroute-dev:/data \
-  ghcr.io/enroute-sh/enroute:0.4.0 dev --dir /data --host 0.0.0.0
+  ghcr.io/enroute-sh/enroute:0.4.1 dev --dir /data --host 0.0.0.0
 ```
 
 To build an application on Enroute with a coding agent, add our agent skills:
@@ -109,21 +126,19 @@ environment and help you build your dream platform.
 
 ## How does it grow with me?
 
-Every deployment uses the same binary and the same bucket. Only the `[node]`
-section of the configuration changes:
+We know that different setups have different requirements. Enroute does not
+force you to overcomplicate yours if you don't want to. It can run in three
+different configurations:
 
-1. **One node** on a single machine, with the bucket in a local directory or
-   an object store.
-2. **Separate compute nodes** behind a load balancer when you need more
-   capacity for Git and API traffic.
-3. **Three or more ledger nodes** when writes must continue after the loss of
-   a machine or an availability zone. Each repository's log is replicated to
-   three of them.
+1. **One node** on a single machine, with the storage in a local directory or an
+   object store.
+2. **Separate compute nodes** behind a load balancer when you need more capacity
+   for Git and API traffic.
+3. **Three or more ledger nodes** when you need high availability across
+   multiple machines, availability zones or regions.
 
-You can move a deployment from one step to the next without data loss. To move
-from a local directory to an object store, copy the repositories to a new
-deployment. See [Deployment profiles](docs/operate/deployment-profiles.md) and
-[Upgrades and migrations](docs/operate/upgrades.md).
+Check out [Deployment profiles](docs/operate/deployment-profiles.md) and
+[Upgrades and migrations](docs/operate/upgrades.md) for more information.
 
 ## What's currently supported?
 
@@ -144,40 +159,28 @@ hooks are supported:
 - Post-receive: Schedule actions to run after a successful push like running CI,
   deploying code, or mirroring your code to another repository.
 
-On top of the hooks, Enroute exposes a rich gRPC API for you to programmatically
-interact with any repository. See the [API reference](docs/reference/proto.md).
-
-## What's on the roadmap?
-
-In the near future, our focus is on increasing the reliability and performance
-of Enroute. This includes benchmarks against other Git servers, and moving a
-single machine from a local directory to an object store in place.
-
-In addition, we are planning the following features:
-
-- More transports like SSH and `git://`.
-- More gRPC capabilities to enable a broader set of use-cases.
-- Fast checkout: Specific features aimed towards use in latency-sensitive,
-  ephemeral environments like agent sandboxes.
-- First-class support for the [`git-meta`](https://git-meta.com/) standard.
+On top of the hooks, Enroute exposes a gRPC API to create commits on the server,
+read files, history and diffs, and push to or fetch from other Git hosts. See
+the [API reference](docs/reference/proto.md).
 
 ## Where can I learn more?
 
 [The docs](docs/) start here. The short version:
 
 - [Quickstart](docs/quickstart.md) — a repository served in a few minutes.
-- [Build a code-hosting application](docs/build/README.md) — build one on Enroute,
-  chapter by chapter, from an empty project to code and diffs on a page.
+- [Build a code-hosting application](docs/build/README.md) — build one on
+  Enroute, chapter by chapter, from an empty project to code and diffs on a
+  page.
 - [Hook reference](docs/reference/hooks.md) — every field of every hook, with
   the payload of each call.
-- [Concepts](docs/concepts/README.md) — the model, the clients and interfaces, the hooks
-  and the storage, in four short pages.
-- [Operate a deployment](docs/operate/README.md) — configuration,
-  storage, security, maintenance, telemetry and upgrades.
+- [Concepts](docs/concepts/README.md) — the model, the clients and interfaces,
+  the hooks and the storage, in four short pages.
+- [Operate a deployment](docs/operate/README.md) — configuration, storage,
+  security, maintenance, telemetry and upgrades.
 - [Limitations](docs/reference/limitations.md) — what does not work yet, stated
   plainly.
-- [Architecture](docs/internals/README.md) — how Enroute stores,
-  replicates and serves repositories, and how it is tested.
+- [Architecture](docs/internals/README.md) — how Enroute stores, replicates and
+  serves repositories, and how it is tested.
 
 ## What's the status?
 
@@ -187,8 +190,8 @@ Enroute is **early**. We use it ourselves, but read
 
 **Until 1.0, any `0.x` release can change the storage format, the configuration
 and the API.** When the storage format changes, you move your repositories to a
-new deployment rather than push them again. See
-[Upgrades and migrations](docs/operate/upgrades.md).
+new deployment rather than push them again. See [Upgrades and
+migrations](docs/operate/upgrades.md).
 
 ## How can I contribute?
 
@@ -209,5 +212,5 @@ in whole or in part, with or without attribution.
 
 ## What's the license?
 
-Enroute is licensed under [Apache-2.0](LICENSE). The [NOTICE](NOTICE) file has
-the attribution notice.
+Enroute is licensed under [Apache-2.0](LICENSE). Hosted Enroute is in early
+access at [enroute.sh](https://enroute.sh).

@@ -97,8 +97,7 @@ fn table_keys(manifest: &Value, section: &str, key: &str) -> HashSet<String> {
         .get(section)
         .and_then(|value| value.get(key))
         .and_then(Value::as_table)
-        .map(|table| table.keys().cloned().collect())
-        .unwrap_or_default()
+        .map_or_default(|table| table.keys().cloned().collect())
 }
 
 /// A dep pointing at a location rather than a registry version: nothing to

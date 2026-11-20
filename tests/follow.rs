@@ -1,11 +1,6 @@
 //! Subscriptions to repositories' logs (`Watch`): a follower that applies
 //! the stream ends up with the ledger's state.
 
-#![expect(
-    clippy::unwrap_used,
-    reason = "a test fails by panicking, on values it chose itself"
-)]
-
 mod common;
 
 use std::sync::Arc;

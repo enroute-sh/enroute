@@ -39,6 +39,9 @@ use crate::proto::{
     NamedIncarnation, RootEntry, RootMeta, Upgrade, root_entry,
 };
 
+use super::log_id;
+use super::shardlog::{Appoint, Config};
+
 /// How many replicas a repository's log has (fewer if there are fewer
 /// members).
 pub(crate) const REPLICAS: usize = 3;
@@ -82,6 +85,9 @@ pub(crate) struct Directory {
     /// how many logs each node is a replica of (see `reindex`).
     pub(crate) sequencing: HashMap<u64, BTreeSet<String>>,
     pub(crate) placed: HashMap<u64, usize>,
+    /// The live repositories, by log id (kept by create, delete and
+    /// `reindex`).
+    pub(crate) logs: HashMap<u64, String>,
 }
 
 /// What applying a root entry changed.
@@ -114,6 +120,17 @@ impl Change {
 /// those it is changing from.
 pub(crate) fn hosts(inc: &Incarnation, node: u64) -> bool {
     !inc.deleted && (inc.replicas.contains(&node) || inc.joint.contains(&node))
+}
+
+/// Incarnation `inc`'s log config.
+pub(crate) fn config(inc: &Incarnation) -> Config<u64> {
+    Config {
+        term: inc.term,
+        sequencer: inc.sequencer,
+        boot: inc.boot,
+        replicas: inc.replicas.clone(),
+        joint: inc.joint.clone(),
+    }
 }
 
 /// A tie-break between nodes for `repo`, the same on every node and every
@@ -359,6 +376,7 @@ impl Directory {
         };
         let epoch = inc.epoch;
         self.index(&c.repo, &inc, true);
+        self.logs.insert(log_id(&c.repo, epoch), c.repo.clone());
         self.repos.insert(c.repo.clone(), inc);
         Change::Created(c.repo.clone(), epoch)
     }
@@ -367,6 +385,7 @@ impl Directory {
         match self.repos.get(&d.repo).cloned() {
             Some(mut i) if i.epoch == d.epoch && !i.deleted => {
                 self.index(&d.repo, &i, false);
+                self.logs.remove(&log_id(&d.repo, d.epoch));
                 i.deleted = true;
                 (i.end_version, i.end_upload_gen) = (d.version, d.upload_gen);
                 self.repos.insert(d.repo.clone(), i);
@@ -376,53 +395,46 @@ impl Directory {
         }
     }
 
-    /// Hand a log to a new term, if it is still at the appointment's base
-    /// term, its sequencer a member and one of its replicas, and (for new
-    /// replicas) no other replica change under way.
+    /// Hand a log to a new term, if [`Config::appointed`] takes it, with the
+    /// members and placements that [`Directory::fits`].
     fn appoint(&mut self, a: &Appointment) -> Change {
-        let Some(old) = self.repos.get(&a.repo).cloned() else {
-            return Change::None;
+        let appoint = Appoint {
+            base: a.base_term,
+            sequencer: a.sequencer,
+            boot: a.boot,
+            replicas: (!a.replicas.is_empty()).then(|| a.replicas.clone()),
         };
-        if old.epoch != a.epoch || old.deleted || old.term != a.base_term {
-            return Change::None;
-        }
-        let replicas = if a.replicas.is_empty() {
-            old.replicas.clone()
-        } else {
-            a.replicas.clone()
-        };
-        if !self.meta.members.contains(&a.sequencer) || !replicas.contains(&a.sequencer) {
-            return Change::None;
-        }
-        let mut inc = old.clone();
-        if replicas != old.replicas {
-            if !old.joint.is_empty() || !self.fits(&replicas) {
-                return Change::None;
-            }
-            inc.joint.clone_from(&old.replicas);
-        }
-        self.index(&a.repo, &old, false);
-        (inc.term, inc.sequencer, inc.boot, inc.replicas) =
-            (a.base_term + 1, a.sequencer, a.boot, replicas);
-        self.index(&a.repo, &inc, true);
-        self.repos.insert(a.repo.clone(), inc);
-        Change::Appointed(a.repo.clone(), a.epoch)
+        let members = &self.meta.members;
+        let next = self
+            .config_at(&a.repo, a.epoch)
+            .and_then(|c| c.appointed(appoint, |n| members.contains(&n), |r| self.fits(r)));
+        self.set_config(&a.repo, next)
     }
 
     /// End a replica change once its term committed on the new replicas.
     fn activate(&mut self, a: &Activation) -> Change {
-        let Some(old) = self.repos.get(&a.repo).cloned() else {
+        let next = (self.config_at(&a.repo, a.epoch)).and_then(|c| c.activated(a.term));
+        self.set_config(&a.repo, next)
+    }
+
+    /// The config of `repo`'s log, if incarnation `epoch` is live.
+    fn config_at(&self, repo: &str, epoch: u64) -> Option<Config<u64>> {
+        let inc = self.live(repo).filter(|i| i.epoch == epoch)?;
+        Some(config(inc))
+    }
+
+    /// Give `repo`'s live log config `c`, if there is one.
+    fn set_config(&mut self, repo: &str, c: Option<Config<u64>>) -> Change {
+        let (Some(c), Some(old)) = (c, self.live(repo).cloned()) else {
             return Change::None;
         };
-        if old.epoch != a.epoch || old.deleted || old.term != a.term || old.joint.is_empty() {
-            return Change::None;
-        }
         let mut inc = old.clone();
-        inc.joint.clear();
-        self.index(&a.repo, &old, false);
-        self.index(&a.repo, &inc, true);
-        self.repos.insert(a.repo.clone(), inc);
-        Change::Appointed(a.repo.clone(), a.epoch)
+        (inc.term, inc.sequencer, inc.boot, inc.replicas, inc.joint) =
+            (c.term, c.sequencer, c.boot, c.replicas, c.joint);
+        self.index(repo, &old, false);
+        self.index(repo, &inc, true);
+        self.repos.insert(repo.to_string(), inc);
+        Change::Appointed(repo.to_string(), old.epoch)
     }
 
     /// Count (`add`) or uncount a live incarnation in the derived indexes.
@@ -447,6 +459,10 @@ impl Directory {
     fn reindex(&mut self) {
         (self.sequencing, self.placed) = (HashMap::new(), HashMap::new());
         let repos = std::mem::take(&mut self.repos);
+        self.logs = (repos.iter())
+            .filter(|(_, i)| !i.deleted)
+            .map(|(r, i)| (log_id(r, i.epoch), r.clone()))
+            .collect();
         for (repo, inc) in &repos {
             self.index(repo, inc, true);
         }

@@ -122,16 +122,17 @@ because a diff needs both.
 
 ## The commit page
 
-Create `app/r/[...path]/commit/[hex]/page.tsx`:
+Next.js allows a catch-all segment only at the end of a route, so the commit
+page cannot sit under `app/r/[...path]/`. Put the commit ID first. Create
+`app/commit/[hex]/[...path]/page.tsx`:
 
 ```tsx
 import { notFound } from "next/navigation";
 import { preloadMultiFileDiff } from "@pierre/diffs/ssr";
+import type { DiffFileInput } from "@pierre/diffs/ssr";
 import { diffCommit } from "@/lib/enroute";
 import { repoByPath } from "@/lib/store";
 import { CommitDiff } from "./commit-diff";
-
-export const runtime = "nodejs";
 
 const THEME = {
   theme: { light: "pierre-light", dark: "pierre-dark" },
@@ -157,9 +158,16 @@ export default async function Page({
       return { path: change.path, unshowable: true as const };
     }
 
+    // A change has at least one side. The renderer's types need to be told
+    // which one is missing.
+    const sides: DiffFileInput =
+      oldFile && newFile ? { oldFile, newFile }
+      : oldFile ? { oldFile, newFile: null }
+      : { oldFile: null, newFile: newFile! };
+
     return {
       path: change.path,
-      preloaded: await preloadMultiFileDiff({ oldFile, newFile, options: THEME }),
+      preloaded: await preloadMultiFileDiff({ ...sides, options: THEME }),
     };
   });
 
@@ -173,7 +181,7 @@ export default async function Page({
 }
 ```
 
-And the client boundary, `app/r/[...path]/commit/[hex]/commit-diff.tsx`:
+And the client boundary, `app/commit/[hex]/[...path]/commit-diff.tsx`:
 
 ```tsx
 "use client";
@@ -224,7 +232,7 @@ const { commits } = await listCommits(repo.id, tip.hex);
 <ul>
   {commits.map((c) => (
     <li key={c.commitId!.hex}>
-      <a href={`/r/${repo.path}/commit/${c.commitId!.hex}`}>
+      <a href={`/commit/${c.commitId!.hex}/${repo.path}`}>
         {c.summary}
       </a>{" "}
       — {c.author?.name}

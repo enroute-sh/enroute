@@ -47,10 +47,11 @@ namespace. Enroute hands every later hook call that answer and never what the
 Git client said. Put an id there, never a credential and never an email
 address.
 
-**The application holds the policy.** Enroute refuses a push whose objects are
-missing, a push whose refname Git would not accept, and a push whose
-`old_object_id` no longer matches what the ref holds. It refuses nothing else.
-A force-push, a deleted trunk, or a branch nobody reviewed each lands unless
+**The application holds the policy.** Enroute refuses a command whose objects
+are missing, whose refname Git would not accept, that updates the same ref
+twice, or that deletes the branch `HEAD` names, and one whose `old_object_id`
+no longer matches what the ref holds. It refuses nothing else. A force-push, a
+deleted release branch or tag, or a branch nobody reviewed each lands unless
 `preReceive` refuses it.
 
 **A refusal is per ref, unless the push is atomic.** `preReceive` judges every

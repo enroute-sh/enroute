@@ -26,19 +26,25 @@ Answer the same denial for "no such repository" and "not yours", and separate
 authentication from authorization by which denial you send.
 
 ```ts
-const deny = (denial: Denial, challenge?: Challenge): AuthorizeResponse => ({
-  outcome: { case: "denied", value: { denial, challenge } },
-});
+import { create } from "@bufbuild/protobuf";
+import {
+  AuthorizeResponseSchema, ChallengeSchema, VisibleRefsResponseSchema,
+} from "./gen/enroute/hook/v1alpha1/hook_pb";
+
+const deny = (denial: Denial, challenge?: Challenge): AuthorizeResponse =>
+  create(AuthorizeResponseSchema, {
+    outcome: { case: "denied", value: { denial, challenge } },
+  });
 
 async function authorize(req: AuthorizeRequest): Promise<AuthorizeResponse> {
   const token = bearerOrBasicPassword(req.headers);
 
   const caller = await lookupSession(token);
   if (!caller) {
-    return deny(Denial.UNAUTHORIZED, {
+    return deny(Denial.UNAUTHORIZED, create(ChallengeSchema, {
       wwwAuthenticate: 'Basic realm="forge"',
       help: "Create a token at https://forge.example.com/tokens\n",
-    });
+    }));
   }
 
   // `.git` is a convention of the client and means nothing in the protocol.
@@ -49,7 +55,7 @@ async function authorize(req: AuthorizeRequest): Promise<AuthorizeResponse> {
     return deny(Denial.FORBIDDEN);
   }
 
-  return {
+  return create(AuthorizeResponseSchema, {
     outcome: {
       case: "granted",
       value: {
@@ -58,7 +64,7 @@ async function authorize(req: AuthorizeRequest): Promise<AuthorizeResponse> {
         context: encodeContext({ session: caller.id, perms: caller.perms }),
       },
     },
-  };
+  });
 }
 ```
 
@@ -92,7 +98,9 @@ async function visibleRefs(
   req: VisibleRefsRequest,
 ): Promise<VisibleRefsResponse> {
   const perms = decodeContext(req.context);
-  return { refnames: req.refnames.filter((r) => maySee(perms, r, req.access)) };
+  return create(VisibleRefsResponseSchema, {
+    refnames: req.refnames.filter((r) => maySee(perms, r, req.access)),
+  });
 }
 ```
 

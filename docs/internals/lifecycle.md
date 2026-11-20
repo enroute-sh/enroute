@@ -63,8 +63,9 @@ incarnation 1.
 ### Why a lagging replica can never write again
 
 The tombstone is committed. A majority of the replicas of E have it, so any
-later sequencer of E has it (an appointment seals a majority and picks the most
-up to date), and a sequencer refuses every command. The root ends E only after
+later sequencer of E has it (an appointment seals a majority and picks a
+replica at least as up to date as a majority of the answers), and a sequencer
+refuses every command. The root ends E only after
 that commit. Whoever reads "ended" therefore knows that any later sequencer of E
 has the tombstone. A replica that was down keeps E untombstoned, but it cannot
 commit without a majority, and the others dropped the log. It drops E as its

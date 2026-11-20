@@ -24,7 +24,7 @@ use raft_engine::LogBatch;
 use enroute_shared::state::RepoMeta;
 
 use crate::logdb::LogDb;
-use crate::proto::{Effect, Hard, Incarnation, Record, Start, StoredCell, frame};
+use crate::proto::{Effect, Hard, Record, Start, StoredCell, frame};
 use crate::state::machine::count;
 use crate::state::store::{Root, StateStore};
 use crate::state::stored;
@@ -500,28 +500,6 @@ impl Store<Bytes> for LedgerStore {
     }
 }
 
-/// A log's configuration, as the root's directory has it.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(super) struct Config {
-    pub term: u64,
-    pub sequencer: u64,
-    pub boot: u64,
-    pub replicas: Vec<u64>,
-    pub joint: Vec<u64>,
-}
-
-impl Config {
-    pub(super) fn of(inc: &Incarnation) -> Config {
-        Config {
-            term: inc.term,
-            sequencer: inc.sequencer,
-            boot: inc.boot,
-            replicas: inc.replicas.clone(),
-            joint: inc.joint.clone(),
-        }
-    }
-}
-
 /// A hosted repository's log.
 pub(super) struct RepoLog {
     pub repo: String,
@@ -532,7 +510,7 @@ pub(super) struct RepoLog {
     /// The last entry durably applied, and the oldest entry pinned by an
     /// inline layer then: how far the log may be compacted.
     pub durable: (u64, Option<u64>),
-    pub config: Config,
+    pub config: shardlog::Config<u64>,
     /// The last position handed to the apply thread.
     pub handed: u64,
     /// Proposals waiting for their entry (by position, with its term).
@@ -558,7 +536,7 @@ impl RepoLog {
         epoch: u64,
         store: LedgerStore,
         progress: Arc<Mutex<Progress>>,
-        config: Config,
+        config: shardlog::Config<u64>,
         me: u64,
     ) -> RepoLog {
         RepoLog {

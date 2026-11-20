@@ -97,7 +97,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 publish = false
 license = "Apache-2.0"
@@ -354,6 +354,9 @@ pedantic = { level = "deny", priority = -1 }
 # HashMap/HashSet hasher is fine everywhere, so generalizing over BuildHasher
 # would just be noise
 implicit_hasher = "allow"
+# `assert!(v.is_empty())` reads better than its suggested `assert_eq!(v, []
+# as [T; 0])`, and a failing test can print the value when it matters
+assert_is_empty = "allow"
 # restriction lints
 allow_attributes = "deny"
 allow_attributes_without_reason = "deny"

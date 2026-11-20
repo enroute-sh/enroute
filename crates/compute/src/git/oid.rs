@@ -66,14 +66,12 @@ pub(crate) fn try_hash_object(
     kind: Kind,
     data: &[u8],
 ) -> anyhow::Result<Oid> {
-    let len = data.len().to_string();
-    let header = [kind.name().as_bytes(), b" ", len.as_bytes(), &[0u8]];
+    let mut buf = [0u8; 32];
+    let header = object_header(kind, data.len(), &mut buf);
     match format {
         ObjectFormat::Sha1 => {
             let mut h = sha1dc::Hasher::new();
-            for part in header {
-                h.update(part);
-            }
+            h.update(header);
             h.update(data);
             let d = h.finalize().map_err(|e| {
                 anyhow::anyhow!(
@@ -86,13 +84,40 @@ pub(crate) fn try_hash_object(
         ObjectFormat::Sha256 => {
             use sha2::Digest;
             let mut h = sha2::Sha256::new();
-            for part in header {
-                h.update(part);
-            }
+            h.update(header);
             h.update(data);
             Ok(Oid::sha256(h.finalize().into()))
         }
     }
+}
+
+/// The `"<kind> <len>\0"` header that git hashes ahead of an object's data.
+///
+/// It is written right-aligned into `buf` and passed to the hasher in one
+/// update: an allocated length string and four small updates cost about as
+/// much as hashing a small object itself.
+fn object_header(kind: Kind, len: usize, buf: &mut [u8; 32]) -> &[u8] {
+    let mut digits = [0u8; 20];
+    let mut count = 0;
+    let mut rest = len;
+    for d in &mut digits {
+        *d = b'0' | u8::try_from(rest % 10).unwrap_or_default();
+        count += 1;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    let reversed = std::iter::once(0)
+        .chain(digits.iter().take(count).copied())
+        .chain(std::iter::once(b' '))
+        .chain(kind.name().bytes().rev());
+    let mut used = 0;
+    for (slot, b) in buf.iter_mut().rev().zip(reversed) {
+        *slot = b;
+        used += 1;
+    }
+    buf.split_at(buf.len().saturating_sub(used)).1
 }
 
 /// [`try_hash_object`] of a SHA-1 repository, for tests: they hash only
@@ -106,4 +131,35 @@ pub(crate) fn hash_object(kind: Kind, data: &[u8]) -> Oid {
 #[cfg(test)]
 pub(crate) fn hash_object_in(format: ObjectFormat, kind: Kind, data: &[u8]) -> Oid {
     try_hash_object(format, kind, data).expect("collision attack in locally generated object")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn header_matches_git() {
+        let mut buf = [0u8; 32];
+        assert_eq!(object_header(Kind::Blob, 0, &mut buf), b"blob 0\0");
+        assert_eq!(
+            object_header(Kind::Commit, 1234, &mut buf),
+            b"commit 1234\0"
+        );
+        assert_eq!(
+            object_header(Kind::Tree, usize::MAX, &mut buf),
+            format!("tree {}\0", usize::MAX).as_bytes()
+        );
+    }
+
+    #[test]
+    fn empty_blob_ids_match_git() {
+        assert_eq!(
+            hash_object_in(ObjectFormat::Sha1, Kind::Blob, b"").to_string(),
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+        );
+        assert_eq!(
+            hash_object_in(ObjectFormat::Sha256, Kind::Blob, b"").to_string(),
+            "473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813"
+        );
+    }
 }

@@ -43,8 +43,8 @@ path uses the same planner and pack writer as v2.
 ### Push
 
 The advertisement of `git-receive-pack` offers `report-status`,
-`delete-refs`, `side-band-64k`, `quiet`, `atomic`, `ofs-delta` and the
-repository's `object-format`.
+`delete-refs`, `side-band-64k`, `quiet`, `atomic`, `ofs-delta`,
+`push-options` and the repository's `object-format`.
 
 - With `atomic`, one refused command fails every command of the push
   ([Write path](write-path.md#pushes-with-hooks)).
@@ -122,10 +122,14 @@ The API port authenticates nothing. Keep it on a network that only the
 application can reach ([Security](../operate/security.md)). Engine errors reach
 the caller as `Internal` without detail. The log carries the detail.
 
-## Push to a remote
+## Push to and fetch from a remote
 
-`SyncService.PushToRemote` makes Enroute a Git client. The compute builds the pack
-with the code that answers a fetch, from a snapshot. It keeps nothing about the
+`SyncService.PushToRemote` and `SyncService.FetchFromRemote` make Enroute a
+Git client. A fetch uses protocol v2 `ls-refs` and `fetch`, and lands its refs
+as one log entry after the same checks as a push
+([Fetch from a remote](../reference/fetch-from-a-remote.md)).
+
+For a push, the compute builds the pack with the code that answers a fetch, from a snapshot. It keeps nothing about the
 remote: each call brings the URL, the
 credentials and the refs.
 

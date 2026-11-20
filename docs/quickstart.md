@@ -17,7 +17,7 @@ It downloads the latest release for your platform, checks it against
 release, set `ENROUTE_VERSION`:
 
 ```sh
-curl -fsSL https://enroute.sh/install | ENROUTE_VERSION=0.4.0 sh
+curl -fsSL https://enroute.sh/install | ENROUTE_VERSION=0.4.1 sh
 ```
 
 To install from an archive, build from source, or use the container image, see
@@ -235,7 +235,7 @@ cargo install --path .
 ### Run the image
 
 You can run `enroute dev` from the published image. Replace `<version>` with
-a release, for example `0.4.0`:
+a release, for example `0.4.1`:
 
 ```sh
 docker run --rm -p 8080:8080 -p 50051:50051 -v enroute-dev:/data \

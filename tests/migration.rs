@@ -4,11 +4,6 @@
 //! One node, then one ledger with compute nodes, then a replicated ledger
 //! (docs/operate/deployment-profiles.md).
 
-#![expect(
-    clippy::unwrap_used,
-    reason = "a test fails by panicking, on values it chose itself"
-)]
-
 mod common;
 
 use std::path::{Path, PathBuf};

@@ -66,11 +66,14 @@ async function land(
     }],
   });
 
+  const rejection = outcomes[0].rejection;
   // The trunk moved between the read and the move. Nothing is wrong, and the
   // next pass measures against the new tip.
-  if (outcomes[0].rejection?.reason === Reason.NON_FAST_FORWARD) {
+  if (rejection?.reason === Reason.NON_FAST_FORWARD) {
     return { retry: true };
   }
+  // Any other rejection did not land, and retrying does not change it.
+  if (rejection) return { blocked: `refused: ${Reason[rejection.reason]}` };
   return { merged: mr.tip };
 }
 ```

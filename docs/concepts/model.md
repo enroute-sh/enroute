@@ -63,10 +63,12 @@ A repository holds what any Git repository holds: objects (commits, trees,
 blobs, and tags) and refs that name them. Enroute adds no records of its own,
 such as pull requests or issues.
 
-Objects arrive in two ways: a Git push, or a
+Objects arrive in three ways: a Git push, a
 [`CreateCommit`](../reference/the-contract.md#createcommit) call that makes one
-commit from file changes. Refs move in three ways: a push,
-[`UpdateRefs`](../reference/the-contract.md#updaterefs), and `CreateCommit`.
+commit from file changes, or a
+[`FetchFromRemote`](../reference/fetch-from-a-remote.md) call. Refs move in
+four ways: a push, [`UpdateRefs`](../reference/the-contract.md#updaterefs),
+`CreateCommit`, and `FetchFromRemote`.
 Only a push runs the hooks. The API calls are your application acting on its
 own authority, so it applies its rules before it calls.
 
@@ -86,8 +88,8 @@ good. A Git client must use the same format.
   [Security](../operate/security.md).
 - **Store policy.** Branch protection, review rules, and access lists are your
   application's data, applied in hooks.
-- **Create objects on its own.** Every object comes from a push or a
-  `CreateCommit` call. Enroute makes no merge commits.
+- **Create objects on its own.** Every object comes from a push, a
+  `CreateCommit` call, or a `FetchFromRemote` call. Enroute makes no merge commits.
 - **Share objects between repositories.** Each repository stores its own
   objects. There are no forks with shared storage.
 

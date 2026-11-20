@@ -439,6 +439,8 @@ impl StateStore {
             // new one's directory entry is not synced).
             .open()
             .with_context(|| format!("opening the state store at {}", path.display()))?;
+        // lsm-tree syncs what is in the tree's directory, not its entry here.
+        enroute_shared::durable::sync_dir(path)?;
         // A read at 0 sees nothing, so batches start at 1.
         let start = tree.get_highest_seqno().map_or(1, |s| s + 1);
         seqno.fetch_max(start);
@@ -668,7 +670,7 @@ impl StateStore {
 
 /// Lock the store's directory at `path`, creating it if needed.
 fn lock(path: &Path) -> Result<File> {
-    std::fs::create_dir_all(path)?;
+    enroute_shared::durable::create_dir_all(path)?;
     let lock = File::options()
         .create(true)
         .truncate(false)

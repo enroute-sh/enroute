@@ -176,6 +176,20 @@
       (do (info via "removed member" id) true)
       (do (warn via "could not remove member" id ":" (str/trim err)) false))))
 
+(defn members
+  "The ledger's members and removed IDs, as `{:members #{..} :removed #{..}}`,
+  read with `enroute members` on node `via`. Nil if no member answers."
+  [test via]
+  (let [{:keys [exit out]}
+        (shell/sh "setpriv" (str "--reuid=" via) (str "--regid=" via) "--clear-groups"
+                  "env" "-i" "PATH=/usr/bin:/bin" "RUST_LOG=off"
+                  (bin test) "members" "--config" (str "file://" (config-file test via))
+                  "--json")]
+    (when (zero? exit)
+      (let [m (http/parse-json out)]
+        {:members (set (map long (:members m)))
+         :removed (set (map long (:removed m)))}))))
+
 (defn await-serving
   "Waits until compute `node` reaches the ledger: /status answers before the
   node has joined the ledger."

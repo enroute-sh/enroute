@@ -104,7 +104,7 @@ export async function sweepOrphans() {
 ```
 
 A short page is not the last page. Stop only when `nextPageToken` comes back
-empty. See [The contract](../reference/the-contract.md#repository-keys).
+empty. See [The contract](../reference/the-contract.md#listrepositories).
 
 The same ordering settles a race between two creates of one path. Each caller
 allocates its own ID and makes its own repository. Let the unique constraint

@@ -1,11 +1,6 @@
 //! SHA-256 repositories: created through the API, served to git clients
 //! with `object-format=sha256`, and kept apart from SHA-1 clients.
 
-#![expect(
-    clippy::unwrap_used,
-    reason = "a test fails by panicking, on values it chose itself"
-)]
-
 mod common;
 
 use std::path::{Path, PathBuf};

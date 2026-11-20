@@ -2,9 +2,7 @@
 #![expect(
     clippy::as_conversions,
     clippy::format_push_string,
-    clippy::panic,
     clippy::unreadable_literal,
-    clippy::unwrap_used,
     clippy::used_underscore_binding,
     reason = "a test fails by panicking, on values it chose itself"
 )]
@@ -290,7 +288,7 @@ impl Api {
         Ok(listing
             .refs
             .into_iter()
-            .map(|r| (r.name, r.object_id.map(|id| id.hex).unwrap_or_default()))
+            .map(|r| (r.name, r.object_id.map_or_default(|id| id.hex)))
             .collect())
     }
 
@@ -623,8 +621,7 @@ pub(crate) fn replicas(server: &Server, repo: &str) -> Vec<u64> {
         .unwrap()
         .replicas(repo)
         .filter(|(_, joint)| joint.is_empty())
-        .map(|(r, _)| r)
-        .unwrap_or_default();
+        .map_or_default(|(r, _)| r);
     v.sort_unstable();
     v
 }

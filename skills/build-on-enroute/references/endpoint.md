@@ -210,7 +210,8 @@ PostReceiveResponse { messages[] }
 ```
 
 `commands` holds only what landed. A push whose commands were all refused
-sends no call at all.
+sends no call at all. Enroute computes `force` only when `pre_receive` is
+enabled; without it, every command arrives with `force` false.
 
 Enroute prints `messages` to whoever pushed, above the `ok <ref>` lines. A
 message such as "Open a merge request at ..." comes from here, and from
@@ -225,8 +226,9 @@ does not tell an application that was unreachable. Treat this as latency, not
 as a guarantee. Anything whose correctness depends on being told needs its own
 record.
 
-Enroute waits for the answer and ignores it, the way `receive-pack` ignores the
-exit code of `post-receive`. A failure here undoes nothing.
+Enroute waits for the answer, sends its `messages`, and ignores the rest, the
+way `receive-pack` ignores the exit code of `post-receive`. A failure here
+undoes nothing.
 
 ## The context field
 

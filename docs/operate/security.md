@@ -73,9 +73,13 @@ On S3, for example, a compute node's policy allows:
 Ledger nodes get the same statements with `GetObject`, `PutObject` and
 `DeleteObject` on `BUCKET/*`. On GCS, grant the compute nodes' service account
 `storage.objects.list` on the bucket (a custom role: a list request names the
-bucket, so an object-name condition would refuse it), and
+bucket, so an object-name condition would refuse it),
 `roles/storage.objectUser` with the IAM condition
-`resource.name.startsWith("projects/_/buckets/BUCKET/objects/data/")`.
+`resource.name.startsWith("projects/_/buckets/BUCKET/objects/data/")`, and
+`roles/storage.objectViewer` with the IAM condition
+`resource.name.startsWith("projects/_/buckets/BUCKET/objects/cluster/")`.
+Compute nodes read `cluster/format` and `cluster/members` at startup, and do
+not start without the `cluster/` grant.
 
 Some providers scope credentials per bucket only, among them Cloudflare R2
 (without temporary credentials) and DigitalOcean Spaces. There, compute nodes'
@@ -116,8 +120,8 @@ development. See
 ## Other boundaries
 
 `PushToRemote` and `FetchFromRemote` discard credentials after each call. They
-reject credentials in URLs and redirects, and permits only public `https` hosts unless
-`git.allow_private_remotes` is enabled.
+reject credentials in URLs and redirects, and permit only public `https` hosts
+unless `git.allow_private_remotes` is enabled.
 
 A deployment holds one application's repositories. Enroute enforces no
 boundary inside that set: every key is reachable by whoever reaches the API

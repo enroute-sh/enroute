@@ -213,8 +213,7 @@ pub(crate) fn ls_refs(view: &RefView<'_>, symrefs: bool, unborn: bool) -> Vec<u8
         let peeled = view
             .peeled
             .get(oid)
-            .map(|p| format!(" peeled:{p}"))
-            .unwrap_or_default();
+            .map_or_default(|p| format!(" peeled:{p}"));
         pktline::line(&mut out, &format!("{oid} {name}{peeled}\n"));
     }
     pktline::flush(&mut out);

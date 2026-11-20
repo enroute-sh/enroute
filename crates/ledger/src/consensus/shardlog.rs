@@ -19,16 +19,17 @@
 //!
 //! The controller changes the sequencer. It seals the next term on a
 //! quorum, which raises each replica's fence and returns the term and
-//! position of its last cell; it appoints the replica whose log is the most
-//! up to date of those answers (Raft's election restriction), by
-//! compare-and-swap on the log's config. A seal quorum meets every write
+//! position of its last cell; it appoints a replica whose log is at least as
+//! up to date as a quorum of those answers (Raft's election restriction), by
+//! compare-and-swap on the log's config. That quorum meets every write
 //! quorum, so the appointee holds every committed cell. Nothing else is
 //! decided by quorum.
 //!
 //! The controller changes the replicas the same way, one at a time, as
 //! Vertical Paxos does: the seal of the new term goes to the old replicas
-//! and needs a quorum of them, and the appointee is one of the most up to
-//! date answers that stays a replica. Until the new term's no-op commits,
+//! and needs a quorum of them, and the appointee is a replica that stays, at
+//! least as up to date as a quorum of the answers. Until the new term's
+//! no-op commits,
 //! the config is *joint*: it keeps the old replicas, and every seal needs a
 //! quorum of them as well as of the new, since cells committed before the
 //! change may be on the old alone. Once the no-op
@@ -42,14 +43,15 @@
 //!
 //! The protocol is sans-IO: a [`Node`] per log per node, which hides that
 //! node's replica, its sequencer and its read rounds behind one input and
-//! effects interface over the node's [`Store`], and [`Reconfigure`], one
-//! failover of the controller. The tests run them under a model checker,
+//! effects interface over the node's [`Store`], and [`Root`], the
+//! controller on the root log's leader, with the rules by which the root
+//! changes a log's [`Config`]. The tests run them under a model checker,
 //! and the ledger drives the same ones: it carries their messages, keeps
 //! their stores, and syncs them. They own every protocol decision and the
 //! hard state's changes; answers that rest on writes go only once the
 //! writes are durable ([`Synced`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// The replicas of `n` that a write, a seal and a check need.
 #[must_use]
@@ -146,6 +148,19 @@ pub enum Response {
     },
     /// Whether the term is open.
     Open(bool),
+}
+
+impl Response {
+    /// A replica's answer to the seal of `term`: refused if its `fence` is
+    /// past `term`, else where its log ends.
+    #[must_use]
+    pub fn sealed(term: Term, last: Pos, last_term: Term, fence: Term) -> Response {
+        if fence > term {
+            Response::Fenced { fence }
+        } else {
+            Response::Sealed { last, last_term }
+        }
+    }
 }
 
 /// What a replica knows of its log's positions: enough to decide an
@@ -390,7 +405,7 @@ fn replica<V, S: Store<V>>(store: &mut S, request: Request<V, S::State>) -> Resu
 }
 
 /// Requests and where they go.
-pub type Sends<R, V, T> = Vec<(R, Request<V, T>)>;
+type Sends<R, V, T> = Vec<(R, Request<V, T>)>;
 
 /// A started sequencer and its first sends.
 type Started<R, V, S> = (Sequencer<R>, Sends<R, V, <S as Store<V>>::State>);
@@ -744,20 +759,11 @@ pub fn rename_all<R: Id>(f: impl Fn(R) -> R, set: &mut [R]) {
     set.sort_unstable();
 }
 
-/// What a machine does next.
+/// What a read round does next.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum Next<R> {
+enum Next {
     /// Waits for more answers.
     Wait,
-    /// Appoint one of `candidates` for `term`, by compare-and-swap on the
-    /// config.
-    Appoint {
-        /// The new term.
-        term: Term,
-        /// The replicas whose logs are the most up to date: any of them
-        /// may sequence it.
-        candidates: Vec<R>,
-    },
     /// A read: everything up to this position is what it reads.
     Done(Pos),
     /// A higher term came first.
@@ -766,135 +772,431 @@ pub enum Next<R> {
 
 /// A seal answer: the term and position of a replica's last cell, and the
 /// replica. Sorted, the last is the most up to date.
-pub type Answered<R> = (Term, Pos, R);
+type Answered<R> = (Term, Pos, R);
 
-/// The controller's change of sequencer, from `term` to the next.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Reconfigure<R> {
-    term: Term,
-    /// The sets of replicas it needs a quorum of each of, sorted.
-    quorums: Vec<Vec<R>>,
-    /// The replicas of the new term: the appointee is one of them.
-    replicas: Vec<R>,
-    answers: Vec<Answered<R>>,
-    done: bool,
-}
-
-impl<R: Id> Reconfigure<R> {
-    /// Seals `term + 1` for a term on `replicas`, on the config's
-    /// replicas, and during a replica change (`joint`, the replicas it
-    /// changes from) on those too. For a new replica change, `replicas`
-    /// are the new ones and `joint` the current: the change seal goes to
-    /// the replicas it changes from.
-    #[must_use]
-    pub fn start<V, T>(
-        term: Term,
-        current: &[R],
-        joint: &[R],
-        replicas: Vec<R>,
-    ) -> (Self, Sends<R, V, T>) {
-        let mut quorums = vec![current.to_vec()];
-        if !joint.is_empty() {
-            quorums.push(joint.to_vec());
-        }
-        let mut to: Vec<R> = quorums.iter().flatten().copied().collect();
-        to.sort_unstable();
-        to.dedup();
-        let m = Reconfigure {
-            term,
-            quorums,
-            replicas,
-            answers: Vec::new(),
-            done: false,
-        };
-        let sends = (to.into_iter())
-            .map(|r| (r, Request::Seal { term: term + 1 }))
-            .collect();
-        (m, sends)
-    }
-
-    /// The replicas of the new term.
-    #[must_use]
-    pub fn replicas(&self) -> &[R] {
-        &self.replicas
-    }
-
-    /// The term it replaces.
-    #[must_use]
-    pub fn base(&self) -> Term {
-        self.term
-    }
-
-    /// Whether it still waits for `r`'s answer.
-    #[must_use]
-    pub fn pending(&self, r: R) -> bool {
-        !self.done && self.answers.iter().all(|a| a.2 != r)
-    }
-
-    /// Renames the replicas by `f` (see [`Node::relabel`]).
-    pub fn relabel(&mut self, f: impl Fn(R) -> R) {
-        for a in &mut self.answers {
-            a.2 = f(a.2);
-        }
-        if !self.done {
-            self.answers.sort_unstable();
-        }
-        for q in &mut self.quorums {
-            rename_all(&f, q);
-        }
-        rename_all(&f, &mut self.replicas);
-    }
-
-    /// Takes `r`'s answer to the seal. Once a majority of every sealed set
-    /// answered, the candidates are the most up-to-date answers among the
-    /// new term's replicas; `eligible` leaves out replicas that may not
-    /// sequence (the ledger's: not members). Their answers count toward
-    /// nothing.
-    pub fn on_seal(&mut self, r: R, response: Response, eligible: impl Fn(R) -> bool) -> Next<R> {
-        if self.done {
-            return Next::Wait;
-        }
-        let Response::Sealed { last, last_term } = response else {
-            self.done = true;
-            return Next::Failed;
-        };
-        if eligible(r) && self.pending(r) {
-            self.answers.push((last_term, last, r));
-            self.answers.sort_unstable();
-        }
-        let answered: Vec<R> = self.answers.iter().map(|a| a.2).collect();
-        if !reached(&self.quorums, &answered) {
-            return Next::Wait;
-        }
-        self.done = true;
-        let mut candidates = most_up_to_date(&self.answers);
-        candidates.retain(|r| self.replicas.contains(r));
-        Next::Appoint {
-            term: self.term + 1,
-            candidates,
-        }
-    }
-}
-
-/// Whether the replicas in `answered` hold a majority of every set in
+/// Whether the replicas that answered hold a majority of every set in
 /// `quorums`.
-fn reached<R: PartialEq>(quorums: &[Vec<R>], answered: &[R]) -> bool {
+fn reached<R: PartialEq>(quorums: &[Vec<R>], answers: &[Answered<R>]) -> bool {
     quorums.iter().all(|q| {
-        let n = answered.iter().filter(|r| q.contains(r)).count();
+        let n = answers.iter().filter(|a| q.contains(&a.2)).count();
         n >= majority(q.len())
     })
 }
 
-/// The replicas whose seal answers, by (last term, last position), are the
-/// most up to date: Raft's election restriction.
-fn most_up_to_date<R: Copy>(answers: &[Answered<R>]) -> Vec<R> {
-    let Some(best) = answers.iter().map(|a| (a.0, a.1)).max() else {
+/// The replicas whose seal answers, by (last term, last position), are at
+/// least as up to date as a majority of every set in `quorums`: Raft's
+/// election restriction. Each holds every committed cell, as such a majority
+/// does. `answers` is sorted, so the least up to date of them ends the
+/// shortest prefix that reaches the quorums.
+fn up_to_date<R: Copy + PartialEq>(quorums: &[Vec<R>], answers: &[Answered<R>]) -> Vec<R> {
+    let least = (1..=answers.len())
+        .filter_map(|n| answers.get(..n))
+        .find(|prefix| reached(quorums, prefix))
+        .and_then(<[_]>::last);
+    let Some(&(term, pos, _)) = least else {
         return Vec::new();
     };
     (answers.iter())
-        .filter(|a| (a.0, a.1) == best)
+        .filter(|a| (a.0, a.1) >= (term, pos))
         .map(|a| a.2)
         .collect()
+}
+
+/// A log's configuration: the root's compare-and-swap register for it,
+/// which only [`Config::appointed`] and [`Config::activated`] change.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Config<R> {
+    /// The open term.
+    pub term: Term,
+    /// Its sequencer.
+    pub sequencer: R,
+    /// The sequencer's boot: one that restarted lost its unsynced cells,
+    /// so its term ends.
+    pub boot: u64,
+    /// The term's replicas, sorted.
+    pub replicas: Vec<R>,
+    /// During a replica change, the replicas it changes from.
+    pub joint: Vec<R>,
+}
+
+/// A new term for a log, as the controller proposes it to the root.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Appoint<R> {
+    /// The term it replaces.
+    pub base: Term,
+    /// The new term's sequencer.
+    pub sequencer: R,
+    /// The sequencer's boot.
+    pub boot: u64,
+    /// The new term's replicas, if they change.
+    pub replicas: Option<Vec<R>>,
+}
+
+impl<R: Id> Config<R> {
+    /// The config after `a`, if `a` still applies: the config is at its base
+    /// term, its sequencer is a `member` and one of its replicas, and new
+    /// replicas `fit` and start the only replica change under way. Every
+    /// root replica applies it alike.
+    #[must_use]
+    pub fn appointed(
+        mut self,
+        a: Appoint<R>,
+        member: impl Fn(R) -> bool,
+        fits: impl Fn(&[R]) -> bool,
+    ) -> Option<Config<R>> {
+        let seq = a.sequencer;
+        let in_replicas = a.replicas.as_ref().unwrap_or(&self.replicas).contains(&seq);
+        if a.base != self.term || !member(seq) || !in_replicas {
+            return None;
+        }
+        if let Some(replicas) = a.replicas.filter(|r| *r != self.replicas) {
+            if !self.joint.is_empty() || !fits(&replicas) {
+                return None;
+            }
+            self.joint = std::mem::replace(&mut self.replicas, replicas);
+        }
+        (self.term, self.sequencer, self.boot) = (a.base + 1, seq, a.boot);
+        Some(self)
+    }
+
+    /// The config once `term`'s replica change ended (its no-op committed on
+    /// the new replicas), if it is still at `term` and joint.
+    #[must_use]
+    pub fn activated(mut self, term: Term) -> Option<Config<R>> {
+        if self.term != term || self.joint.is_empty() {
+            return None;
+        }
+        self.joint.clear();
+        Some(self)
+    }
+}
+
+/// What the controller reads of the cluster: the root's configs, the
+/// members, who is up, and where logs should be placed.
+pub trait Cluster<K, R> {
+    /// Log `log`'s config, unless the log ended.
+    fn config(&self, log: &K) -> Option<Config<R>>;
+
+    /// Whether `r` is a member. A removed node keeps its logs until they
+    /// move off it, but may not sequence.
+    fn member(&self, r: R) -> bool;
+
+    /// Node `r`'s boot, while it is up.
+    fn boot(&self, r: R) -> Option<u64>;
+
+    /// The replicas that log `log` should move to, if any: one change from
+    /// `config`'s. Asked only when no replica change is under way.
+    fn moved(&self, log: &K, config: &Config<R>) -> Option<Vec<R>>;
+}
+
+/// How much the controller does at once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Limits {
+    /// How long, on the caller's clock, a failover may stall before it
+    /// starts again.
+    pub retry: u64,
+    /// The logs it looks at per tick.
+    pub per_tick: usize,
+    /// The failovers it runs at once.
+    pub in_flight: usize,
+}
+
+/// A seal the controller sends: of `term` on log `log`, to `to`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Seal<K, R> {
+    /// The log.
+    pub log: K,
+    /// The term sealed.
+    pub term: Term,
+    /// The replicas to send it to.
+    pub to: Vec<R>,
+}
+
+/// A failover in flight: the seal of term `base + 1`, for a term on
+/// `replicas`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct Failover<R> {
+    base: Term,
+    /// The sets of replicas it needs a quorum of each of.
+    quorums: Vec<Vec<R>>,
+    replicas: Vec<R>,
+    phase: Phase<R>,
+    /// When it started or proposed, on the caller's clock.
+    at: u64,
+}
+
+impl<R: Id> Failover<R> {
+    fn relabel(&mut self, f: impl Fn(R) -> R) {
+        for q in &mut self.quorums {
+            rename_all(&f, q);
+        }
+        rename_all(&f, &mut self.replicas);
+        match &mut self.phase {
+            Phase::Sealing(answers) => {
+                for a in answers.iter_mut() {
+                    a.2 = f(a.2);
+                }
+                answers.sort_unstable();
+            }
+            Phase::Ready(c) => rename_all(&f, c),
+            Phase::Proposed => {}
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Phase<R> {
+    /// The answers so far, sorted: the last is the most up to date.
+    Sealing(Vec<Answered<R>>),
+    /// Its seal reached its quorums and someone may be appointed: who.
+    Ready(Vec<R>),
+    Proposed,
+}
+
+/// The controller, on the root log's leader: it gives a log a new term
+/// when its sequencer fails or is removed, and new replicas when the
+/// placement asks, one change at a time. It seals the next term on a
+/// quorum of every set the config names, and once one answered, proposes
+/// an [`Appoint`] of a member at least as up to date as such a quorum.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Root<K, R> {
+    limits: Limits,
+    leading: bool,
+    inflight: BTreeMap<K, Failover<R>>,
+    /// Logs to look at, in order.
+    todo: VecDeque<K>,
+    queued: BTreeSet<K>,
+    /// Logs whose sequencer said a seal deposed it, with no appointment
+    /// after: they need a new term.
+    deposed: BTreeSet<K>,
+}
+
+impl<K: Ord + Clone, R: Id> Root<K, R> {
+    /// A controller that does not lead yet.
+    #[must_use]
+    pub fn new(limits: Limits) -> Self {
+        Root {
+            limits,
+            leading: false,
+            inflight: BTreeMap::new(),
+            todo: VecDeque::new(),
+            queued: BTreeSet::new(),
+            deposed: BTreeSet::new(),
+        }
+    }
+
+    /// Whether this node leads the root. Returns whether it just started
+    /// to: the caller then notes every log. A change forgets everything.
+    pub fn lead(&mut self, leading: bool) -> bool {
+        if leading == self.leading {
+            return false;
+        }
+        *self = Root {
+            leading,
+            ..Root::new(self.limits)
+        };
+        leading
+    }
+
+    /// Whether this node leads the root.
+    #[must_use]
+    pub fn leading(&self) -> bool {
+        self.leading
+    }
+
+    /// Look at `log` at a coming tick.
+    pub fn note(&mut self, log: K) {
+        if self.leading && self.queued.insert(log.clone()) {
+            self.todo.push_back(log);
+        }
+    }
+
+    /// A tick at `now` on the caller's clock: start the failovers due, and
+    /// return their seals.
+    pub fn tick(&mut self, c: &impl Cluster<K, R>, now: u64) -> Vec<Seal<K, R>> {
+        if !self.leading {
+            return Vec::new();
+        }
+        let stalled: Vec<K> = (self.inflight.iter())
+            .filter(|(_, f)| now.saturating_sub(f.at) > self.limits.retry)
+            .map(|(l, _)| l.clone())
+            .collect();
+        for log in stalled {
+            self.inflight.remove(&log);
+            self.note(log);
+        }
+        let mut seals = Vec::new();
+        for _ in 0..self.limits.per_tick {
+            if self.inflight.len() >= self.limits.in_flight {
+                break;
+            }
+            let Some(log) = self.todo.pop_front() else {
+                break;
+            };
+            self.queued.remove(&log);
+            if self.inflight.contains_key(&log) {
+                continue;
+            }
+            let Some(config) = c.config(&log) else {
+                continue;
+            };
+            let Some(replicas) = self.needs(c, &log, &config) else {
+                continue;
+            };
+            // During a replica change, the seal needs the replicas it
+            // changes from too. A new change seals the current replicas,
+            // which it changes from (the new one has nothing to lose).
+            let mut quorums = vec![config.replicas];
+            if !config.joint.is_empty() {
+                quorums.push(config.joint);
+            }
+            let mut to: Vec<R> = quorums.iter().flatten().copied().collect();
+            to.sort_unstable();
+            to.dedup();
+            let term = config.term + 1;
+            seals.push(Seal {
+                log: log.clone(),
+                term,
+                to,
+            });
+            let f = Failover {
+                base: config.term,
+                quorums,
+                replicas,
+                phase: Phase::Sealing(Vec::new()),
+                at: now,
+            };
+            self.inflight.insert(log, f);
+        }
+        seals
+    }
+
+    /// The replicas of the term `log` needs next, if it needs one.
+    fn needs(&self, c: &impl Cluster<K, R>, log: &K, config: &Config<R>) -> Option<Vec<R>> {
+        let seq = config.sequencer;
+        let gone = self.deposed.contains(log) || !c.member(seq) || c.boot(seq) != Some(config.boot);
+        let moved = if config.joint.is_empty() {
+            c.moved(log, config)
+        } else {
+            None
+        };
+        match moved {
+            // A move never drops the sitting sequencer: it hands the log to
+            // another replica first, in a term on the same replicas, as a
+            // lease moves before its replica does. It stays a replica of
+            // that term, so it learns the outcome of what it appended.
+            Some(replicas) if !replicas.contains(&seq) => Some(config.replicas.clone()),
+            moved => moved.or_else(|| gone.then(|| config.replicas.clone())),
+        }
+    }
+
+    /// Takes `from`'s answer to the seal of `term` on `log`. Once a majority
+    /// of every sealed set answered, the candidates are the new term's
+    /// replicas at least as up to date as such a majority. A removed node's
+    /// answer counts toward the quorums, as it keeps its logs until they move
+    /// off it, but only a member may be appointed: while none may, the seal
+    /// takes more answers, as a member's can make one.
+    pub fn on_sealed(
+        &mut self,
+        c: &impl Cluster<K, R>,
+        log: &K,
+        from: R,
+        term: Term,
+        response: Response,
+    ) {
+        let Some(f) = self.inflight.get_mut(log).filter(|f| term == f.base + 1) else {
+            return;
+        };
+        let Phase::Sealing(answers) = &mut f.phase else {
+            return;
+        };
+        let Response::Sealed { last, last_term } = response else {
+            // A higher term came first: look again once the root says.
+            self.inflight.remove(log);
+            self.note(log.clone());
+            return;
+        };
+        if answers.iter().all(|a| a.2 != from) {
+            answers.push((last_term, last, from));
+            answers.sort_unstable();
+        }
+        let mut candidates = up_to_date(&f.quorums, answers);
+        candidates.retain(|&r| f.replicas.contains(&r) && c.member(r));
+        if !candidates.is_empty() {
+            f.phase = Phase::Ready(candidates);
+        }
+    }
+
+    /// The failovers whose seals reached their quorums, with who may be
+    /// appointed.
+    pub fn ready(&self) -> impl Iterator<Item = (&K, &[R])> {
+        (self.inflight.iter()).filter_map(|(l, f)| match &f.phase {
+            Phase::Ready(c) => Some((l, &c[..])),
+            Phase::Sealing(a) if reached(&f.quorums, a) => Some((l, &[][..])),
+            _ => None,
+        })
+    }
+
+    /// The appointment of `sequencer`, one of `log`'s [ready](Self::ready)
+    /// candidates that is up, to propose to the root at `now`.
+    pub fn appoint(
+        &mut self,
+        c: &impl Cluster<K, R>,
+        log: &K,
+        sequencer: R,
+        now: u64,
+    ) -> Option<Appoint<R>> {
+        let config = c.config(log)?;
+        let boot = c.boot(sequencer)?;
+        let f = self.inflight.get_mut(log)?;
+        if !matches!(&f.phase, Phase::Ready(c) if c.contains(&sequencer)) {
+            return None;
+        }
+        (f.phase, f.at) = (Phase::Proposed, now);
+        Some(Appoint {
+            base: f.base,
+            sequencer,
+            boot,
+            replicas: (f.replicas != config.replicas).then(|| f.replicas.clone()),
+        })
+    }
+
+    /// `log`'s sequencer of `term` was deposed by a seal: if the root still
+    /// names that term, the log needs a new one.
+    pub fn on_deposed(&mut self, c: &impl Cluster<K, R>, log: K, term: Term) {
+        if self.leading && c.config(&log).is_some_and(|x| x.term == term) {
+            self.deposed.insert(log.clone());
+            self.note(log);
+        }
+    }
+
+    /// The root applied a change to `log`'s config: its failover is over.
+    pub fn applied(&mut self, log: K) {
+        self.deposed.remove(&log);
+        self.inflight.remove(&log);
+        self.note(log);
+    }
+
+    /// Whether `log`'s seal still waits for `r`'s answer.
+    #[must_use]
+    pub fn waits(&self, log: &K, r: R) -> bool {
+        (self.inflight.get(log))
+            .is_some_and(|f| matches!(&f.phase, Phase::Sealing(a) if a.iter().all(|a| a.2 != r)))
+    }
+
+    /// Whether `log`'s seal still waits for a quorum's answers.
+    #[must_use]
+    pub fn sealing(&self, log: &K) -> bool {
+        (self.inflight.get(log))
+            .is_some_and(|f| matches!(&f.phase, Phase::Sealing(a) if !reached(&f.quorums, a)))
+    }
+
+    /// Renames the replicas by `f` (see [`Node::relabel`]).
+    pub fn relabel(&mut self, f: impl Fn(R) -> R) {
+        for failover in self.inflight.values_mut() {
+            failover.relabel(&f);
+        }
+    }
 }
 
 /// A read round at a node's sequencer: a linearizable read of everything
@@ -942,7 +1244,7 @@ impl<R: Id> Round<R> {
 
     /// Takes `r`'s answer to the check: whether `r` says the term is open.
     /// Done once a quorum does; failed once any does not.
-    fn on_check(&mut self, r: R, open: bool) -> Next<R> {
+    fn on_check(&mut self, r: R, open: bool) -> Next {
         if !open {
             return Next::Failed;
         }
@@ -1122,6 +1424,19 @@ impl<R: Id, S> Node<R, S> {
         S: Store<V>,
     {
         self.seq.as_ref().is_some_and(|s| s.ready(&self.store))
+    }
+
+    /// The term whose replica change the root may end, given the root's
+    /// `config`: this node sequences the config's joint term, and the
+    /// term's no-op committed on the new replicas, so everything before it
+    /// is there.
+    #[must_use]
+    pub fn activation<V>(&self, config: &Config<R>) -> Option<Term>
+    where
+        S: Store<V>,
+    {
+        let term = self.sequencing::<V>().filter(|&t| t == config.term)?;
+        (!config.joint.is_empty() && self.leading::<V>()).then_some(term)
     }
 
     /// Whether its sequencer may take a proposal now (its window has
@@ -1384,7 +1699,7 @@ impl<R: Id, S> Node<R, S> {
             self.fail_reads(&mut fx);
             return fx;
         };
-        let replicas = self.replicas().map(<[R]>::to_vec).unwrap_or_default();
+        let replicas = self.replicas().map_or_default(<[R]>::to_vec);
         let ids: Vec<u64> = (self.rounds.iter().filter(|r| !r.sent))
             .map(|r| r.id)
             .collect();
@@ -1440,7 +1755,7 @@ impl<R: Id, S> Node<R, S> {
                 }
                 self.fail_reads(fx);
             }
-            Next::Wait | Next::Appoint { .. } => {}
+            Next::Wait => {}
         }
     }
 

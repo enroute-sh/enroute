@@ -39,9 +39,10 @@ One call per question, the tip read once, and every stream folded with its
 | One commit | `diffCommit` with an unset base, which is what it changed |
 
 ```ts
-async function treePage(repo: RepoKey, branch: string, dirObjectId?: string) {
+async function treePage(repo: RepoKey, branch: string, dirObjectId?: ObjectId) {
   const { refs: tips } = await refs.listRefs({ repo, prefixes: [branch] });
-  const tip = tips[0]?.objectId;
+  // A prefix also matches `refs/heads/main-old`, so pick the exact name.
+  const tip = tips.find((r) => r.name === branch)?.objectId;
   if (!tip) return { entries: [], truncated: false };
 
   const entries: TreeEntry[] = [];

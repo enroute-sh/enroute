@@ -140,7 +140,7 @@ pub(crate) fn store_id(db: &LogDb) -> Result<u64> {
 
 /// Open (and recover) the store in `dir`.
 pub(crate) fn open(dir: &Path) -> Result<LogDb> {
-    std::fs::create_dir_all(dir)?;
+    enroute_shared::durable::create_dir_all(dir)?;
     let cfg = Config {
         dir: dir.display().to_string(),
         target_file_size: ReadableSize::mb(64),
@@ -152,14 +152,18 @@ pub(crate) fn open(dir: &Path) -> Result<LogDb> {
     // A node stopping in this process (tests restart nodes in place) may
     // still hold the directory lock for a moment.
     let mut tries = 0;
-    loop {
+    let engine = loop {
         match Engine::open(cfg.clone()) {
-            Ok(e) => return LogDb::new(e),
+            Ok(e) => break e,
             Err(e) if tries < 100 && e.to_string().contains("Failed to lock file") => {
                 tries += 1;
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             Err(e) => return Err(e).context("open the log store"),
         }
-    }
+    };
+    // raft-engine syncs the directory when it adds a log file, except for
+    // the first one of each queue, made at open.
+    enroute_shared::durable::sync_dir(dir)?;
+    LogDb::new(engine)
 }

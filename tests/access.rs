@@ -1,10 +1,5 @@
 //! Access hooks: the host's authorizer and ref visibility, through git.
 
-#![expect(
-    clippy::unwrap_used,
-    reason = "a test fails by panicking, on values it chose itself"
-)]
-
 mod common;
 
 use std::collections::HashSet;

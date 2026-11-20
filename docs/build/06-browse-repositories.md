@@ -18,8 +18,8 @@ Enroute answers these questions directly. One call per question:
 | File tree | `ListTree` on a commit, which resolves to its root tree |
 | One file | `GetObject`: a header, then the bytes |
 
-Three of these stream, so what arrives is pages rather than an answer. Two of
-them stop at a server limit and set `truncated`. Surface that state instead of
+`ListTree` and `GetObject` stream, so what arrives is pages rather than an
+answer. `ListTree` stops at a server limit and sets `truncated`. Surface that state instead of
 rendering a partial directory as complete.
 
 ## Add the reads
@@ -159,8 +159,6 @@ import { ObjectKind } from "@/lib/gen/enroute/api/v1alpha1/object";
 import { listRefs, listTree, readBlob } from "@/lib/enroute";
 import { repoByPath } from "@/lib/store";
 import { Browser } from "./browser";
-
-export const runtime = "nodejs";
 
 const THEME = {
   theme: { light: "pierre-light", dark: "pierre-dark" },

@@ -434,7 +434,7 @@ impl Default for WaitHistogram {
 impl WaitHistogram {
     fn record(&self, wait: Duration) {
         let us = u64::try_from(wait.as_micros()).unwrap_or(u64::MAX);
-        let i = usize::try_from(u64::BITS - us.leading_zeros()).unwrap_or(BUCKETS);
+        let i = usize::try_from(us.bit_width()).unwrap_or(BUCKETS);
         if let Some(b) = self.buckets.get(i.min(BUCKETS - 1)) {
             b.fetch_add(1, Relaxed);
         }

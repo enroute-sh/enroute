@@ -115,9 +115,8 @@ there is no third:
   The layer file travels inside the log entry that commits it. The push costs
   one replicated, group-committed log write and no object store round trip.
   Every compute node that follows the repository writes the bytes to its local
-  disk (checked against the id) and reads them like any other layer. This is the
-  split of Neon: the log takes small writes, and everything at rest is in the
-  object store.
+  disk (checked against the id) and reads them like any other layer. The log
+  takes small writes, and a flush later moves them to the object store.
 - **In the object store** (larger layers, and every flush and compaction
   output). The upload finishes before the entry that names the layer is
   proposed.
@@ -174,9 +173,8 @@ sweep.
 ### Durability window
 
 Until it is flushed, an inline layer is as durable as the log: it is on the
-disks of a majority of nodes. This is the guarantee that Neon's safekeepers
-give. If a majority of the replicas lose their logs, an operator restores the
-ledger from volume snapshots ([Recovery](ledger-and-compute.md#recovery)).
+disks of a majority of nodes. If a majority of the replicas lose their logs,
+an operator restores the ledger from volume snapshots ([Recovery](ledger-and-compute.md#recovery)).
 
 ## Server-side writes
 

@@ -22,7 +22,7 @@ Enroute instead:
   group-committed log store per node, with the state machines on disk in an
   LSM tree; idle logs cost nothing; no external database);
 - serves fetches from **long-lived in-memory snapshots** (commit graph with
-  generation numbers, per-commit object segments as roaring bitmaps), streaming
+  generation numbers, per-commit object segments as sorted `u32` arrays), streaming
   stored pack entries verbatim;
 - ingests pushes with **parallel indexing and delta encoding**, publishing
   objects and ref updates atomically;
@@ -38,8 +38,9 @@ Enroute instead:
   clones and fetches against the same repository.
 - **Scales in both directions**: millions of small repositories, and very large
   monorepos.
-- **Storage and compute are disaggregated** in the style of Neon: the object
-  store is the durable store, and nodes are replaceable.
+- **Storage and compute are disaggregated**: layer files are in the object
+  store, and refs and the layer manifest are on the ledger nodes' disks. Compute
+  nodes hold only caches and are replaceable.
 - **No external database dependency.** Consensus for mutable state is built in
   (a shard log per repository, and a Raft root log).
 
@@ -124,7 +125,7 @@ push takes the barrier only when its view does not have an object it needs. See 
   served from the same planner and pack writer.
 - **Push** uses v0 `receive-pack` over smart HTTP, because v2 does not define
   push. Supported: `report-status`, `side-band-64k`, `atomic`, `delete-refs`,
-  `quiet`, thin packs, and gzip request bodies. Enroute accepts pushes from
+  `quiet`, `push-options`, thin packs, and gzip request bodies. Enroute accepts pushes from
   shallow clones when the result stays connected.
 - **Server-side writes** go through the API, Enroute's contract
   `enroute.api.v1alpha1` on its own port: `CommitService.CreateCommit` edits
